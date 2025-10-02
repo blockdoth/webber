@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<head>
+  <script>
+    const ws = new WebSocket("ws://localhost:9001");
+    ws.onopen = () => console.log("Connected!");
+    ws.onmessage = (event) => console.log("Message:", event.data);
+    ws.send("Hello from browser!");
+  </script>
+</head>
+<body>
+balls
+</body>

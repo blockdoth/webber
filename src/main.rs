@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::net::TcpListener;
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, thread};
 
-const SOCKET_ADDR: &str = "127.0.0.1:9123";
+const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
 const STATE_PATH: &str = "./state/state";
 
@@ -20,6 +20,9 @@ fn main() {
     let asset_map = Arc::new(Mutex::new(match deserialize_asset_map(STATE_PATH) {
         Ok(hm) => {
             println!("Loaded {} assets from state", hm.len());
+            for asset in hm.keys() {
+                println!("{}", asset.to_string_lossy());
+            }
             hm
         }
         Err(err) => {
@@ -28,19 +31,112 @@ fn main() {
         }
     }));
 
+    let watch_asset_map = asset_map.clone();
+
     let _handle = thread::spawn(|| {
-        watch_assets(asset_map, ASSETS_PATH);
+        watch_assets(watch_asset_map, ASSETS_PATH);
     });
 
     for stream in listener.incoming() {
+        let handle_asset_map = asset_map.clone();
         thread::spawn(|| {
-            let mut stream = stream.unwrap();
-            let _ = stream.write(b"Hello World\r\n").unwrap();
+            let _ = handle_stream(stream.unwrap(), handle_asset_map);
         });
     }
 }
 
+fn handle_stream(mut stream: TcpStream, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> Result<(), io::Error> {
+    let peer_ip = stream.peer_addr()?;
+    println!("[{peer_ip}] connected");
+
+    let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
+
+    loop {
+        let n = stream.read(&mut buffer)?;
+        // println!("{:?}", &buffer[..n]);
+
+        if let Some(pos) = buffer[..n].windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_str = String::from_utf8_lossy(&buffer[..pos]);
+            let body_str = String::from_utf8_lossy(&buffer[pos + 4..n]);
+            let header = parse_header(header_str.to_string())?;
+            println!("Header {header:?}");
+            println!("Body {body_str:?}");
+
+            let asset = match header.typ {
+                RequestType::GET => {
+                    let key = PathBuf::from(format!("./assets{}", header.path));
+                    println!("{key:?}");
+                    asset_map.lock().unwrap().get(&key).cloned()
+                }
+            };
+
+            if let Some(asset) = asset {
+                let body = asset.content.as_bytes();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                    Content-Length: {}\r\n\
+                    Content-Type: text/plain\r\n\
+                    \r\n",
+                    body.len()
+                );
+
+                stream.write_all(response.as_bytes())?;
+                stream.write_all(body)?;
+            } else {
+                let body = b"404 Not Found";
+                let response = format!(
+                    "HTTP/1.1 404 NOT FOUND\r\n\
+                    Content-Length: {}\r\n\
+                    Content-Type: text/plain\r\n\
+                    \r\n",
+                    body.len()
+                );
+
+                stream.write_all(response.as_bytes())?;
+                stream.write_all(body)?;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HttpHeader {
+    typ: RequestType,
+    path: String,
+}
+
+#[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
+enum RequestType {
+    GET,
+}
+
+fn parse_header(header_str: String) -> Result<HttpHeader, io::Error> {
+    let mut lines = header_str.lines();
+
+    let first_line = lines.next().unwrap();
+    let mut first_line_words = first_line.split_ascii_whitespace();
+
+    let request_type = match first_line_words.next() {
+        Some("GET") => RequestType::GET,
+        invalid => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid request type {invalid:?}"))),
+    };
+
+    let path = if let Some(path) = first_line_words.next() {
+        path
+    } else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request path"));
+    };
+
+    Ok(HttpHeader {
+        typ: request_type,
+        path: path.to_owned(),
+    })
+}
+
 type AssetPath = PathBuf;
+
+#[derive(Clone)]
 struct Asset {
     last_modified: SystemTime,
     content: String,
@@ -75,6 +171,7 @@ fn serialize_asset_map(asset_map: &HashMap<AssetPath, Asset>, save_path: &str) -
 
     fs::write(save_path, bin)
 }
+
 fn deserialize_asset_map(load_path: &str) -> Result<HashMap<AssetPath, Asset>, io::Error> {
     let bin = fs::read(load_path)?;
     let mut hm = HashMap::new();
@@ -112,50 +209,64 @@ fn deserialize_asset_map(load_path: &str) -> Result<HashMap<AssetPath, Asset>, i
 }
 
 fn watch_assets(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &str) {
+    let mut state_changed = true;
     loop {
-        let dir = match fs::read_dir(Path::new(dir_path)) {
-            Ok(dir) => dir,
-            Err(error) => {
-                println!("Error while trying to open asset dir at {dir_path}: {error}");
-                return;
-            }
-        };
+        let rootdir: PathBuf = PathBuf::from(dir_path);
 
         let mut asset_file_paths = HashSet::new();
-        for file in dir {
-            if let Ok(file) = file
-                && let Ok(metadata) = file.metadata()
-                && let Ok(last_edited) = metadata.accessed()
-            {
-                let file_path = file.path();
-                let content = fs::read_to_string(&file_path).unwrap();
 
-                asset_file_paths.insert(file_path.clone());
+        let mut stack = vec![rootdir];
 
-                if let Some(asset) = asset_map.lock().unwrap().get_mut(&file_path) {
-                    // println!("{:?} {:?}", asset.last_modified, last_edited);
+        while let Some(dir_path) = stack.pop() {
+            let dir = match fs::read_dir(&dir_path) {
+                Ok(dir) => dir,
+                Err(error) => {
+                    println!("Error while trying to open asset dir at {dir_path:?}: {error}");
+                    continue;
+                }
+            };
 
-                    if asset.last_modified < last_edited {
-                        asset.content = content;
-                        asset.last_modified = last_edited;
+            for file in dir {
+                if let Ok(file) = file
+                    && let Ok(metadata) = file.metadata()
+                    && let Ok(last_edited) = metadata.accessed()
+                {
+                    if metadata.is_dir() {
+                        stack.push(file.path());
+                        continue;
+                    };
+                    let file_path = file.path();
+                    let content = fs::read_to_string(&file_path).unwrap();
+
+                    asset_file_paths.insert(file_path.clone());
+
+                    if let Some(asset) = asset_map.lock().unwrap().get_mut(&file_path) {
+                        // println!("{:?} {:?}", asset.last_modified, last_edited);
+
+                        if asset.last_modified < last_edited {
+                            asset.content = content;
+                            asset.last_modified = last_edited;
+                            println!(
+                                "Updated file {file_path:?}, edited {:?} minutes ago",
+                                last_edited.elapsed().unwrap().as_secs() / 60
+                            );
+                            state_changed = true;
+                        }
+                    } else {
+                        asset_map.lock().unwrap().insert(
+                            file_path.clone(),
+                            Asset {
+                                last_modified: last_edited,
+                                content,
+                            },
+                        );
+
                         println!(
-                            "Updated file {file_path:?}, edited {:?} minutes ago",
+                            "Added file {file_path:?}, edited {:?} minutes ago",
                             last_edited.elapsed().unwrap().as_secs() / 60
                         );
+                        state_changed = true;
                     }
-                } else {
-                    asset_map.lock().unwrap().insert(
-                        file_path.clone(),
-                        Asset {
-                            last_modified: last_edited,
-                            content,
-                        },
-                    );
-
-                    println!(
-                        "Added file {file_path:?}, edited {:?} minutes ago",
-                        last_edited.elapsed().unwrap().as_secs() / 60
-                    );
                 }
             }
         }
@@ -169,16 +280,21 @@ fn watch_assets(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &str
         for key in asset_difference {
             map.remove(key);
             println!("Removed file {key:?}");
-        }
-        match serialize_asset_map(&map, STATE_PATH) {
-            Ok(_) => {
-                // println!("Saved state to file");
-            }
-            Err(err) => {
-                println!("Error while saving state to file {err:?}");
-            }
+            state_changed = true;
         }
 
-        sleep(Duration::from_millis(500));
+        if state_changed {
+            match serialize_asset_map(&map, STATE_PATH) {
+                Ok(_) => {
+                    // println!("Saved state to file");
+                }
+                Err(err) => {
+                    println!("Error while saving state to file {err:?}");
+                }
+            }
+            state_changed = false;
+        }
+
+        sleep(Duration::from_millis(100));
     }
 }
