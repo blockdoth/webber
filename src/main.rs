@@ -32,7 +32,6 @@ fn main() {
     }));
 
     let watch_asset_map = asset_map.clone();
-
     let _handle = thread::spawn(|| {
         watch_assets(watch_asset_map, ASSETS_PATH);
     });
@@ -47,7 +46,7 @@ fn main() {
 
 fn handle_stream(mut stream: TcpStream, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> Result<(), io::Error> {
     let peer_ip = stream.peer_addr()?;
-    println!("[{peer_ip}] connected");
+    println!("[{peer_ip}] Connected");
 
     let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
 
@@ -59,66 +58,80 @@ fn handle_stream(mut stream: TcpStream, asset_map: Arc<Mutex<HashMap<PathBuf, As
             let header_str = String::from_utf8_lossy(&buffer[..pos]);
             let body_str = String::from_utf8_lossy(&buffer[pos + 4..n]);
             let header = parse_header(header_str.to_string())?;
-            println!("Header {header:?}");
-            println!("Body {body_str:?}");
+            println!(
+                "[{peer_ip}] Received {:?} request for {:?} of length {}",
+                header.typ,
+                header.path,
+                body_str.len()
+            );
 
             let asset = match header.typ {
-                RequestType::GET => {
+                HttpRequestType::GET => {
                     let key = PathBuf::from(format!("./assets{}", header.path));
-                    println!("{key:?}");
+                    // println!("{key:?}");
                     asset_map.lock().unwrap().get(&key).cloned()
                 }
             };
 
             if let Some(asset) = asset {
-                let body = asset.content.as_bytes();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                    Content-Length: {}\r\n\
-                    Content-Type: text/plain\r\n\
-                    \r\n",
-                    body.len()
-                );
+                let body = asset.content;
+                let header = build_response_header(HttpResponseCode::Ok, HttpContentType::Text, body.len());
 
-                stream.write_all(response.as_bytes())?;
-                stream.write_all(body)?;
+                stream.write_all(header.as_bytes())?;
+                stream.write_all(body.as_bytes())?;
             } else {
-                let body = b"404 Not Found";
-                let response = format!(
-                    "HTTP/1.1 404 NOT FOUND\r\n\
-                    Content-Length: {}\r\n\
-                    Content-Type: text/plain\r\n\
-                    \r\n",
-                    body.len()
-                );
+                let body = format!("resource at {} not found", header.path);
+                let header = build_response_header(HttpResponseCode::NotFound, HttpContentType::Text, body.len());
 
-                stream.write_all(response.as_bytes())?;
-                stream.write_all(body)?;
+                stream.write_all(header.as_bytes())?;
+                stream.write_all(body.as_bytes())?;
             }
+            let _ = stream.flush();
         }
     }
 }
 
+fn build_response_header(code: HttpResponseCode, content_typ: HttpContentType, content_length: usize) -> String {
+    let status = match code {
+        HttpResponseCode::Ok => "200 Ok",
+        HttpResponseCode::NotFound => "404 Not Found",
+    };
+
+    let content_typ = match content_typ {
+        HttpContentType::Text => "text/plain",
+    };
+
+    format!("HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {content_length}\r\n\r\n")
+}
+
+enum HttpResponseCode {
+    Ok = 200,
+    NotFound = 404,
+}
+enum HttpContentType {
+    Text,
+}
+
 #[derive(Debug)]
-struct HttpHeader {
-    typ: RequestType,
+struct HttpRequestHeader {
+    typ: HttpRequestType,
     path: String,
 }
 
 #[derive(Debug)]
 #[allow(clippy::upper_case_acronyms)]
-enum RequestType {
+enum HttpRequestType {
     GET,
 }
 
-fn parse_header(header_str: String) -> Result<HttpHeader, io::Error> {
+fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
     let mut lines = header_str.lines();
 
     let first_line = lines.next().unwrap();
     let mut first_line_words = first_line.split_ascii_whitespace();
 
     let request_type = match first_line_words.next() {
-        Some("GET") => RequestType::GET,
+        Some("GET") => HttpRequestType::GET,
         invalid => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid request type {invalid:?}"))),
     };
 
@@ -128,11 +141,44 @@ fn parse_header(header_str: String) -> Result<HttpHeader, io::Error> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request path"));
     };
 
-    Ok(HttpHeader {
+    Ok(HttpRequestHeader {
         typ: request_type,
         path: path.to_owned(),
     })
 }
+
+
+// const base64Conversion:[char;64] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z','a', 'b', 'd', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/'];
+
+// fn base64(bytes:&[u8]) -> String {
+//   let count = bytes.len() * 8;
+  
+//   let pad = count % 3;
+//   let bits = bytes.bit
+
+//   for _ in 0..pad {
+//     bytes. ('');
+//   }
+
+
+//   ""
+
+  
+// }
+
+// fn sha1(input:String) -> String{
+//   let h0:u32 = 0x67452301;
+//   let h1:u32 = 0xEFCDAB89;
+//   let h2:u32 = 0x98BADCFE;
+//   let h3:u32 = 0x10325476;
+//   let h4:u32 = 0xC3D2E1F0;
+
+//   let message = input.as_bytes();
+//   let ml = message.len() * 8;
+
+//   "".to_owned()
+// }
+
 
 type AssetPath = PathBuf;
 
