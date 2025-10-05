@@ -20,8 +20,8 @@ fn main() {
     let asset_map = Arc::new(Mutex::new(match deserialize_asset_map(STATE_PATH) {
         Ok(hm) => {
             println!("Loaded {} assets from state", hm.len());
-            for asset in hm.keys() {
-                println!("{}", asset.to_string_lossy());
+            for (key, value) in hm.iter() {
+                println!("{} [{:?}]", key.to_string_lossy(), value.asset_typ);
             }
             hm
         }
@@ -65,51 +65,62 @@ fn handle_stream(mut stream: TcpStream, asset_map: Arc<Mutex<HashMap<PathBuf, As
                 body_str.len()
             );
 
-            let asset = match header.typ {
-                HttpRequestType::GET => {
-                    let key = PathBuf::from(format!("./assets{}", header.path));
-                    // println!("{key:?}");
-                    asset_map.lock().unwrap().get(&key).cloned()
-                }
-            };
-
-            if let Some(asset) = asset {
-                let body = asset.content;
-                let header = build_response_header(HttpResponseCode::Ok, HttpContentType::Text, body.len());
-
-                stream.write_all(header.as_bytes())?;
-                stream.write_all(body.as_bytes())?;
-            } else {
-                let body = format!("resource at {} not found", header.path);
-                let header = build_response_header(HttpResponseCode::NotFound, HttpContentType::Text, body.len());
-
-                stream.write_all(header.as_bytes())?;
-                stream.write_all(body.as_bytes())?;
-            }
+            let response = handle_request(header, &body_str, asset_map.clone());
+            let _ = stream.write(&response);
             let _ = stream.flush();
         }
     }
 }
 
-fn build_response_header(code: HttpResponseCode, content_typ: HttpContentType, content_length: usize) -> String {
+fn handle_request(header: HttpRequestHeader, body: &str, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> Vec<u8> {
+    let asset = match header.typ {
+        HttpRequestType::GET => {
+            let key = PathBuf::from(format!("./assets{}", header.path));
+            // println!("{key:?}");
+            asset_map.lock().unwrap().get(&key).cloned()
+        }
+    };
+
+    let res = if let Some(asset) = asset {
+        build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
+    } else {
+        let body = format!("resource at {} not found", header.path);
+        build_response(HttpResponseCode::NotFound, ContentType::Text, body)
+    };
+
+    res.as_bytes().to_vec()
+}
+
+fn build_response(code: HttpResponseCode, content_typ: ContentType, content: String) -> String {
     let status = match code {
         HttpResponseCode::Ok => "200 Ok",
         HttpResponseCode::NotFound => "404 Not Found",
     };
 
     let content_typ = match content_typ {
-        HttpContentType::Text => "text/plain",
+        ContentType::Text => "text/plain",
+        ContentType::Html => "text/html",
+        ContentType::Css => "text/css",
+        ContentType::Js => "text/javascript",
+        ContentType::Unknown => "text/plain",
     };
+    let content_length = content.len();
 
-    format!("HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {content_length}\r\n\r\n")
+    format!("HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {content_length}\r\n\r\n{content}")
 }
 
 enum HttpResponseCode {
     Ok = 200,
     NotFound = 404,
 }
-enum HttpContentType {
-    Text,
+
+#[derive(Clone, Debug)]
+enum ContentType {
+    Text = 1,
+    Html = 2,
+    Css = 3,
+    Js = 4,
+    Unknown = 5,
 }
 
 #[derive(Debug)]
@@ -269,10 +280,11 @@ fn sha1(input: String) -> [u8; 20] {
 
 type AssetPath = PathBuf;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Asset {
     last_modified: SystemTime,
     content: String,
+    asset_typ: ContentType,
 }
 
 const MAGIC_VALUE: u8 = 255;
@@ -287,6 +299,7 @@ fn serialize_asset_map(asset_map: &HashMap<AssetPath, Asset>, save_path: &str) -
         let asset_last_modified_secs_bin = last_modified_duration.as_secs();
         let asset_last_modified_nanos_bin = last_modified_duration.subsec_nanos();
         let asset_content_bin = key_value.1.content.as_bytes();
+        let asset_typ = key_value.1.asset_typ.clone() as u8;
 
         // Key
         bin.extend((key_bin.len() as u64).to_be_bytes()); // Length of path string in u8's
@@ -296,6 +309,9 @@ fn serialize_asset_map(asset_map: &HashMap<AssetPath, Asset>, save_path: &str) -
         // Unix timestamp
         bin.extend(asset_last_modified_secs_bin.to_be_bytes()); // unix time stamp is of constant length
         bin.extend(asset_last_modified_nanos_bin.to_be_bytes());
+
+        // Content typ
+        bin.push(asset_typ);
 
         // Content
         bin.extend((asset_content_bin.len() as u64).to_be_bytes()); // Length of path string in u8's
@@ -328,6 +344,15 @@ fn deserialize_asset_map(load_path: &str) -> Result<HashMap<AssetPath, Asset>, i
         idx += 4;
         let last_modified = UNIX_EPOCH + Duration::new(timestamp_secs, timestamp_nanos);
 
+        let asset_typ = match bin[idx] {
+            1 => ContentType::Text,
+            2 => ContentType::Html,
+            3 => ContentType::Css,
+            4 => ContentType::Js,
+            _ => ContentType::Unknown,
+        };
+        idx += 1;
+
         let content_length = u64::from_be_bytes(bin[idx..idx + 8].try_into().unwrap()) as usize;
         idx += 8;
 
@@ -335,7 +360,14 @@ fn deserialize_asset_map(load_path: &str) -> Result<HashMap<AssetPath, Asset>, i
         idx += content_length;
         // println!("Inserting {key:?} {last_modified:?} {content:?}");
 
-        hm.insert(key, Asset { last_modified, content });
+        hm.insert(
+            key,
+            Asset {
+                last_modified,
+                content,
+                asset_typ,
+            },
+        );
     }
 
     Ok(hm)
@@ -371,6 +403,14 @@ fn watch_assets(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &str
                     let file_path = file.path();
                     let content = fs::read_to_string(&file_path).unwrap();
 
+                    let asset_typ = match file_path.extension().and_then(|s| s.to_str()) {
+                        Some("html") => ContentType::Html,
+                        Some("txt") => ContentType::Text,
+                        Some("css") => ContentType::Css,
+                        Some("js") => ContentType::Js,
+                        _ => ContentType::Unknown,
+                    };
+
                     asset_file_paths.insert(file_path.clone());
 
                     if let Some(asset) = asset_map.lock().unwrap().get_mut(&file_path) {
@@ -391,6 +431,7 @@ fn watch_assets(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &str
                             Asset {
                                 last_modified: last_edited,
                                 content,
+                                asset_typ,
                             },
                         );
 
