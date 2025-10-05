@@ -44,57 +44,86 @@ fn main() {
     }
 }
 
+
+
 fn handle_stream(mut stream: TcpStream, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> Result<(), io::Error> {
     let peer_ip = stream.peer_addr()?;
     println!("[{peer_ip}] Connected");
 
     let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
 
+    let connection_is_http = true;
+
     loop {
         let n = stream.read(&mut buffer)?;
         // println!("{:?}", &buffer[..n]);
+        if connection_is_http {
+          if let Some(pos) = buffer[..n].windows(4).position(|window| window == b"\r\n\r\n") {
+              let header_str = String::from_utf8_lossy(&buffer[..pos]);
+              let body_str = String::from_utf8_lossy(&buffer[pos + 4..n]);
+              let header = parse_header(header_str.to_string())?;
+              println!(
+                  "[{peer_ip}] Received {:?} request for {:?} of length {}",
+                  header.typ,
+                  header.path,
+                  body_str.len()
+              );
+  
+              let response = handle_request(header, &body_str, asset_map.clone());
+              let _ = stream.write(response.as_bytes());
+              let _ = stream.flush();
+          }
+        }else { // Connection is websocket
+          let response = vec![];
+          
 
-        if let Some(pos) = buffer[..n].windows(4).position(|window| window == b"\r\n\r\n") {
-            let header_str = String::from_utf8_lossy(&buffer[..pos]);
-            let body_str = String::from_utf8_lossy(&buffer[pos + 4..n]);
-            let header = parse_header(header_str.to_string())?;
-            println!(
-                "[{peer_ip}] Received {:?} request for {:?} of length {}",
-                header.typ,
-                header.path,
-                body_str.len()
-            );
-
-            let response = handle_request(header, &body_str, asset_map.clone());
-            let _ = stream.write(&response);
-            let _ = stream.flush();
+          let _ = stream.write(&response);
+          let _ = stream.flush();  
         }
     }
 }
 
-fn handle_request(header: HttpRequestHeader, body: &str, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> Vec<u8> {
-    let asset = match header.typ {
-        HttpRequestType::GET => {
-            let key = PathBuf::from(format!("./assets{}", header.path));
-            // println!("{key:?}");
-            asset_map.lock().unwrap().get(&key).cloned()
+fn handle_request(header: HttpRequestHeader, body: &str, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> String {
+    match header.path.as_str() {
+        "/ws" => upgrade_websocket(header),
+        _ => {
+            let asset = match header.typ {
+                HttpRequestType::GET => {
+                    let key = PathBuf::from(format!("./assets{}", header.path));
+                    // println!("{key:?}");
+                    asset_map.lock().unwrap().get(&key).cloned()
+                }
+            };
+            if let Some(asset) = asset {
+                build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
+            } else {
+                let body = format!("resource at {} not found", header.path);
+                build_response(HttpResponseCode::NotFound, ContentType::Text, body)
+            }
         }
-    };
+    }
+}
 
-    let res = if let Some(asset) = asset {
-        build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
-    } else {
-        let body = format!("resource at {} not found", header.path);
-        build_response(HttpResponseCode::NotFound, ContentType::Text, body)
-    };
+fn upgrade_websocket(header: HttpRequestHeader) -> String {
+    println!("upgrading connection to websocket");
+    if let Some(_) = header.upgrade 
+    && let Some(_) = header.upgrade 
+    && let Some(sec_websocket_key) = header.sec_websocket_key 
+    && let Some(_) = header.sec_websocket_version {
+      let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+      let websocket_accept = base64(&sha1(format!("{sec_websocket_key}{magic_string}")));
+      format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n")
 
-    res.as_bytes().to_vec()
+    }else {
+      build_response(HttpResponseCode::BadRequest, ContentType::Text, "Invalid websocket upgrade request".to_owned())
+    }
 }
 
 fn build_response(code: HttpResponseCode, content_typ: ContentType, content: String) -> String {
     let status = match code {
         HttpResponseCode::Ok => "200 Ok",
         HttpResponseCode::NotFound => "404 Not Found",
+        HttpResponseCode::BadRequest => "400 Bad Request",
     };
 
     let content_typ = match content_typ {
@@ -112,6 +141,7 @@ fn build_response(code: HttpResponseCode, content_typ: ContentType, content: Str
 enum HttpResponseCode {
     Ok = 200,
     NotFound = 404,
+    BadRequest = 400,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +157,11 @@ enum ContentType {
 struct HttpRequestHeader {
     typ: HttpRequestType,
     path: String,
+    origin: Option<String>,
+    sec_websocket_key: Option<String>,
+    sec_websocket_version: Option<String>,
+    user_agent: Option<String>,
+    upgrade: Option<String>,
 }
 
 #[derive(Debug)]
@@ -152,9 +187,34 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request path"));
     };
 
+    let mut origin = None;
+    let mut sec_websocket_key = None;
+    let mut sec_websocket_version = None;
+    let mut user_agent = None;
+    let mut upgrade = None;
+
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.to_string();
+            match key.to_ascii_lowercase().as_str() {
+                "origin" => origin = Some(value),
+                "sec-websocket-key" => sec_websocket_key = Some(value),
+                "sec-websocket-version" => sec_websocket_version = Some(value),
+                "user-agent" => user_agent = Some(value),
+                "upgrade" => upgrade = Some(value),
+                _ => {}
+            }
+        }
+    }
+
     Ok(HttpRequestHeader {
         typ: request_type,
         path: path.to_owned(),
+        origin,
+        sec_websocket_key,
+        sec_websocket_version,
+        user_agent,
+        upgrade,
     })
 }
 
