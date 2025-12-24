@@ -1,105 +1,161 @@
+#![feature(tcp_linger)]
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
-use std::{fs, thread};
+use std::{fs, thread, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
 
 fn main() {
-    let listener = TcpListener::bind(SOCKET_ADDR).unwrap();
+    let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
     println!("Started listening on socket {SOCKET_ADDR}");
 
     let assets = Arc::new(Mutex::new(HashMap::new()));
 
-    let changed = AtomicBool::new(false);
+    let changed = Arc::new(AtomicBool::new(false));
     #[cfg(debug_assertions)]
     {
-        hot_reloading(assets.clone(), ASSETS_PATH, changed);
+        hot_reloading(assets.clone(), ASSETS_PATH, changed.clone());
     }
 
-    for stream in listener.incoming() {
-        let handle_asset_map = assets.clone();
-        thread::spawn(|| {
-            let _ = handle_stream(stream.unwrap(), handle_asset_map);
-        });
-    }
-}
-
-fn handle_stream(mut stream: TcpStream, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> Result<(), io::Error> {
-    let peer_ip = stream.peer_addr()?;
-    println!("[{peer_ip}] Connected");
+    listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
 
     let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
 
-    let connection_is_http = true;
-
+    let mut active_streams = vec![];
+    let mut it = 0;
     loop {
-        let n = stream.read(&mut buffer)?;
-        // println!("{:?}", &buffer[..n]);
-        if connection_is_http {
-            if let Some(pos) = buffer[..n].windows(4).position(|window| window == b"\r\n\r\n") {
-                let header_str = String::from_utf8_lossy(&buffer[..pos]);
-                let body_str = String::from_utf8_lossy(&buffer[pos + 4..n]);
-                let header = parse_header(header_str.to_string())?;
-                println!(
-                    "[{peer_ip}] Received {:?} request for {:?} of length {}",
-                    header.typ,
-                    header.path,
-                    body_str.len()
-                );
+        print!("Loop it {it}\r");
+        it += 1;
 
-                let response = handle_request(header, &body_str, asset_map.clone());
-                let _ = stream.write(&response);
-                let _ = stream.flush();
+        if let Ok((mut stream, peer_addr)) = listener.accept() {
+            println!("[{peer_addr}] Connected");
+            let n = stream.read(&mut buffer).expect("Unable to read buffer");
+
+            let (header, body) = parse_request(&buffer[..n]).expect("Unable to parse request");
+
+            println!(
+                "[{peer_addr}] Received {:?} request for {:?} of length {}",
+                header.typ,
+                header.path,
+                body.len()
+            );
+
+            let mut is_ws = false;
+
+            match header.path.as_str() {
+                "/ws" => {
+                    print!("[{peer_addr:?}] Upgrading websocket ... ");
+                    let response = upgrade_websocket(header);
+
+                    let payload = "test".as_bytes();
+                    let mut frame = Vec::new();
+
+                    frame.push(0x81);
+                    frame.push(payload.len() as u8);
+                    frame.extend_from_slice(payload);
+
+                    let _ = stream.write(&response).expect("Failed to write to stream");
+                    stream.flush().expect("Failed to flush stream");
+                    let mut buff: [u8; 8192] = [0; 8192];
+                    let n = stream.read(&mut buff).expect("fail");
+
+                    println!("res: {:?}", buff[..n].to_vec());
+
+                    stream.write_all(&frame).expect("Failed to flush stream");
+                    is_ws = true;
+                }
+                _ => {
+                    let asset = match header.typ {
+                        HttpRequestType::GET => {
+                            let key = PathBuf::from(format!("./assets{}", header.path));
+                            // println!("{key:?}");
+                            assets.lock().expect("Cant get lock").get(&key).cloned()
+                        }
+                    };
+                    let response = if let Some(asset) = asset {
+                        build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
+                    } else {
+                        let body = Content::Text(format!("resource at {} not found", header.path));
+                        build_response(HttpResponseCode::NotFound, ContentType::Text, body)
+                    };
+
+                    let _ = stream.write(&response).expect("Failed to write to stream");
+                    stream.flush().expect("Failed to flush stream");
+                }
+            };
+
+            #[cfg(not(debug_assertions))]
+            {
+                stream.set_linger(Some(Duration::from_secs(0))).exact("Unable to change linger time");
+                stream.shutdown(std::net::Shutdown::Both).expect("Unable to close connection");
             }
-        } else {
-            // Connection is websocket
-            let response = vec![];
-            let _ = stream.write(&response);
-            let _ = stream.flush();
+            #[cfg(debug_assertions)]
+            {
+                if is_ws {
+                    active_streams.push(stream);
+                    println!("Active connections {}", active_streams.len());
+                }
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            if changed.load(Ordering::Relaxed) {
+                active_streams.retain(|mut stream| {
+                        if let Ok(peer_addr) = stream.peer_addr()
+                            && let Ok(_) = stream.write("reload".as_bytes())
+                            && let Ok(_) = stream.flush()
+                        {
+                            println!("[{peer_addr:?}] Reloaded");
+                            true
+                        } else {
+                            println!("Failed to reload, closing connection");
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+
+                            false
+                        }
+                    });
+                changed.store(false, Ordering::Relaxed);
+            }
         }
     }
 }
 
-fn handle_request(header: HttpRequestHeader, _body: &str, asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>) -> Vec<u8> {
-    match header.path.as_str() {
-        "/ws" => upgrade_websocket(header),
-        _ => {
-            let asset = match header.typ {
-                HttpRequestType::GET => {
-                    let key = PathBuf::from(format!("./assets{}", header.path));
-                    // println!("{key:?}");
-                    asset_map.lock().unwrap().get(&key).cloned()
-                }
-            };
-            if let Some(asset) = asset {
-                build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
-            } else {
-                let body = Content::Text(format!("resource at {} not found", header.path));
-                build_response(HttpResponseCode::NotFound, ContentType::Text, body)
-            }
-        }
+fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Error> {
+    if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+        let header = parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string()).expect("Unable to parse header");
+
+        let content = match header.content_typ {
+            ContentType::Png => Content::Binary(buffer[pos + 4..].to_vec()),
+            _ => Content::Text(String::from_utf8_lossy(&buffer[pos + 4..]).to_string()),
+        };
+
+        Ok((header, content))
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "could not find header/body separator"))
     }
 }
 
 fn upgrade_websocket(header: HttpRequestHeader) -> Vec<u8> {
-    println!("upgrading connection to websocket");
     if let Some(_) = header.upgrade
         && let Some(sec_websocket_key) = header.sec_websocket_key
         && let Some(_) = header.sec_websocket_version
     {
         let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         let websocket_accept = base64(&sha1(format!("{sec_websocket_key}{magic_string}")));
-        format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n")
+        println!("Succeeded");
+        format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n")
             .as_bytes()
             .to_vec()
     } else {
+        println!("Failed");
         build_response(
             HttpResponseCode::BadRequest,
             ContentType::Text,
@@ -169,6 +225,7 @@ struct HttpRequestHeader {
     sec_websocket_key: Option<String>,
     sec_websocket_version: Option<String>,
     upgrade: Option<String>,
+    content_typ: ContentType,
 }
 
 #[derive(Debug)]
@@ -180,7 +237,7 @@ enum HttpRequestType {
 fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
     let mut lines = header_str.lines();
 
-    let first_line = lines.next().unwrap();
+    let first_line = lines.next().expect("Unable to get next line");
     let mut first_line_words = first_line.split_ascii_whitespace();
 
     let request_type = match first_line_words.next() {
@@ -199,6 +256,7 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
     let mut sec_websocket_version = None;
     let mut user_agent = None;
     let mut upgrade = None;
+    let mut content_typ = ContentType::Unknown;
 
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
@@ -209,6 +267,16 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
                 "sec-websocket-version" => sec_websocket_version = Some(value),
                 "user-agent" => user_agent = Some(value),
                 "upgrade" => upgrade = Some(value),
+                "content-type" => {
+                    content_typ = match value.as_str() {
+                        "text/plain" => ContentType::Text,
+                        "text/html" => ContentType::Html,
+                        "text/css" => ContentType::Css,
+                        "text/javascript" => ContentType::Js,
+                        "image/png" => ContentType::Png,
+                        _ => ContentType::Unknown,
+                    }
+                }
                 _ => {}
             }
         }
@@ -222,6 +290,7 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
         sec_websocket_key,
         sec_websocket_version,
         upgrade,
+        content_typ,
     })
 }
 
@@ -360,8 +429,18 @@ enum Content {
     Text(String),
 }
 
-fn hot_reloading(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &'static str, changed: AtomicBool) {
+impl Content {
+    pub fn len(&self) -> usize {
+        match self {
+            Content::Binary(bytes) => bytes.len(),
+            Content::Text(text) => text.len(),
+        }
+    }
+}
+
+fn hot_reloading(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &'static str, changed: Arc<AtomicBool>) {
     let _handle = thread::spawn(move || {
+        println!("Started file watcher thread");
         loop {
             let rootdir: PathBuf = PathBuf::from(dir_path);
 
@@ -399,24 +478,26 @@ fn hot_reloading(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &'s
                         };
 
                         let content = match asset_typ {
-                            ContentType::Png | ContentType::Unknown => Content::Binary(fs::read(&file_path).unwrap()),
-                            _ => Content::Text(fs::read_to_string(&file_path).unwrap()),
+                            ContentType::Png | ContentType::Unknown => {
+                                Content::Binary(fs::read(&file_path).expect("Unable to read file into binary"))
+                            }
+                            _ => Content::Text(fs::read_to_string(&file_path).expect("Unable read file into string")),
                         };
 
                         asset_file_paths.insert(file_path.clone());
 
-                        if let Some(asset) = asset_map.lock().unwrap().get_mut(&file_path) {
+                        if let Some(asset) = asset_map.lock().expect("Unable to acquire lock").get_mut(&file_path) {
                             if asset.last_modified < last_edited {
                                 asset.content = content;
                                 asset.last_modified = last_edited;
                                 changed.store(true, Ordering::Release);
                                 println!(
                                     "Updated file {file_path:?}, edited {:?} minutes ago",
-                                    last_edited.elapsed().unwrap().as_secs() / 60
+                                    last_edited.elapsed().expect("Unable to get time elapsed").as_secs() / 60
                                 );
                             }
                         } else {
-                            asset_map.lock().unwrap().insert(
+                            asset_map.lock().expect("Unable to acquire lock").insert(
                                 file_path.clone(),
                                 Asset {
                                     last_modified: last_edited,
@@ -427,18 +508,18 @@ fn hot_reloading(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &'s
                             changed.store(true, Ordering::Release);
                             println!(
                                 "Added file {file_path:?}, edited {:?} minutes ago",
-                                last_edited.elapsed().unwrap().as_secs() / 60
+                                last_edited.elapsed().expect("Unable to get time elapsed").as_secs() / 60
                             );
                         }
                     }
                 }
             }
 
-            let keys_set: HashSet<_> = asset_map.lock().unwrap().keys().cloned().collect();
+            let keys_set: HashSet<_> = asset_map.lock().expect("Unable to acquire lock").keys().cloned().collect();
             let asset_difference = keys_set.difference(&asset_file_paths);
             // println!("{keys_set:?} {asset_file_paths:?} {asset_difference:?}");
 
-            let mut map = asset_map.lock().unwrap();
+            let mut map = asset_map.lock().expect("Unable to acquire lock");
             for key in asset_difference {
                 map.remove(key);
                 println!("Removed file {key:?}");
