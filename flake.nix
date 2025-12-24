@@ -31,6 +31,7 @@
             packages = with pkgs; [
               rust-analyzer-unwrapped
               toolchain
+              typst
             ];
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
           };
