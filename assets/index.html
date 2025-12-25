@@ -2,11 +2,15 @@
 <head>
   <script>
     const ws = new WebSocket("ws://127.0.0.1:4000/ws");
-    ws.onopen = () => console.log("Connected!");
-    ws.onmessage = (event) => console.log("Message:", event.data);
-    ws.send("Hello from browser!");
+    ws.onopen = () => console.log("Websockter connected!");
+    ws.onmessage = (event) => {
+      if ( event.data == "reload" ) {
+        window.location.reload();
+      };
+    }
+
   </script>
 </head>
 <body>
-ballsssddddsssssssssssssssss
+testtes
 </body>

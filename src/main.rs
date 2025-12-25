@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,19 +17,19 @@ fn main() {
     let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
     println!("Started listening on socket {SOCKET_ADDR}");
 
-    let assets = Arc::new(Mutex::new(HashMap::new()));
+    let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let changed = Arc::new(AtomicBool::new(false));
     #[cfg(debug_assertions)]
     {
         hot_reloading(assets.clone(), ASSETS_PATH, changed.clone());
     }
-
+    #[cfg(debug_assertions)]
     listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
 
     let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
 
-    let mut active_streams = vec![];
+    let mut active_streams: Vec<TcpStream> = vec![];
     let mut it = 0;
     loop {
         print!("Loop it {it}\r");
@@ -51,25 +51,12 @@ fn main() {
             let mut is_ws = false;
 
             match header.path.as_str() {
+                #[cfg(debug_assertions)]
                 "/ws" => {
                     print!("[{peer_addr:?}] Upgrading websocket ... ");
                     let response = upgrade_websocket(header);
-
-                    let payload = "test".as_bytes();
-                    let mut frame = Vec::new();
-
-                    frame.push(0x81);
-                    frame.push(payload.len() as u8);
-                    frame.extend_from_slice(payload);
-
-                    let _ = stream.write(&response).expect("Failed to write to stream");
+                    stream.write_all(&response).expect("Failed to write to stream");
                     stream.flush().expect("Failed to flush stream");
-                    let mut buff: [u8; 8192] = [0; 8192];
-                    let n = stream.read(&mut buff).expect("fail");
-
-                    println!("res: {:?}", buff[..n].to_vec());
-
-                    stream.write_all(&frame).expect("Failed to flush stream");
                     is_ws = true;
                 }
                 _ => {
@@ -89,17 +76,18 @@ fn main() {
 
                     let _ = stream.write(&response).expect("Failed to write to stream");
                     stream.flush().expect("Failed to flush stream");
+                    #[cfg(not(debug_assertions))]
+                    {
+                        stream.set_linger(Some(Duration::from_secs(0))).expect("Unable to change linger time");
+                        stream.shutdown(std::net::Shutdown::Both).expect("Unable to close connection");
+                    }
                 }
             };
 
-            #[cfg(not(debug_assertions))]
-            {
-                stream.set_linger(Some(Duration::from_secs(0))).exact("Unable to change linger time");
-                stream.shutdown(std::net::Shutdown::Both).expect("Unable to close connection");
-            }
             #[cfg(debug_assertions)]
             {
                 if is_ws {
+                    // thread::sleep(Duration::from_secs(2));
                     active_streams.push(stream);
                     println!("Active connections {}", active_streams.len());
                 }
@@ -108,24 +96,53 @@ fn main() {
         #[cfg(debug_assertions)]
         {
             if changed.load(Ordering::Relaxed) {
-                active_streams.retain(|mut stream| {
-                        if let Ok(peer_addr) = stream.peer_addr()
-                            && let Ok(_) = stream.write("reload".as_bytes())
-                            && let Ok(_) = stream.flush()
-                        {
-                            println!("[{peer_addr:?}] Reloaded");
-                            true
-                        } else {
-                            println!("Failed to reload, closing connection");
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                active_streams.retain(|stream| {
+                    if let Ok(peer_addr) = stream.peer_addr()
+                        && let Ok(_) = send_ws_message(stream, "reload")
+                    {
+                        println!("[{peer_addr:?}] Reloaded");
+                        true
+                    } else {
+                        println!("Failed to reload, closing connection");
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
 
-                            false
-                        }
-                    });
+                        false
+                    }
+                });
                 changed.store(false, Ordering::Relaxed);
             }
         }
     }
+}
+
+fn upgrade_websocket(header: HttpRequestHeader) -> Vec<u8> {
+    if let Some(_) = header.upgrade
+        && let Some(sec_websocket_key) = header.sec_websocket_key
+        && let Some(_) = header.sec_websocket_version
+    {
+        let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        let websocket_accept = base64(&sha1(format!("{}{magic_string}", sec_websocket_key.trim())));
+        println!("Succeeded");
+        format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n")
+            .as_bytes()
+            .to_vec()
+    } else {
+        println!("Failed");
+        build_response(
+            HttpResponseCode::BadRequest,
+            ContentType::Text,
+            Content::Text("Invalid websocket upgrade request".to_owned()),
+        )
+    }
+}
+
+fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), io::Error> {
+    let mut frame = Vec::new();
+    frame.push(0x81); // first bit for FIN frame and 8th bit for message type text 
+    frame.push(msg.len() as u8); // should technically u7, but not needed for my use case
+    frame.extend_from_slice(msg.as_bytes());
+    stream.write_all(&frame)?;
+    stream.flush()
 }
 
 fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Error> {
@@ -140,27 +157,6 @@ fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Erro
         Ok((header, content))
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidData, "could not find header/body separator"))
-    }
-}
-
-fn upgrade_websocket(header: HttpRequestHeader) -> Vec<u8> {
-    if let Some(_) = header.upgrade
-        && let Some(sec_websocket_key) = header.sec_websocket_key
-        && let Some(_) = header.sec_websocket_version
-    {
-        let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        let websocket_accept = base64(&sha1(format!("{sec_websocket_key}{magic_string}")));
-        println!("Succeeded");
-        format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n")
-            .as_bytes()
-            .to_vec()
-    } else {
-        println!("Failed");
-        build_response(
-            HttpResponseCode::BadRequest,
-            ContentType::Text,
-            Content::Text("Invalid websocket upgrade request".to_owned()),
-        )
     }
 }
 
