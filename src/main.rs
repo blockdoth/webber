@@ -1,43 +1,115 @@
 #![feature(tcp_linger)]
+#![allow(unexpected_cfgs)]
+#![allow(dead_code, unused, unused_mut)]
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Display, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
-use std::time::{Duration, SystemTime};
-use std::{fs, thread, vec};
+use std::time::{Duration, Instant, SystemTime};
+use std::{fmt, fs, thread, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
 
+#[cfg(generated)]
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
 fn main() {
+    if std::env::args().any(|arg| arg.contains("build-script-build")) {
+        println!("cargo:warning=Running in build script");
+        comptime();
+    } else {
+        println!("Running normally");
+        runtime();
+    }
+}
+
+fn comptime() {
+    println!("cargo:rerun-if-changed=none");
+    println!("cargo:rustc-cfg=generated");
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let file_path = Path::new(&out_dir).join("generated.rs");
+
+    let asset_paths = walk_dir(ASSETS_PATH);
+
+    let mut assets_str = String::new();
+    assets_str.push_str("fn get_assets() -> HashMap<PathBuf, Asset> {\n");
+    assets_str.push_str("\tlet mut assets = HashMap::new();\n");
+
+    for asset_path in asset_paths {
+        let path_key = asset_path.to_string_lossy();
+        let full_path = format!("{}/{}", std::env::current_dir().expect("current dir").to_string_lossy(), path_key);
+
+        assets_str.push_str(&format!("\tlet path = PathBuf::from(\"{}\");\n", path_key));
+        assets_str.push_str(&format!("\tlet asset_typ = AssetType::from_path(&PathBuf::from(\"{}\"));\n", full_path));
+        assets_str.push_str(&format!("\tlet content_raw = include_bytes!(\"{}\").to_vec();\n", full_path));
+        assets_str.push_str(
+            "\tlet content = if asset_typ.is_text() {
+                Content::Text(String::from_utf8(content_raw).expect(\"Failed to convert to utf8\"))
+            } else {
+                Content::Binary(content_raw)
+            };\n",
+        );
+        assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now()};\n");
+        assets_str.push_str("\tassets.insert(path,asset);\n");
+    }
+    assets_str.push_str("\tassets\n");
+    assets_str.push_str("}\n");
+
+    fs::write(&file_path, assets_str).unwrap();
+    println!("cargo:warning=End of build script");
+}
+
+fn runtime() {
+    #[cfg(generated)]
+    let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(get_assets()));
+    #[cfg(not(generated))]
+    let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(HashMap::new()));
+
     let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
     println!("Started listening on socket {SOCKET_ADDR}");
 
-    let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    let changed = Arc::new(AtomicBool::new(false));
+    let reload_assets = Arc::new(AtomicBool::new(false));
     #[cfg(debug_assertions)]
     {
-        hot_reloading(assets.clone(), ASSETS_PATH, changed.clone());
+        hot_reloading(assets.clone(), ASSETS_PATH, reload_assets.clone());
     }
-    #[cfg(debug_assertions)]
-    listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
 
     let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
-
     let mut active_streams: Vec<TcpStream> = vec![];
+    let mut check_alive_timer = Instant::now();
+
     let mut it = 0;
-    loop {
+
+    'main: loop {
         print!("Loop it {it}\r");
         it += 1;
 
+        if active_streams.is_empty() {
+            listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
+        } else {
+            listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
+        }
+
         if let Ok((mut stream, peer_addr)) = listener.accept() {
             println!("[{peer_addr}] Connected");
-            let n = stream.read(&mut buffer).expect("Unable to read buffer");
+            stream.set_nonblocking(true).expect("Failed to change blocking of stream");
+
+            let n = loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => {
+                        println!("[{peer_addr}] Disconnected");
+                        continue 'main;
+                    }
+                    Ok(n) => break n,
+                    _ => continue,
+                };
+            };
 
             let (header, body) = parse_request(&buffer[..n]).expect("Unable to parse request");
 
@@ -59,10 +131,10 @@ fn main() {
                     stream.flush().expect("Failed to flush stream");
                     is_ws = true;
                 }
-                _ => {
+                path => {
                     let asset = match header.typ {
                         HttpRequestType::GET => {
-                            let key = PathBuf::from(format!("./assets{}", header.path));
+                            let key = PathBuf::from(format!("./assets{}", path));
                             // println!("{key:?}");
                             assets.lock().expect("Cant get lock").get(&key).cloned()
                         }
@@ -70,8 +142,8 @@ fn main() {
                     let response = if let Some(asset) = asset {
                         build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
                     } else {
-                        let body = Content::Text(format!("resource at {} not found", header.path));
-                        build_response(HttpResponseCode::NotFound, ContentType::Text, body)
+                        let body = Content::Text(format!("resource at {} not found", path));
+                        build_response(HttpResponseCode::NotFound, AssetType::Text, body)
                     };
 
                     let _ = stream.write(&response).expect("Failed to write to stream");
@@ -95,21 +167,34 @@ fn main() {
         }
         #[cfg(debug_assertions)]
         {
-            if changed.load(Ordering::Relaxed) {
-                active_streams.retain(|stream| {
-                    if let Ok(peer_addr) = stream.peer_addr()
-                        && let Ok(_) = send_ws_message(stream, "reload")
-                    {
-                        println!("[{peer_addr:?}] Reloaded");
+            let should_reload = reload_assets.load(Ordering::Relaxed);
+
+            if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
+                check_alive_timer = Instant::now();
+                active_streams.retain(|mut stream| {
+                    let connection_is_alive = match stream.read(&mut [0]) {
+                        Ok(0) => false,
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                        _ => false,
+                    };
+
+                    if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
+                        if should_reload {
+                            let _ = send_ws_message(stream, "reload");
+                            println!("[{peer_addr:?}] Reloaded");
+                        }
+                        // println!("[{peer_addr:?}] Connection still alive");
                         true
                     } else {
-                        println!("Failed to reload, closing connection");
+                        println!("Closing connection");
                         let _ = stream.shutdown(std::net::Shutdown::Both);
 
                         false
                     }
                 });
-                changed.store(false, Ordering::Relaxed);
+                if should_reload {
+                    reload_assets.store(false, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -130,7 +215,7 @@ fn upgrade_websocket(header: HttpRequestHeader) -> Vec<u8> {
         println!("Failed");
         build_response(
             HttpResponseCode::BadRequest,
-            ContentType::Text,
+            AssetType::Text,
             Content::Text("Invalid websocket upgrade request".to_owned()),
         )
     }
@@ -150,7 +235,7 @@ fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Erro
         let header = parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string()).expect("Unable to parse header");
 
         let content = match header.content_typ {
-            ContentType::Png => Content::Binary(buffer[pos + 4..].to_vec()),
+            AssetType::Png => Content::Binary(buffer[pos + 4..].to_vec()),
             _ => Content::Text(String::from_utf8_lossy(&buffer[pos + 4..]).to_string()),
         };
 
@@ -160,20 +245,11 @@ fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Erro
     }
 }
 
-fn build_response(code: HttpResponseCode, content_typ: ContentType, content: Content) -> Vec<u8> {
+fn build_response(code: HttpResponseCode, content_typ: AssetType, content: Content) -> Vec<u8> {
     let status = match code {
         HttpResponseCode::Ok => "200 Ok",
         HttpResponseCode::NotFound => "404 Not Found",
         HttpResponseCode::BadRequest => "400 Bad Request",
-    };
-
-    let content_typ = match content_typ {
-        ContentType::Text => "text/plain",
-        ContentType::Html => "text/html",
-        ContentType::Css => "text/css",
-        ContentType::Js => "text/javascript",
-        ContentType::Unknown => "text/plain",
-        ContentType::Png => "image/png",
     };
 
     match content {
@@ -202,16 +278,6 @@ enum HttpResponseCode {
     BadRequest = 400,
 }
 
-#[derive(Clone, Debug)]
-enum ContentType {
-    Text = 1,
-    Html = 2,
-    Css = 3,
-    Js = 4,
-    Png = 5,
-    Unknown = 6,
-}
-
 #[derive(Debug)]
 struct HttpRequestHeader {
     typ: HttpRequestType,
@@ -221,7 +287,7 @@ struct HttpRequestHeader {
     sec_websocket_key: Option<String>,
     sec_websocket_version: Option<String>,
     upgrade: Option<String>,
-    content_typ: ContentType,
+    content_typ: AssetType,
 }
 
 #[derive(Debug)]
@@ -252,7 +318,7 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
     let mut sec_websocket_version = None;
     let mut user_agent = None;
     let mut upgrade = None;
-    let mut content_typ = ContentType::Unknown;
+    let mut content_typ = AssetType::Unknown;
 
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
@@ -265,12 +331,12 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
                 "upgrade" => upgrade = Some(value),
                 "content-type" => {
                     content_typ = match value.as_str() {
-                        "text/plain" => ContentType::Text,
-                        "text/html" => ContentType::Html,
-                        "text/css" => ContentType::Css,
-                        "text/javascript" => ContentType::Js,
-                        "image/png" => ContentType::Png,
-                        _ => ContentType::Unknown,
+                        "text/plain" => AssetType::Text,
+                        "text/html" => AssetType::Html,
+                        "text/css" => AssetType::Css,
+                        "text/javascript" => AssetType::Js,
+                        "image/png" => AssetType::Png,
+                        _ => AssetType::Unknown,
                     }
                 }
                 _ => {}
@@ -288,6 +354,172 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
         upgrade,
         content_typ,
     })
+}
+
+#[derive(Clone, Debug)]
+enum AssetType {
+    Text = 1,
+    Html = 2,
+    Css = 3,
+    Js = 4,
+    Png = 5,
+    Unknown = 6,
+}
+
+impl AssetType {
+    fn is_text(&self) -> bool {
+        use AssetType::*;
+        matches!(self, Text | Html | Css | Js)
+    }
+    fn from_path(path: &Path) -> AssetType {
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("html") => AssetType::Html,
+            Some("txt") => AssetType::Text,
+            Some("css") => AssetType::Css,
+            Some("js") => AssetType::Js,
+            Some("png") => AssetType::Png,
+            _ => AssetType::Unknown,
+        }
+    }
+}
+
+impl fmt::Display for AssetType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AssetType::Text => "text/plain",
+            AssetType::Html => "text/html",
+            AssetType::Css => "text/css",
+            AssetType::Js => "text/javascript",
+            AssetType::Png => "image/png",
+            AssetType::Unknown => "text/plain",
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Asset {
+    last_modified: SystemTime,
+    content: Content,
+    asset_typ: AssetType,
+}
+
+#[derive(Clone, Debug)]
+enum Content {
+    Binary(Vec<u8>),
+    Text(String),
+}
+
+impl Content {
+    pub fn len(&self) -> usize {
+        match self {
+            Content::Binary(bytes) => bytes.len(),
+            Content::Text(text) => text.len(),
+        }
+    }
+    fn from_path(path: &Path, content_typ: &AssetType) -> Content {
+        match content_typ {
+            AssetType::Png | AssetType::Unknown => Content::Binary(fs::read(path).expect("Unable to read file into binary")),
+            _ => Content::Text(fs::read_to_string(path).expect("Unable read file into string")),
+        }
+    }
+}
+
+fn walk_dir(dir_path: &'static str) -> Vec<PathBuf> {
+    let rootdir: PathBuf = PathBuf::from(dir_path);
+
+    let mut asset_paths = vec![];
+    let mut stack = vec![rootdir];
+
+    while let Some(dir_path) = stack.pop() {
+        let dir = match fs::read_dir(&dir_path) {
+            Ok(dir) => dir,
+            Err(error) => {
+                println!("Error while trying to open asset dir at {dir_path:?}: {error}");
+                continue;
+            }
+        };
+
+        for file in dir {
+            if let Ok(file) = file
+                && let Ok(metadata) = file.metadata()
+            {
+                if metadata.is_dir() {
+                    stack.push(file.path());
+                    continue;
+                };
+                let file_path = file.path();
+                asset_paths.push(file_path.clone());
+            }
+        }
+    }
+    asset_paths
+}
+
+fn hot_reloading(asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>, dir_path: &'static str, changed: Arc<AtomicBool>) {
+    let _ = thread::spawn(move || {
+        println!("Started file watcher thread");
+        loop {
+            let asset_paths = walk_dir(dir_path);
+            let asset_set: HashSet<PathBuf> = asset_paths.iter().cloned().collect();
+
+            let mut map = asset_map.lock().expect("Unable to acquire lock");
+            for path in asset_paths {
+                let metadata = match path.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let last_modified = match metadata.modified() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                match map.get_mut(&path) {
+                    Some(existing_asset) => {
+                        if last_modified > existing_asset.last_modified {
+                            existing_asset.content = Content::from_path(&path, &existing_asset.asset_typ);
+                            existing_asset.last_modified = last_modified;
+                            changed.store(true, Ordering::Release);
+
+                            println!(
+                                "Updated file {:?}, edited {} minutes ago",
+                                path,
+                                last_modified.elapsed().unwrap().as_secs() / 60
+                            );
+                        }
+                    }
+                    None => {
+                        let content_typ = AssetType::from_path(&path);
+                        map.insert(
+                            path.clone(),
+                            Asset {
+                                last_modified,
+                                content: Content::from_path(&path, &content_typ),
+                                asset_typ: content_typ,
+                            },
+                        );
+                        changed.store(true, Ordering::Release);
+                        println!(
+                            "Added file {:?}, edited {:?} minutes ago",
+                            path,
+                            last_modified.elapsed().expect("Unable to get time elapsed").as_secs() / 60
+                        );
+                    }
+                }
+            }
+            map.retain(|path, _| {
+                if asset_set.contains(path) {
+                    true
+                } else {
+                    println!("Removed file {:?}", path);
+                    changed.store(true, Ordering::Release);
+                    false
+                }
+            });
+
+            sleep(Duration::from_millis(100));
+        }
+    });
 }
 
 const BASE64_CONVERSION: [char; 64] = [
@@ -408,120 +640,4 @@ fn sha1(input: String) -> [u8; 20] {
     digest[12..16].copy_from_slice(&h3.to_be_bytes());
     digest[16..20].copy_from_slice(&h4.to_be_bytes());
     digest
-}
-
-type AssetPath = PathBuf;
-
-#[derive(Clone, Debug)]
-struct Asset {
-    last_modified: SystemTime,
-    content: Content,
-    asset_typ: ContentType,
-}
-
-#[derive(Clone, Debug)]
-enum Content {
-    Binary(Vec<u8>),
-    Text(String),
-}
-
-impl Content {
-    pub fn len(&self) -> usize {
-        match self {
-            Content::Binary(bytes) => bytes.len(),
-            Content::Text(text) => text.len(),
-        }
-    }
-}
-
-fn hot_reloading(asset_map: Arc<Mutex<HashMap<AssetPath, Asset>>>, dir_path: &'static str, changed: Arc<AtomicBool>) {
-    let _handle = thread::spawn(move || {
-        println!("Started file watcher thread");
-        loop {
-            let rootdir: PathBuf = PathBuf::from(dir_path);
-
-            let mut asset_file_paths = HashSet::new();
-
-            let mut stack = vec![rootdir];
-
-            while let Some(dir_path) = stack.pop() {
-                let dir = match fs::read_dir(&dir_path) {
-                    Ok(dir) => dir,
-                    Err(error) => {
-                        println!("Error while trying to open asset dir at {dir_path:?}: {error}");
-                        continue;
-                    }
-                };
-
-                for file in dir {
-                    if let Ok(file) = file
-                        && let Ok(metadata) = file.metadata()
-                        && let Ok(last_edited) = metadata.accessed()
-                    {
-                        if metadata.is_dir() {
-                            stack.push(file.path());
-                            continue;
-                        };
-                        let file_path = file.path();
-
-                        let asset_typ = match file_path.extension().and_then(|s| s.to_str()) {
-                            Some("html") => ContentType::Html,
-                            Some("txt") => ContentType::Text,
-                            Some("css") => ContentType::Css,
-                            Some("js") => ContentType::Js,
-                            Some("png") => ContentType::Png,
-                            _ => ContentType::Unknown,
-                        };
-
-                        let content = match asset_typ {
-                            ContentType::Png | ContentType::Unknown => {
-                                Content::Binary(fs::read(&file_path).expect("Unable to read file into binary"))
-                            }
-                            _ => Content::Text(fs::read_to_string(&file_path).expect("Unable read file into string")),
-                        };
-
-                        asset_file_paths.insert(file_path.clone());
-
-                        if let Some(asset) = asset_map.lock().expect("Unable to acquire lock").get_mut(&file_path) {
-                            if asset.last_modified < last_edited {
-                                asset.content = content;
-                                asset.last_modified = last_edited;
-                                changed.store(true, Ordering::Release);
-                                println!(
-                                    "Updated file {file_path:?}, edited {:?} minutes ago",
-                                    last_edited.elapsed().expect("Unable to get time elapsed").as_secs() / 60
-                                );
-                            }
-                        } else {
-                            asset_map.lock().expect("Unable to acquire lock").insert(
-                                file_path.clone(),
-                                Asset {
-                                    last_modified: last_edited,
-                                    content,
-                                    asset_typ,
-                                },
-                            );
-                            changed.store(true, Ordering::Release);
-                            println!(
-                                "Added file {file_path:?}, edited {:?} minutes ago",
-                                last_edited.elapsed().expect("Unable to get time elapsed").as_secs() / 60
-                            );
-                        }
-                    }
-                }
-            }
-
-            let keys_set: HashSet<_> = asset_map.lock().expect("Unable to acquire lock").keys().cloned().collect();
-            let asset_difference = keys_set.difference(&asset_file_paths);
-            // println!("{keys_set:?} {asset_file_paths:?} {asset_difference:?}");
-
-            let mut map = asset_map.lock().expect("Unable to acquire lock");
-            for key in asset_difference {
-                map.remove(key);
-                println!("Removed file {key:?}");
-            }
-
-            sleep(Duration::from_millis(100));
-        }
-    });
 }
