@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
-use std::{fmt, fs, thread, vec};
+use std::{char, fmt, fs, thread, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
@@ -25,6 +25,10 @@ fn main() {
     } else {
         println!("Running normally");
         runtime();
+        let text = fs::read_to_string("./assets/markdown/inline.md").unwrap();
+        let mut parser = Parser::new(&text); 
+        let md = parser.parse();
+        println!("{:?}", md);
     }
 }
 
@@ -640,4 +644,320 @@ fn sha1(input: String) -> [u8; 20] {
     digest[12..16].copy_from_slice(&h3.to_be_bytes());
     digest[16..20].copy_from_slice(&h4.to_be_bytes());
     digest
+}
+
+#[derive(Debug)]
+pub enum MarkdownNode<'a>  {
+    Document(Vec<MarkdownNode<'a>>),
+
+    // Block
+    Paragraph(Vec<MarkdownNode<'a>>),
+    Heading { level: u8, children: Vec<MarkdownNode<'a>> },
+    CodeBlock { language: Option<&'a str>, content: Vec<&'a str> },
+    OrderedList(Vec<MarkdownNode<'a>>),
+    UnorderedList(Vec<MarkdownNode<'a>>),
+    ListItem(Vec<MarkdownNode<'a>>),
+    BlockQuote(Vec<MarkdownNode<'a>>),
+    Breakline,
+    Table,
+
+    // Inline
+    Text(&'a str),
+    Italic(Vec<MarkdownNode<'a>>),
+    Bold(Vec<MarkdownNode<'a>>),
+    Code(&'a str),
+    Link { text: Vec<MarkdownNode<'a>>, url: &'a str },
+}
+
+#[derive(Debug, Clone)]
+pub enum MarkDownBlock<'a> {
+    Heading { level: u8, content: &'a str },
+    Paragraph { content: Vec<&'a str> },
+    OrderedList { content: Vec<&'a str> },
+    UnorderedList { content: Vec<&'a str> },
+    BlockQuote { content: Vec<&'a str> },
+    Table { content: Vec<&'a str> },
+    CodeBlock { language: &'a str, content: Vec<&'a str> },
+    BreakLine,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum BlockTyp {
+    Paragraph,
+    OrderedList,
+    UnorderedList,
+    BlockQuote,
+    CodeBlockLine,
+    CodeBlockBlock,
+    BreakLine,
+    Table,
+    Misc,
+}
+pub struct Parser<'a> {
+    lines: Vec<&'a str>,
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(input: &'a str) -> Parser<'a> {
+        Parser {
+            lines: input.lines().collect(),
+        }
+    }
+
+    pub fn parse(&mut self) -> MarkdownNode<'_> {
+        let mut active_block = vec![];
+        let mut blocks: Vec<MarkDownBlock> = vec![];
+
+        let mut current_block_typ: BlockTyp = BlockTyp::Misc;
+
+        let mut code_block_language = "";
+
+        for untrimmed_line in &self.lines {
+            let line = untrimmed_line.trim_start();
+
+            // match
+            if line.is_empty() {
+                Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                current_block_typ = BlockTyp::Misc;
+            } else {
+                match line.chars().next().expect("string empty") {
+                    _ if line.starts_with("---") | line.starts_with("___") | line.starts_with("***") => {
+                        if current_block_typ != BlockTyp::Misc {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                        }
+                        current_block_typ = BlockTyp::BreakLine;
+                    }
+                    '-' | '*' => {
+                        if current_block_typ != BlockTyp::UnorderedList {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                        }
+                        current_block_typ = BlockTyp::UnorderedList;
+                        let line = line[1..].trim();
+                        active_block.push(line);
+                    }
+                    a if a.is_numeric() && line.split(' ').next().expect("empty").ends_with('.') => {
+                        if current_block_typ != BlockTyp::OrderedList {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                        }
+                        current_block_typ = BlockTyp::OrderedList;
+                        let line = line.split(' ').nth(1).expect("empty").trim();
+                        active_block.push(line);
+                    }
+                    '>' => {
+                        if current_block_typ != BlockTyp::BlockQuote {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                        }
+                        current_block_typ = BlockTyp::BlockQuote;
+                        let line = line[2..].trim();
+                        active_block.push(line);
+                    }
+                    '|' => {
+                        if current_block_typ != BlockTyp::Table {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                        }
+                        current_block_typ = BlockTyp::Table;
+                        active_block.push(line);
+                    }
+
+                    '#' => {
+                        if current_block_typ != BlockTyp::Misc {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                        }
+                        current_block_typ = BlockTyp::Misc;
+
+                        let level = line.chars().take_while(|&c| c == '#').count();
+                        let content = line[level..].trim();
+
+                        blocks.push(MarkDownBlock::Heading { level: level as u8, content });
+                    }
+
+                    _ if line.starts_with("```") => {
+                        if current_block_typ == BlockTyp::CodeBlockBlock {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                            current_block_typ = BlockTyp::Misc;
+                        } else {
+                            current_block_typ = BlockTyp::CodeBlockBlock;
+                            if let Some(item) = &line.split(' ').next()
+                                && let Some(lang) = item.strip_prefix("```")
+                            {
+                                code_block_language = lang
+                            }
+                        }
+                    }
+                    _ if (untrimmed_line.starts_with("  ") | untrimmed_line.starts_with("    ")) && current_block_typ != BlockTyp::CodeBlockBlock => {
+                        if current_block_typ != BlockTyp::Misc {
+                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+                        } else {
+                            current_block_typ = BlockTyp::CodeBlockLine;
+                            let line = if untrimmed_line.starts_with("  ") { line } else { &line[5..] };
+                            active_block.push(line);
+                        }
+                    }
+                    _ => {
+                        if current_block_typ != BlockTyp::CodeBlockBlock {
+                            current_block_typ = BlockTyp::Paragraph;
+                        }
+                        active_block.push(line);
+                    }
+                }
+            }
+        }
+        if current_block_typ != BlockTyp::CodeBlockBlock {
+            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
+        }
+
+        for i in blocks.clone() {
+            println!("{:?}", i);
+        }
+
+        MarkdownNode::Document(blocks.into_iter().map(Self::parse_block).collect())
+    }
+
+    fn parse_block(block: MarkDownBlock<'a>) -> MarkdownNode<'a> {
+        match block {
+            MarkDownBlock::Heading { level, content } => MarkdownNode::Heading {
+                level,
+                children: Self::parse_inline(content),
+            },
+            MarkDownBlock::Paragraph { content } => MarkdownNode::Paragraph(content.iter().flat_map(|line| Self::parse_inline(line)).collect()),
+            MarkDownBlock::OrderedList { content } => MarkdownNode::OrderedList(content.iter().flat_map(|item| Self::parse_inline(item)).collect()),
+            MarkDownBlock::UnorderedList { content } => {
+                MarkdownNode::UnorderedList(content.iter().flat_map(|item| Self::parse_inline(item)).collect())
+            }
+            MarkDownBlock::BlockQuote { content } => MarkdownNode::UnorderedList(content.iter().flat_map(|item| Self::parse_inline(item)).collect()),
+            MarkDownBlock::Table { content } => MarkdownNode::Table,
+            MarkDownBlock::CodeBlock { language, content } => MarkdownNode::CodeBlock {
+                language: if language.is_empty() { None } else { Some(language) },
+                content,
+            },
+            MarkDownBlock::BreakLine => MarkdownNode::Breakline,
+        }
+    }
+
+    pub fn parse_inline(input: &'a str) -> Vec<MarkdownNode<'a>> {
+        let mut res = Vec::new();
+        let mut stack: Vec<(char, usize, usize)> = Vec::new();
+        let mut cursor = 0;
+
+        let chars: Vec<(usize, char)> = input.char_indices().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let (idx, ch) = chars[i];
+
+            match ch {
+                '*' | '_' => {
+                    let mut count = 1;
+                    while i + count < chars.len() && chars[i + count].1 == ch {
+                        count += 1;
+                    }
+
+                    if let Some((top_ch, start_idx, top_count)) = stack.last() {
+                        if *top_ch == ch && *top_count <= count {
+                            let inner = &input[start_idx + count..idx];
+                            println!("Inner string: {inner}");
+                            let inner_nodes = Self::parse_inline(inner); 
+
+                            if *start_idx > cursor {
+                                res.push(MarkdownNode::Text(&input[cursor..*start_idx]));
+                            }
+
+                            let node = match count {
+                                1 => MarkdownNode::Italic(inner_nodes),
+                                2 => MarkdownNode::Bold(inner_nodes),
+                                3 => MarkdownNode::Italic(vec![MarkdownNode::Bold(inner_nodes)]),
+                                _ => MarkdownNode::Text(&input[*start_idx..idx + count]),
+                            };
+                            res.push(node);
+
+                            cursor = idx + count;
+                            stack.pop();
+                            i += count - 1;
+                        } else {
+                            stack.push((ch, idx, count));
+                            i += count - 1;
+                        }
+                    } else {
+                        stack.push((ch, idx, count));
+                        i += count - 1;
+                    }
+                }
+
+                '`' => {
+                    // Count consecutive backticks
+                    let mut count = 1;
+                    while i + count < chars.len() && chars[i + count].1 == '`' {
+                        count += 1;
+                    }
+
+                    if let Some((top_ch, start_idx, top_count)) = stack.last() {
+                        if *top_ch == '`' && *top_count == count {
+                            // Code span - no inner parsing
+                            let inner = &input[start_idx + count..idx];
+                            if *start_idx > cursor {
+                                res.push(MarkdownNode::Text(&input[cursor..*start_idx]));
+                            }
+                            res.push(MarkdownNode::Code(inner));
+
+                            stack.pop();
+                            cursor = idx + count;
+                            i += count - 1;
+                        } else {
+                            stack.push(('`', idx, count));
+                            i += count - 1;
+                        }
+                    } else {
+                        stack.push(('`', idx, count));
+                        i += count - 1;
+                    }
+                }
+
+                _ => {}
+            }
+
+            i += 1;
+        }
+
+        if cursor < input.len() {
+            res.push(MarkdownNode::Text(&input[cursor..]));
+        }
+
+        res
+    }
+    fn end_block<'b>(
+        current_block_typ: &mut BlockTyp,
+        active_block: &mut Vec<&'b str>,
+        blocks: &mut Vec<MarkDownBlock<'b>>,
+        code_block_lanuage: &mut &'b str,
+    ) {
+        // println!("Ending block {:?}", current_block_typ);
+        blocks.push(match current_block_typ {
+            BlockTyp::Paragraph => MarkDownBlock::Paragraph {
+                content: std::mem::take(active_block),
+            },
+            BlockTyp::UnorderedList => MarkDownBlock::UnorderedList {
+                content: std::mem::take(active_block),
+            },
+            BlockTyp::OrderedList => MarkDownBlock::OrderedList {
+                content: std::mem::take(active_block),
+            },
+            BlockTyp::BlockQuote => MarkDownBlock::BlockQuote {
+                content: std::mem::take(active_block),
+            },
+            BlockTyp::Table => MarkDownBlock::Table {
+                content: std::mem::take(active_block),
+            },
+            BlockTyp::CodeBlockBlock => MarkDownBlock::CodeBlock {
+                language: code_block_lanuage,
+                content: std::mem::take(active_block),
+            },
+            BlockTyp::CodeBlockLine => MarkDownBlock::CodeBlock {
+                language: "",
+                content: std::mem::take(active_block),
+            },
+            BlockTyp::BreakLine => MarkDownBlock::BreakLine,
+            BlockTyp::Misc => return,
+        });
+        *code_block_lanuage = "";
+    }
 }
