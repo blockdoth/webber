@@ -3,6 +3,7 @@
 #![allow(dead_code, unused, unused_mut)]
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Display, Path, PathBuf};
@@ -38,8 +39,8 @@ fn comptime() {
     let asset_paths = walk_dir(ASSETS_PATH);
 
     let mut assets_str = String::new();
-    assets_str.push_str("fn get_assets() -> HashMap<PathBuf, Asset> {\n");
-    assets_str.push_str("\tlet mut assets = HashMap::new();\n");
+    assets_str.push_str("fn get_assets() -> PathTrie {\n");
+    assets_str.push_str("\tlet mut assets = PathTrie::new();\n");
 
     for asset_path in asset_paths {
         let path_key = asset_path.to_string_lossy();
@@ -61,9 +62,9 @@ fn comptime() {
 
 fn runtime() {
     #[cfg(generated)]
-    let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(get_assets()));
+    let assets: Arc<Mutex<PathTrie>> = Arc::new(Mutex::new(get_assets()));
     #[cfg(not(generated))]
-    let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(HashMap::new()));
+    let assets: Arc<Mutex<PathTrie>> = Arc::new(Mutex::new(PathTrie::new()));
     println!("Asset count: {:?}", assets.lock().unwrap().len());
     let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
     println!("Started listening on socket http://{SOCKET_ADDR}");
@@ -130,7 +131,8 @@ fn runtime() {
                         HttpRequestType::GET => {
                             let key = PathBuf::from(format!("./assets{}", path));
                             // println!("{key:?}");
-                            assets.lock().expect("Cant get lock").get(&key).cloned()
+                            let guard = assets.lock().expect("Cant get lock");
+                            guard.get(&key)
                         }
                     };
                     // println!("{:?}", asset);
@@ -139,16 +141,13 @@ fn runtime() {
                             && let Content::Text(content) = asset.content
                         {
                             let main_template = {
-                                let lock = assets.lock().expect("unable to unlock");
                                 #[cfg(debug_assertions)]
-                                let asset = lock
-                                    .get(&PathBuf::from("./assets/templates/main-hotreload.html"))
-                                    .expect("Failed to find main template");
-
+                                let template_path = PathBuf::from("./assets/templates/main-hotreload.html");
                                 #[cfg(not(debug_assertions))]
-                                let asset = lock
-                                    .get(&PathBuf::from("assets/templates/main.html"))
-                                    .expect("Failed to find main template");
+                                let template_path = PathBuf::from("./assets/templates/main.html");
+
+                                let guard = assets.lock().expect("unable to unlock");
+                                let asset = guard.get(&template_path).expect("Failed to find main template");
 
                                 match (&asset.asset_typ, asset.content.clone()) {
                                     (AssetType::Html, Content::Text(html)) => Template { html },
@@ -484,7 +483,7 @@ fn walk_dir(dir_path: &'static str) -> Vec<PathBuf> {
     asset_paths
 }
 
-fn hot_reloading(asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>, dir_path: &'static str, changed: Arc<AtomicBool>) {
+fn hot_reloading(asset_map: Arc<Mutex<PathTrie>>, dir_path: &'static str, changed: Arc<AtomicBool>) {
     let _ = thread::spawn(move || {
         println!("Started file watcher thread");
         loop {
@@ -492,7 +491,7 @@ fn hot_reloading(asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>, dir_path: &'sta
             let asset_set: HashSet<PathBuf> = asset_paths.iter().cloned().collect();
 
             let mut map = asset_map.lock().expect("Unable to acquire lock");
-            for path in asset_paths {
+            for path in &asset_paths {
                 let metadata = match path.metadata() {
                     Ok(m) => m,
                     Err(_) => continue,
@@ -503,10 +502,10 @@ fn hot_reloading(asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>, dir_path: &'sta
                     Err(_) => continue,
                 };
 
-                match map.get_mut(&path) {
+                match map.get_mut(path) {
                     Some(existing_asset) => {
                         if last_modified > existing_asset.last_modified {
-                            existing_asset.content = Content::from_path(&path, &existing_asset.asset_typ);
+                            existing_asset.content = Content::from_path(path, &existing_asset.asset_typ);
                             existing_asset.last_modified = last_modified;
                             changed.store(true, Ordering::Release);
 
@@ -518,12 +517,12 @@ fn hot_reloading(asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>, dir_path: &'sta
                         }
                     }
                     None => {
-                        let content_typ = AssetType::from_path(&path);
+                        let content_typ = AssetType::from_path(path);
                         map.insert(
                             path.clone(),
                             Asset {
                                 last_modified,
-                                content: Content::from_path(&path, &content_typ),
+                                content: Content::from_path(path, &content_typ),
                                 asset_typ: content_typ,
                             },
                         );
@@ -536,19 +535,124 @@ fn hot_reloading(asset_map: Arc<Mutex<HashMap<PathBuf, Asset>>>, dir_path: &'sta
                     }
                 }
             }
-            map.retain(|path, _| {
-                if asset_set.contains(path) {
-                    true
-                } else {
-                    println!("Removed file {:?}", path);
-                    changed.store(true, Ordering::Release);
-                    false
-                }
-            });
+            if map.remove_other_than(asset_paths) {
+                changed.store(true, Ordering::Release);
+            }
 
             sleep(Duration::from_millis(100));
         }
     });
+}
+
+#[derive(Default, Debug, Clone)]
+struct TrieNode {
+    asset: Option<Asset>,
+    children: HashMap<String, TrieNode>,
+}
+
+#[derive(Default, Debug, Clone)]
+struct PathTrie {
+    root: TrieNode,
+    paths: HashSet<PathBuf>,
+}
+
+impl PathTrie {
+    pub fn new() -> Self {
+        PathTrie {
+            root: TrieNode::default(),
+            paths: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, path: PathBuf, asset: Asset) {
+        let mut current_node = &mut self.root;
+
+        for component in path.components() {
+            let key = component.as_os_str().to_string_lossy().to_string();
+            current_node = current_node.children.entry(key).or_default();
+        }
+        current_node.asset = Some(asset);
+        self.paths.insert(path);
+    }
+
+    fn get_mut(&mut self, path: &Path) -> Option<&mut Asset> {
+        let mut current_node = &mut self.root;
+
+        for component in path.components() {
+            let key = component.as_os_str().to_string_lossy().to_string();
+            match current_node.children.get_mut(&key) {
+                Some(node) => current_node = node,
+                None => break,
+            }
+        }
+
+        current_node.asset.as_mut()
+    }
+
+    fn get(&self, path: &Path) -> Option<Asset> {
+        let mut current_node = &self.root;
+
+        for component in path.components() {
+            let key = component.as_os_str().to_string_lossy().to_string();
+            match current_node.children.get(&key) {
+                Some(node) => current_node = node,
+                None => break,
+            }
+        }
+
+        current_node.asset.clone()
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        let mut current_node = &self.root;
+
+        for component in path.components() {
+            let key = component.as_os_str().to_string_lossy().to_string();
+            match current_node.children.get(&key) {
+                Some(node) => current_node = node,
+                None => return false,
+            }
+        }
+
+        current_node.asset.is_some()
+    }
+
+    fn remove(&mut self, path: &Path) -> bool {
+        let mut current_node = &mut self.root;
+
+        for component in path.components() {
+            let key = component.as_os_str().to_string_lossy().to_string();
+            if let Some(node) = current_node.children.get_mut(&key) {
+                current_node = node;
+            } else {
+                return false;
+            }
+        }
+
+        current_node.asset = None;
+        self.paths.remove(path);
+        // TODO remove the emtpy data nodes left behind
+        true
+    }
+    fn remove_other_than(&mut self, current_paths: Vec<PathBuf>) -> bool {
+        let current_paths_set: HashSet<PathBuf> = current_paths.into_iter().collect();
+
+        let paths_to_delete: Vec<PathBuf> = self.paths.difference(&current_paths_set).cloned().collect();
+
+        let mut changed = false;
+
+        for path in &paths_to_delete {
+            println!("Removed file {:?}", path);
+            changed |= self.remove(path);
+        }
+        self.paths = current_paths_set;
+
+        changed
+    }
+
+    fn len(&self) -> usize {
+        self.paths.len()
+    }
 }
 
 const BASE64_CONVERSION: [char; 64] = [
