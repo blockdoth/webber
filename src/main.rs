@@ -25,10 +25,6 @@ fn main() {
     } else {
         println!("Running normally");
         runtime();
-        let text = fs::read_to_string("./assets/markdown/inline.md").unwrap();
-        let mut parser = Parser::new(&text); 
-        let md = parser.parse();
-        println!("{:?}", md);
     }
 }
 
@@ -51,16 +47,10 @@ fn comptime() {
 
         assets_str.push_str(&format!("\tlet path = PathBuf::from(\"{}\");\n", path_key));
         assets_str.push_str(&format!("\tlet asset_typ = AssetType::from_path(&PathBuf::from(\"{}\"));\n", full_path));
-        assets_str.push_str(&format!("\tlet content_raw = include_bytes!(\"{}\").to_vec();\n", full_path));
-        assets_str.push_str(
-            "\tlet content = if asset_typ.is_text() {
-                Content::Text(String::from_utf8(content_raw).expect(\"Failed to convert to utf8\"))
-            } else {
-                Content::Binary(content_raw)
-            };\n",
-        );
+        assets_str.push_str("\tlet content = Content::from_path(&path, &asset_typ);\n");
         assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now()};\n");
         assets_str.push_str("\tassets.insert(path,asset);\n");
+        println!("cargo:warning=Loaded {asset_path:?}");
     }
     assets_str.push_str("\tassets\n");
     assets_str.push_str("}\n");
@@ -74,9 +64,9 @@ fn runtime() {
     let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(get_assets()));
     #[cfg(not(generated))]
     let assets: Arc<Mutex<HashMap<PathBuf, Asset>>> = Arc::new(Mutex::new(HashMap::new()));
-
+    println!("Asset count: {:?}", assets.lock().unwrap().len());
     let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
-    println!("Started listening on socket {SOCKET_ADDR}");
+    println!("Started listening on socket http://{SOCKET_ADDR}");
 
     let reload_assets = Arc::new(AtomicBool::new(false));
     #[cfg(debug_assertions)]
@@ -143,8 +133,35 @@ fn runtime() {
                             assets.lock().expect("Cant get lock").get(&key).cloned()
                         }
                     };
+                    // println!("{:?}", asset);
                     let response = if let Some(asset) = asset {
-                        build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
+                        let response_content = if asset.asset_typ == AssetType::Md
+                            && let Content::Text(content) = asset.content
+                        {
+                            let main_template = {
+                                let lock = assets.lock().expect("unable to unlock");
+                                #[cfg(debug_assertions)]
+                                let asset = lock
+                                    .get(&PathBuf::from("./assets/templates/main-hotreload.html"))
+                                    .expect("Failed to find main template");
+
+                                #[cfg(not(debug_assertions))]
+                                let asset = lock
+                                    .get(&PathBuf::from("assets/templates/main.html"))
+                                    .expect("Failed to find main template");
+
+                                match (&asset.asset_typ, asset.content.clone()) {
+                                    (AssetType::Html, Content::Text(html)) => Template { html },
+                                    _ => panic!("Main template must be html"),
+                                }
+                            };
+                            Content::Text(main_template.populate(vec![("body".to_string(), content)]))
+                        } else {
+                            asset.content
+                        };
+                        println!("{:?}", response_content);
+
+                        build_response(HttpResponseCode::Ok, asset.asset_typ, response_content)
                     } else {
                         let body = Content::Text(format!("resource at {} not found", path));
                         build_response(HttpResponseCode::NotFound, AssetType::Text, body)
@@ -360,20 +377,21 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum AssetType {
     Text = 1,
     Html = 2,
     Css = 3,
     Js = 4,
     Png = 5,
-    Unknown = 6,
+    Md = 6,
+    Unknown = 7,
 }
 
 impl AssetType {
     fn is_text(&self) -> bool {
         use AssetType::*;
-        matches!(self, Text | Html | Css | Js)
+        matches!(self, Text | Html | Css | Js | Md)
     }
     fn from_path(path: &Path) -> AssetType {
         match path.extension().and_then(|s| s.to_str()) {
@@ -382,6 +400,7 @@ impl AssetType {
             Some("css") => AssetType::Css,
             Some("js") => AssetType::Js,
             Some("png") => AssetType::Png,
+            Some("md") => AssetType::Md,
             _ => AssetType::Unknown,
         }
     }
@@ -395,6 +414,7 @@ impl fmt::Display for AssetType {
             AssetType::Css => "text/css",
             AssetType::Js => "text/javascript",
             AssetType::Png => "image/png",
+            AssetType::Md => "text/html",
             AssetType::Unknown => "text/plain",
         })
     }
@@ -414,7 +434,7 @@ enum Content {
 }
 
 impl Content {
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         match self {
             Content::Binary(bytes) => bytes.len(),
             Content::Text(text) => text.len(),
@@ -423,6 +443,11 @@ impl Content {
     fn from_path(path: &Path, content_typ: &AssetType) -> Content {
         match content_typ {
             AssetType::Png | AssetType::Unknown => Content::Binary(fs::read(path).expect("Unable to read file into binary")),
+            AssetType::Md => {
+                let markdown = fs::read_to_string(path).expect("Unable read file into string");
+                let html = Parser::html(Parser::parse(&markdown));
+                Content::Text(html)
+            }
             _ => Content::Text(fs::read_to_string(path).expect("Unable read file into string")),
         }
     }
@@ -646,8 +671,22 @@ fn sha1(input: String) -> [u8; 20] {
     digest
 }
 
+struct Template {
+    html: String,
+}
+
+impl Template {
+    fn populate(&self, content: Vec<(String, String)>) -> String {
+        let mut res = self.html.clone();
+        for (key, value) in content {
+            res = res.replace(&format!("{{{{{key}}}}}"), &value)
+        }
+        res
+    }
+}
+
 #[derive(Debug)]
-pub enum MarkdownNode<'a>  {
+enum MarkdownNode<'a> {
     Document(Vec<MarkdownNode<'a>>),
 
     // Block
@@ -658,19 +697,19 @@ pub enum MarkdownNode<'a>  {
     UnorderedList(Vec<MarkdownNode<'a>>),
     ListItem(Vec<MarkdownNode<'a>>),
     BlockQuote(Vec<MarkdownNode<'a>>),
-    Breakline,
+    HorizontalLine,
     Table,
 
     // Inline
     Text(&'a str),
     Italic(Vec<MarkdownNode<'a>>),
     Bold(Vec<MarkdownNode<'a>>),
-    Code(&'a str),
+    InlineCode(&'a str),
     Link { text: Vec<MarkdownNode<'a>>, url: &'a str },
 }
 
 #[derive(Debug, Clone)]
-pub enum MarkDownBlock<'a> {
+enum MarkDownBlock<'a> {
     Heading { level: u8, content: &'a str },
     Paragraph { content: Vec<&'a str> },
     OrderedList { content: Vec<&'a str> },
@@ -689,22 +728,16 @@ enum BlockTyp {
     BlockQuote,
     CodeBlockLine,
     CodeBlockBlock,
-    BreakLine,
+    HorizontalLine,
     Table,
     Misc,
 }
-pub struct Parser<'a> {
-    lines: Vec<&'a str>,
+struct Parser<'a> {
+    ast: MarkdownNode<'a>,
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(input: &'a str) -> Parser<'a> {
-        Parser {
-            lines: input.lines().collect(),
-        }
-    }
-
-    pub fn parse(&mut self) -> MarkdownNode<'_> {
+    fn parse(input: &'a str) -> MarkdownNode<'a> {
         let mut active_block = vec![];
         let mut blocks: Vec<MarkDownBlock> = vec![];
 
@@ -712,7 +745,7 @@ impl<'a> Parser<'a> {
 
         let mut code_block_language = "";
 
-        for untrimmed_line in &self.lines {
+        for untrimmed_line in input.lines() {
             let line = untrimmed_line.trim_start();
 
             // match
@@ -725,7 +758,7 @@ impl<'a> Parser<'a> {
                         if current_block_typ != BlockTyp::Misc {
                             Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
                         }
-                        current_block_typ = BlockTyp::BreakLine;
+                        current_block_typ = BlockTyp::HorizontalLine;
                     }
                     '-' | '*' => {
                         if current_block_typ != BlockTyp::UnorderedList {
@@ -748,8 +781,12 @@ impl<'a> Parser<'a> {
                             Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
                         }
                         current_block_typ = BlockTyp::BlockQuote;
-                        let line = line[2..].trim();
-                        active_block.push(line);
+                        if line.len() > 2 {
+                            let line = line[2..].trim();
+                            active_block.push(line);
+                        } else {
+                            active_block.push("");
+                        }
                     }
                     '|' => {
                         if current_block_typ != BlockTyp::Table {
@@ -806,9 +843,9 @@ impl<'a> Parser<'a> {
             Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
         }
 
-        for i in blocks.clone() {
-            println!("{:?}", i);
-        }
+        // for i in blocks.clone() {
+        //     println!("{:?}", i);
+        // }
 
         MarkdownNode::Document(blocks.into_iter().map(Self::parse_block).collect())
     }
@@ -820,21 +857,23 @@ impl<'a> Parser<'a> {
                 children: Self::parse_inline(content),
             },
             MarkDownBlock::Paragraph { content } => MarkdownNode::Paragraph(content.iter().flat_map(|line| Self::parse_inline(line)).collect()),
-            MarkDownBlock::OrderedList { content } => MarkdownNode::OrderedList(content.iter().flat_map(|item| Self::parse_inline(item)).collect()),
-            MarkDownBlock::UnorderedList { content } => {
-                MarkdownNode::UnorderedList(content.iter().flat_map(|item| Self::parse_inline(item)).collect())
+            MarkDownBlock::OrderedList { content } => {
+                MarkdownNode::OrderedList(content.iter().map(|item| MarkdownNode::ListItem(Self::parse_inline(item))).collect())
             }
-            MarkDownBlock::BlockQuote { content } => MarkdownNode::UnorderedList(content.iter().flat_map(|item| Self::parse_inline(item)).collect()),
+            MarkDownBlock::UnorderedList { content } => {
+                MarkdownNode::UnorderedList(content.iter().map(|item| MarkdownNode::ListItem(Self::parse_inline(item))).collect())
+            }
+            MarkDownBlock::BlockQuote { content } => MarkdownNode::BlockQuote(content.iter().flat_map(|item| Self::parse_inline(item)).collect()),
             MarkDownBlock::Table { content } => MarkdownNode::Table,
             MarkDownBlock::CodeBlock { language, content } => MarkdownNode::CodeBlock {
                 language: if language.is_empty() { None } else { Some(language) },
                 content,
             },
-            MarkDownBlock::BreakLine => MarkdownNode::Breakline,
+            MarkDownBlock::BreakLine => MarkdownNode::HorizontalLine,
         }
     }
 
-    pub fn parse_inline(input: &'a str) -> Vec<MarkdownNode<'a>> {
+    fn parse_inline(input: &'a str) -> Vec<MarkdownNode<'a>> {
         let mut res = Vec::new();
         let mut stack: Vec<(char, usize, usize)> = Vec::new();
         let mut cursor = 0;
@@ -851,17 +890,15 @@ impl<'a> Parser<'a> {
                     while i + count < chars.len() && chars[i + count].1 == ch {
                         count += 1;
                     }
-
                     if let Some((top_ch, start_idx, top_count)) = stack.last() {
                         if *top_ch == ch && *top_count <= count {
                             let inner = &input[start_idx + count..idx];
-                            println!("Inner string: {inner}");
-                            let inner_nodes = Self::parse_inline(inner); 
 
                             if *start_idx > cursor {
                                 res.push(MarkdownNode::Text(&input[cursor..*start_idx]));
                             }
 
+                            let inner_nodes = Self::parse_inline(inner);
                             let node = match count {
                                 1 => MarkdownNode::Italic(inner_nodes),
                                 2 => MarkdownNode::Bold(inner_nodes),
@@ -884,7 +921,6 @@ impl<'a> Parser<'a> {
                 }
 
                 '`' => {
-                    // Count consecutive backticks
                     let mut count = 1;
                     while i + count < chars.len() && chars[i + count].1 == '`' {
                         count += 1;
@@ -892,12 +928,11 @@ impl<'a> Parser<'a> {
 
                     if let Some((top_ch, start_idx, top_count)) = stack.last() {
                         if *top_ch == '`' && *top_count == count {
-                            // Code span - no inner parsing
                             let inner = &input[start_idx + count..idx];
                             if *start_idx > cursor {
                                 res.push(MarkdownNode::Text(&input[cursor..*start_idx]));
                             }
-                            res.push(MarkdownNode::Code(inner));
+                            res.push(MarkdownNode::InlineCode(inner));
 
                             stack.pop();
                             cursor = idx + count;
@@ -911,10 +946,8 @@ impl<'a> Parser<'a> {
                         i += count - 1;
                     }
                 }
-
                 _ => {}
             }
-
             i += 1;
         }
 
@@ -928,7 +961,7 @@ impl<'a> Parser<'a> {
         current_block_typ: &mut BlockTyp,
         active_block: &mut Vec<&'b str>,
         blocks: &mut Vec<MarkDownBlock<'b>>,
-        code_block_lanuage: &mut &'b str,
+        code_block_language: &mut &'b str,
     ) {
         // println!("Ending block {:?}", current_block_typ);
         blocks.push(match current_block_typ {
@@ -948,16 +981,128 @@ impl<'a> Parser<'a> {
                 content: std::mem::take(active_block),
             },
             BlockTyp::CodeBlockBlock => MarkDownBlock::CodeBlock {
-                language: code_block_lanuage,
+                language: code_block_language,
                 content: std::mem::take(active_block),
             },
             BlockTyp::CodeBlockLine => MarkDownBlock::CodeBlock {
                 language: "",
                 content: std::mem::take(active_block),
             },
-            BlockTyp::BreakLine => MarkDownBlock::BreakLine,
+            BlockTyp::HorizontalLine => MarkDownBlock::BreakLine,
             BlockTyp::Misc => return,
         });
-        *code_block_lanuage = "";
+        *code_block_language = "";
+    }
+
+    fn html(node: MarkdownNode) -> String {
+        let mut html = String::new();
+        Self::html_helper(&node, &mut html);
+        html
+    }
+
+    fn html_helper(node: &MarkdownNode, builder: &mut String) {
+        // print!("{:?}", node);
+        match node {
+            MarkdownNode::Document(nodes) => {
+                nodes.iter().for_each(|n| Self::html_helper(n, builder));
+            }
+            MarkdownNode::Paragraph(children) => {
+                builder.push_str("<p>");
+                for (idx, child) in children.iter().enumerate() {
+                    Self::html_helper(child, builder);
+                    if idx < children.len() - 1 {
+                        builder.push('\n');
+                    }
+                }
+                builder.push_str("</p>\n");
+            }
+            MarkdownNode::Text(text) => {
+                builder.push_str(text);
+            }
+            MarkdownNode::Bold(children) => {
+                builder.push_str("<strong>");
+                children.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push_str("</strong>");
+            }
+            MarkdownNode::Italic(children) => {
+                builder.push_str("<em>");
+                children.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push_str("</em>");
+            }
+
+            MarkdownNode::Heading { level, children } => {
+                let header_level = match level {
+                    0 => panic!("Should not be parsed"),
+                    1 => "h1",
+                    2 => "h2",
+                    3 => "h3",
+                    4 => "h4",
+                    5 => "h5",
+                    _ => "h6",
+                };
+
+                builder.push('<');
+                builder.push_str(header_level);
+                builder.push('>');
+                children.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push_str("</");
+                builder.push_str(header_level);
+                builder.push_str(">\n");
+                if *level < 3 {
+                    builder.push_str("<hr/>\n");
+                }
+            }
+            MarkdownNode::InlineCode(code) => {
+                builder.push_str("<code>");
+                builder.push_str(code);
+                builder.push_str("</code>");
+            }
+            MarkdownNode::CodeBlock { language, content } => {
+                builder.push_str("<pre><code>\n");
+                for (idx, child) in content.iter().enumerate() {
+                    builder.push_str(child);
+                    if idx < content.len() - 1 {
+                        builder.push('\n');
+                    }
+                }
+                builder.push_str("</code></pre>\n");
+            }
+            MarkdownNode::OrderedList(nodes) => {
+                builder.push_str("<ol type=\"1\">\n");
+                nodes.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push_str("</ol>\n");
+            }
+            MarkdownNode::UnorderedList(nodes) => {
+                builder.push_str("<ul>\n");
+                nodes.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push_str("</ul>\n");
+            }
+            MarkdownNode::ListItem(nodes) => {
+                builder.push_str("  <li> ");
+                nodes.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push('\n');
+            }
+            MarkdownNode::BlockQuote(nodes) => {
+                builder.push_str("<blockquote>\n");
+                for child in nodes {
+                    Self::html_helper(child, builder);
+                    builder.push('\n');
+                }
+                builder.push_str("</blockquote>\n");
+            }
+            MarkdownNode::HorizontalLine => {
+                builder.push_str("<hr/>\n");
+            }
+            MarkdownNode::Table => {}
+            MarkdownNode::Link { text, url } => {
+                builder.push('(');
+                text.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push(')');
+
+                builder.push('[');
+                builder.push_str(url);
+                builder.push(']');
+            }
+        }
     }
 }
