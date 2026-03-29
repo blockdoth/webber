@@ -1,0 +1,8 @@
+const ws = new WebSocket("ws://127.0.0.1:4000/ws");
+ws.onopen = () => console.log("Websocket connected!");
+ws.onmessage = (event) => {
+  if ( event.data == "reload" ) {
+    window.location.reload();
+  };
+}
+
