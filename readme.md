@@ -1,3 +1,5 @@
+WRONG but kept for reference 
+
 ```
 .
 ├── content
@@ -49,3 +51,9 @@ these references will be recursively resolved and replaced with html during comp
 
 ```
 As I said all files in content will be converted to html, because I store them in a prefix tree I can querry them at once using the partial path and apply the `post-thumbnail` template
+
+
+
+insp:
+https://www.omarpolo.com/post/template.html
+https://leapcell.medium.com/implementing-template-engine-from-scratch-like-jinja2-or-django-templates-ad3a37279eef

@@ -25,7 +25,113 @@ fn main() {
         comptime();
     } else {
         println!("Running normally");
-        runtime();
+        // runtime();
+
+        let html_template = fs::read_to_string("./assets/templates/test.html").expect("Cant find template");
+
+        let template = Template::new(html_template);
+        let mut context: HashMap<String, &dyn TemplateValue> = HashMap::new();
+
+        context.insert("body".to_string(), &"");
+
+        let html_string = template.populate(context);
+        println!("{html_string}");
+    }
+}
+
+struct SimpleTemplate {
+    html: String,
+}
+
+impl SimpleTemplate {
+    fn populate(&self, content: Vec<(String, String)>) -> String {
+        let mut res = self.html.clone();
+        for (key, value) in content {
+            res = res.replace(&format!("{{{{{key}}}}}"), &value)
+        }
+        res
+    }
+}
+
+trait TemplateValue {
+    fn get_field(&self) -> Option<&dyn TemplateValue>;
+    fn to_str(&self) -> String;
+}
+
+impl TemplateValue for &str {
+    fn get_field(&self) -> Option<&dyn TemplateValue> {
+        Some(self)
+    }
+
+    fn to_str(&self) -> String {
+        self.to_string()
+    }
+}
+enum TemplateNode {
+    Text(String),
+}
+
+struct Template {
+    ast: Vec<TemplateNode>,
+}
+
+enum TemplateToken {
+    Text(&str),
+    StartBlock,
+    EndBlock,
+    Identifier,
+    Dot,
+    If,
+    For,
+    In,
+}
+
+impl Template {
+    fn new(template_str: &str) -> Self {
+        let lexed = Self::lex(template_str);
+
+        Template {
+            ast: TemplateNode::Text(template_str),
+        }
+    }
+
+    fn lex(input: &str) -> Vec<TemplateToken> {
+        use TemplateNode::*;
+        let lexed = vec![];
+
+        let mut cursor = 0;
+
+        let mut in_block = false;
+        let mut last_block = 0;
+
+        while cursor < input.len() {
+            let rest = input[cursor..];
+
+            if rest.starts_with("{{") {
+                cursor += 2;
+                lexed.push(StartBlock);
+
+                if !in_block {
+                    let prev_text = input[last_block..cursor];
+                    lexed.push(Text(prev_text));
+                }
+                in_block = true;
+            }
+
+            if rest.starts_with("}}") {
+                cursor += 2;
+                lexed.push(StartBlock);
+                in_block = false;
+            }
+
+            rest
+        }
+
+        lexed
+    }
+
+    fn populate<'a>(&self, context: HashMap<String, &'a dyn TemplateValue>) -> String {
+        String::new()
     }
 }
 
@@ -150,7 +256,7 @@ fn runtime() {
                                 let asset = guard.get(&template_path).expect("Failed to find main template");
 
                                 match (&asset.asset_typ, asset.content.clone()) {
-                                    (AssetType::Html, Content::Text(html)) => Template { html },
+                                    (AssetType::Html, Content::Text(html)) => SimpleTemplate { html },
                                     _ => panic!("Main template must be html"),
                                 }
                             };
@@ -557,7 +663,7 @@ struct PathTrie {
 }
 
 impl PathTrie {
-    pub fn new() -> Self {
+    fn new() -> Self {
         PathTrie {
             root: TrieNode::default(),
             paths: HashSet::new(),
@@ -773,20 +879,6 @@ fn sha1(input: String) -> [u8; 20] {
     digest[12..16].copy_from_slice(&h3.to_be_bytes());
     digest[16..20].copy_from_slice(&h4.to_be_bytes());
     digest
-}
-
-struct Template {
-    html: String,
-}
-
-impl Template {
-    fn populate(&self, content: Vec<(String, String)>) -> String {
-        let mut res = self.html.clone();
-        for (key, value) in content {
-            res = res.replace(&format!("{{{{{key}}}}}"), &value)
-        }
-        res
-    }
 }
 
 #[derive(Debug)]
