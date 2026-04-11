@@ -31,7 +31,7 @@ fn main() {
 
         let html_template = fs::read_to_string("./assets/templates/test.html").expect("Cant find template");
 
-        let template = Template::new(html_template);
+        let template = Template::new(html_template).expect("TODO");
         let mut context: HashMap<String, &dyn TemplateValue> = HashMap::new();
 
         context.insert("body".to_string(), &"");
@@ -72,6 +72,7 @@ impl TemplateValue for &str {
     }
 }
 
+#[derive(Debug)]
 enum TemplateNode {
     Text(String),
     Variable(Vec<String>),
@@ -81,193 +82,298 @@ enum TemplateNode {
         else_branch: Vec<TemplateNode>,
     },
     For {
-        var: String,
-        iter: Vec<String>,
+        iter_bind: String,
+        iter_src: Vec<String>,
         body: Vec<TemplateNode>,
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 enum TemplateToken {
     Text(String),
     Identifier(String),
     Dot,
     If,
+    // ParenOpen,
+    // ParenClose,
     Else,
     For,
-    In,    
-    EndIf,    
-    EndFor,    
+    In,
+    EndIf,
+    EndElse,
+    EndFor,
 }
 
 struct Template {
     ast: Vec<TemplateNode>,
 }
 
+#[derive(Debug)]
+struct ParseError {}
+
 impl Template {
-    fn new(template_str: String) -> Self {
+    fn new(template_str: String) -> Result<Self, ParseError> {
         let lexed = Self::lex(&template_str);
-        
-        for i in &lexed {
-            println!("{:?}",i);
-        }
-        
+
+        // for i in &lexed {
+        //     println!("{:?}", i);
+        // }
+
         let tokens = &mut lexed.into_iter().peekable();
-        let parsed = Self::parse(tokens);
-        
-        Template {
-            ast: vec![TemplateNode::Text(template_str)],
+        let parsed = Self::parse(tokens)?;
+
+        for i in &parsed {
+            println!("{:?}", i);
         }
+
+        Ok(Template {
+            ast: vec![TemplateNode::Text(template_str)],
+        })
     }
 
-    fn parse(tokens: &mut Peekable<impl Iterator<Item = TemplateToken>>) -> Vec<TemplateNode> {      
+    fn parse(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>) -> Result<Vec<TemplateNode>, ParseError> {
         use TemplateToken::*;
-    
+
+        Self::parse_until(tokens, &[])
+    }
+
+    fn parse_until(
+        tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>,
+        stop: &[TemplateToken],
+    ) -> Result<Vec<TemplateNode>, ParseError> {
+        use TemplateToken::*;
+        let mut parsed = vec![];
+
         while let Some(next_token) = tokens.peek() {
+            if stop.contains(next_token) {
+                break;
+            }
             match next_token {
                 If => {
-                    Self::parse_if(tokens);
-                }
-                For => {
-                    
+                    parsed.push(Self::parse_if(tokens)?);
+                    // println!("Parsed if");
                 }
                 Identifier(ident) => {
-                    
+                    parsed.push(Self::parse_var(tokens)?);
+                    // println!("Parsed identifier");
+                }
+                For => {
+                    parsed.push(Self::parse_for(tokens)?);
+                    // println!("Parsed for");
+                }
+                Identifier(ident) => {}
+                Text(text) => {
+                    parsed.push(TemplateNode::Text(text.to_string())); // TODO not copy
+                    tokens.next();
                 }
                 _ => {
                     tokens.next();
                 }
             }
         }
-        
-        vec![]
-    }    
-    fn parse_if(tokens: &mut Peekable<impl Iterator<Item = TemplateToken>>) -> TemplateNode {
-        tokens.next(); // "If"
-        match Self::parse(tokens).as_slice() {
-            [TemplateNode::Variable(..)] => {}
-            _ => {}
-        }
 
-        
-        if let Some(TemplateToken::EndIf) = tokens.peek() {
-            
-        }
-        
-        TemplateNode::If { 
-            condition: vec![], 
-            then_branch: vec![], 
-            else_branch: vec![]
+        Ok(parsed)
+    }
+
+    fn parse_if(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>) -> Result<TemplateNode, ParseError> {
+        use TemplateToken::*;
+        assert!(tokens.next().expect("peeked earlier") == If); 
+
+        // Self::show_next_n_tokens(tokens, 3);
+        let condition = match Self::parse_var(tokens)? {
+            TemplateNode::Variable(path) => path,
+            _ => return Err(ParseError {}),
+        };
+
+        // Self::show_next_n_tokens(tokens, 3);
+        let then_branch= Self::parse_until(tokens, &[Else, EndIf])?;
+
+        // Self::show_next_n_tokens(tokens, 3);
+        match tokens.next() {
+            Some(Else) => {
+
+                // Self::show_next_n_tokens(tokens, 3);
+                let else_branch = Self::parse_until(tokens, &[EndElse])?;
+                assert!(tokens.next().ok_or(ParseError {})? == EndElse);
+                Ok(TemplateNode::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                })
+            }
+            Some(EndIf) => Ok(TemplateNode::If {
+                condition,
+                then_branch,
+                else_branch: vec![],
+            }),
+            Some(_) => todo!(),
+            None => todo!(),
         }
     }
 
-    
-    
+    fn parse_for(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>) -> Result<TemplateNode, ParseError> {
+        use TemplateToken::*;
+        assert!(tokens.next().ok_or(ParseError {})? == For); // "For"
+        // Self::show_next_n_tokens(tokens, 3);
+
+        let var = match tokens.next().ok_or(ParseError {})? {
+            TemplateToken::Identifier(text) => text,
+            _ => todo!(),
+        };
+
+        if tokens.next().ok_or(ParseError {})? != In {
+            return Err(ParseError {});
+        }
+
+        // Self::show_next_n_tokens(tokens, 3);
+        let iter_src = match Self::parse_var(tokens)? {
+            TemplateNode::Variable(path) => path,
+            _ => return Err(ParseError {}),
+        };
+
+
+        // Self::show_next_n_tokens(tokens, 3);
+        let body: Vec<TemplateNode> = Self::parse_until(tokens, &[EndFor])?;
+        assert!(tokens.next().ok_or(ParseError {})? == EndFor); // "For"
+
+        Ok(TemplateNode::For { iter_bind: var, iter_src, body })
+    }
+
+    fn parse_var(tokens: &mut Peekable<impl Iterator<Item = TemplateToken>>) -> Result<TemplateNode, ParseError> {
+        let mut ident = vec![];
+
+        loop {
+            match tokens.next().ok_or(ParseError {})? {
+                TemplateToken::Identifier(text) => ident.push(text),
+                _ => todo!(),
+            }
+
+            match tokens.peek().ok_or(ParseError {})? {
+                TemplateToken::Dot => {
+                    tokens.next().ok_or(ParseError {});
+                }
+                _ => break,
+            }
+        }
+
+        Ok(TemplateNode::Variable(ident))
+    }
+
+    fn show_next_n_tokens(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>, n: usize) {
+        let mut clone = tokens.clone();
+        print!("Next {} tokens: ", n);
+        for _ in 0..n {
+            match clone.next() {
+                Some(tok) => print!("({:?}) ", tok),
+                None => break,
+            }
+        }
+        println!();
+    }
+
     fn lex(input: &str) -> Vec<TemplateToken> {
         use TemplateToken::*;
-        let mut lexed = vec![];
 
+        let mut lexed = vec![];
         let mut cursor = 0;
+        let input_len = input.len();
 
         let mut in_block = false;
         let mut start_block = 0;
-        let mut end_block = 0;
-        let input_len = input.len();
-        
+
         while cursor < input_len {
             let rest = &input[cursor..];
 
             if rest.starts_with("{{") {
                 if !in_block {
                     let prev_text = input[start_block..cursor].to_string();
-                    // lexed.push(Text(prev_text));
+                    lexed.push(Text(prev_text));
                 }
-                start_block = cursor;
                 cursor += 2;
+                start_block = cursor;
                 in_block = true;
-            }
-            else if rest.starts_with("}}") {
+                // lexed.push(TemplateToken::ParenOpen);
+            } else if rest.starts_with("}}") {
                 if in_block {
-                    let code_text = &input[start_block + 2..cursor];
+                    let code_text = &input[start_block..cursor];
                     let mut lexed_code = Self::lex_code(code_text);
                     lexed.append(&mut lexed_code);
-                }     
+                }
+                // lexed.push(TemplateToken::ParenClose);
                 cursor += 2;
                 start_block = cursor;
                 in_block = false;
+            } else {
+                cursor += 1;
             }
-            cursor += 1;
         }
         lexed
     }
 
-    fn lex_code(input: &str) -> Vec<TemplateToken>{
+    fn lex_code(input: &str) -> Vec<TemplateToken> {
         use TemplateToken::*;
-        
+
         let mut lexed = vec![];
 
         let mut cursor = 0;
         let input_len = input.len();
-        
+
         let mut push_ident = false;
         let mut start_ident = 0;
         let mut end_ident = 0;
-        while cursor < input_len {    
+        while cursor < input_len {
             let rest = &input[cursor..];
-            
+
             end_ident = cursor;
             let tok = if rest.starts_with(".") {
                 cursor += 1;
                 Some(Dot)
-            }            
-            else if rest.starts_with("if") {
+            } else if rest.starts_with("if") {
                 cursor += 2;
                 Some(If)
-            }
-            else if rest.starts_with("else") {
+            } else if rest.starts_with("else") {
                 cursor += 4;
                 Some(Else)
-            }
-            else if rest.starts_with("for") {
+            } else if rest.starts_with("for") {
                 cursor += 3;
                 Some(For)
-            }      
-            else if rest.starts_with("in") {
+            } else if rest.starts_with("in") {
                 cursor += 2;
                 Some(In)
-            }      
-            else if rest.starts_with("endif") {
+            } else if rest.starts_with("endIf") {
                 cursor += 3;
                 Some(EndIf)
-            }   
-            else if rest.starts_with("endfor") {
-                cursor += 3;
+            } else if rest.starts_with("endElse") {
+                cursor += 6;
+                Some(EndElse)
+            } else if rest.starts_with("endFor") {
+                cursor += 6;
                 Some(EndFor)
             } else {
                 None
             };
-        
+
             if let Some(tok) = tok {
                 if start_ident != end_ident {
-                    let ident = input[start_ident..end_ident].trim().to_string(); 
+                    let ident = input[start_ident..end_ident].trim().to_string();
                     lexed.push(Identifier(ident));
                 }
-                lexed.push(tok);                
+                lexed.push(tok);
                 start_ident = cursor;
                 end_ident = cursor;
-                push_ident = false;   
+                push_ident = false;
             }
-            
+
             cursor += 1;
-        }    
+        }
         if start_ident + 1 != cursor {
-            let ident = input[start_ident..].trim().to_string(); 
-            lexed.push(Identifier(ident));        
+            let ident = input[start_ident..].trim().to_string();
+            lexed.push(Identifier(ident));
         }
         lexed
     }
-    
-    fn populate<'a>(&self, context: HashMap<String, &'a dyn TemplateValue>) -> String {
+
+    fn populate(&self, context: HashMap<String, &dyn TemplateValue>) -> String {
         String::new()
     }
 }
