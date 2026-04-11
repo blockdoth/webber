@@ -2,9 +2,11 @@
 #![allow(unexpected_cfgs)]
 #![allow(dead_code, unused, unused_mut)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
+use std::fmt::Debug;
 use std::io::{self, Read, Write};
+use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Display, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,6 +55,8 @@ impl SimpleTemplate {
     }
 }
 
+// Non simple template
+
 trait TemplateValue {
     fn get_field(&self) -> Option<&dyn TemplateValue>;
     fn to_str(&self) -> String;
@@ -67,69 +71,202 @@ impl TemplateValue for &str {
         self.to_string()
     }
 }
+
 enum TemplateNode {
     Text(String),
+    Variable(Vec<String>),
+    If {
+        condition: Vec<String>,
+        then_branch: Vec<TemplateNode>,
+        else_branch: Vec<TemplateNode>,
+    },
+    For {
+        var: String,
+        iter: Vec<String>,
+        body: Vec<TemplateNode>,
+    },
+}
+
+#[derive(Debug)]
+enum TemplateToken {
+    Text(String),
+    Identifier(String),
+    Dot,
+    If,
+    Else,
+    For,
+    In,    
+    EndIf,    
+    EndFor,    
 }
 
 struct Template {
     ast: Vec<TemplateNode>,
 }
 
-enum TemplateToken {
-    Text(&str),
-    StartBlock,
-    EndBlock,
-    Identifier,
-    Dot,
-    If,
-    For,
-    In,
-}
-
 impl Template {
-    fn new(template_str: &str) -> Self {
-        let lexed = Self::lex(template_str);
-
+    fn new(template_str: String) -> Self {
+        let lexed = Self::lex(&template_str);
+        
+        for i in &lexed {
+            println!("{:?}",i);
+        }
+        
+        let tokens = &mut lexed.into_iter().peekable();
+        let parsed = Self::parse(tokens);
+        
         Template {
-            ast: TemplateNode::Text(template_str),
+            ast: vec![TemplateNode::Text(template_str)],
         }
     }
 
+    fn parse(tokens: &mut Peekable<impl Iterator<Item = TemplateToken>>) -> Vec<TemplateNode> {      
+        use TemplateToken::*;
+    
+        while let Some(next_token) = tokens.peek() {
+            match next_token {
+                If => {
+                    Self::parse_if(tokens);
+                }
+                For => {
+                    
+                }
+                Identifier(ident) => {
+                    
+                }
+                _ => {
+                    tokens.next();
+                }
+            }
+        }
+        
+        vec![]
+    }    
+    fn parse_if(tokens: &mut Peekable<impl Iterator<Item = TemplateToken>>) -> TemplateNode {
+        tokens.next(); // "If"
+        match Self::parse(tokens).as_slice() {
+            [TemplateNode::Variable(..)] => {}
+            _ => {}
+        }
+
+        
+        if let Some(TemplateToken::EndIf) = tokens.peek() {
+            
+        }
+        
+        TemplateNode::If { 
+            condition: vec![], 
+            then_branch: vec![], 
+            else_branch: vec![]
+        }
+    }
+
+    
+    
     fn lex(input: &str) -> Vec<TemplateToken> {
-        use TemplateNode::*;
-        let lexed = vec![];
+        use TemplateToken::*;
+        let mut lexed = vec![];
 
         let mut cursor = 0;
 
         let mut in_block = false;
-        let mut last_block = 0;
-
-        while cursor < input.len() {
-            let rest = input[cursor..];
+        let mut start_block = 0;
+        let mut end_block = 0;
+        let input_len = input.len();
+        
+        while cursor < input_len {
+            let rest = &input[cursor..];
 
             if rest.starts_with("{{") {
-                cursor += 2;
-                lexed.push(StartBlock);
-
                 if !in_block {
-                    let prev_text = input[last_block..cursor];
-                    lexed.push(Text(prev_text));
+                    let prev_text = input[start_block..cursor].to_string();
+                    // lexed.push(Text(prev_text));
                 }
+                start_block = cursor;
+                cursor += 2;
                 in_block = true;
             }
-
-            if rest.starts_with("}}") {
+            else if rest.starts_with("}}") {
+                if in_block {
+                    let code_text = &input[start_block + 2..cursor];
+                    let mut lexed_code = Self::lex_code(code_text);
+                    lexed.append(&mut lexed_code);
+                }     
                 cursor += 2;
-                lexed.push(StartBlock);
+                start_block = cursor;
                 in_block = false;
             }
-
-            rest
+            cursor += 1;
         }
-
         lexed
     }
 
+    fn lex_code(input: &str) -> Vec<TemplateToken>{
+        use TemplateToken::*;
+        
+        let mut lexed = vec![];
+
+        let mut cursor = 0;
+        let input_len = input.len();
+        
+        let mut push_ident = false;
+        let mut start_ident = 0;
+        let mut end_ident = 0;
+        while cursor < input_len {    
+            let rest = &input[cursor..];
+            
+            end_ident = cursor;
+            let tok = if rest.starts_with(".") {
+                cursor += 1;
+                Some(Dot)
+            }            
+            else if rest.starts_with("if") {
+                cursor += 2;
+                Some(If)
+            }
+            else if rest.starts_with("else") {
+                cursor += 4;
+                Some(Else)
+            }
+            else if rest.starts_with("for") {
+                cursor += 3;
+                Some(For)
+            }      
+            else if rest.starts_with("in") {
+                cursor += 2;
+                Some(In)
+            }      
+            else if rest.starts_with("endif") {
+                cursor += 3;
+                Some(EndIf)
+            }   
+            else if rest.starts_with("endfor") {
+                cursor += 3;
+                Some(EndFor)
+            } else {
+                None
+            };
+        
+            if let Some(tok) = tok {
+                if start_ident != end_ident {
+                    let ident = input[start_ident..end_ident].trim().to_string(); 
+                    lexed.push(Identifier(ident));
+                }
+                lexed.push(tok);                
+                start_ident = cursor;
+                end_ident = cursor;
+                push_ident = false;   
+            }
+            
+            cursor += 1;
+        }    
+        if start_ident + 1 != cursor {
+            let ident = input[start_ident..].trim().to_string(); 
+            lexed.push(Identifier(ident));        
+        }
+        lexed
+    }
+    
     fn populate<'a>(&self, context: HashMap<String, &'a dyn TemplateValue>) -> String {
         String::new()
     }
@@ -157,7 +294,7 @@ fn comptime() {
         assets_str.push_str("\tlet content = Content::from_path(&path, &asset_typ);\n");
         assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now()};\n");
         assets_str.push_str("\tassets.insert(path,asset);\n");
-        println!("cargo:warning=Loaded {asset_path:?}");
+        // println!("cargo:warning=Loaded {asset_path:?}");
     }
     assets_str.push_str("\tassets\n");
     assets_str.push_str("}\n");
