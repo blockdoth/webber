@@ -1,16 +1,20 @@
-balls 
-{{if var.field.subfield }}
-<h1>conditionals</h1>
-{{else}}  
-<h1>else</h1>
+title
+
+{{if posts.ball_container.is_empty }}
+<h1>has balls</h1>
+{{else}}   
+<h1>no balls</h1>
 {{endElse}}  
 
 {{variable}}
 
-{{for post in posts}}
+<h1>Loop:</h1>
+{{for post in posts.data}}
+
+{{if post.display }}
+<h1>condition in for loop</h1>
+{{endIf}}  
 
 <p>{{post.title}}</p>
 <p>{{post.intro}}</p>
-<p>{{post.date}}</p>
-
 {{endFor}}
