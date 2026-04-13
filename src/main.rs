@@ -41,35 +41,32 @@ fn main() -> Result<(), TemplateError> {
         comptime();
     } else {
         println!("Running normally");
-        // runtime();
+        runtime()?;
+        // let template = Template::load(html_template)?;
+        // let mut context: HashMap<String, TemplateValue> = HashMap::new();
 
-        let html_template = fs::read_to_string("./assets/templates/test.html").expect("Cant find template");
+        // let posts = Posts {
+        //     ball_container: BallContainer { is_empty: false },
+        //     data: vec![
+        //         Post {
+        //             title: "title 1".to_string(),
+        //             intro: "intro 1".to_string(),
+        //             display: false,
+        //         },
+        //         Post {
+        //             title: "title 2".to_string(),
+        //             intro: "intro 2".to_string(),
+        //             display: true,
+        //         },
+        //     ],
+        // };
 
-        let template = Template::new(html_template)?;
-        let mut context: HashMap<String, TemplateValue> = HashMap::new();
+        // context.insert("posts".to_string(), posts.to_template_value());
 
-        let posts = Posts {
-            ball_container: BallContainer { is_empty: false },
-            data: vec![
-                Post {
-                    title: "title 1".to_string(),
-                    intro: "intro 1".to_string(),
-                    display: false,
-                },
-                Post {
-                    title: "title 2".to_string(),
-                    intro: "intro 2".to_string(),
-                    display: true,
-                },
-            ],
-        };
+        // context.insert("variable".to_string(), "arbitrary var".to_template_value());
 
-        context.insert("posts".to_string(), posts.to_template_value());
-
-        context.insert("variable".to_string(), "arbitrary var".to_template_value());
-
-        let html_string = template.render(context)?;
-        println!("{html_string}");
+        // let html_string = template.render(context)?;
+        // println!("{html_string}");
     }
     Ok(())
 }
@@ -177,6 +174,7 @@ enum TemplateToken {
 
 struct Template {
     ast: Vec<TemplateNode>,
+    metadata: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -201,6 +199,12 @@ impl fmt::Display for TemplateError {
             TemplateError::Parse(e) => write!(f, "Template Parse error: {}", e),
             TemplateError::Render(e) => write!(f, "Template Render error: {}", e),
         }
+    }
+}
+
+impl From<std::io::Error> for TemplateError {
+    fn from(e: std::io::Error) -> Self {
+        TemplateError::Parse(TemplateParseError::new(e.to_string()))
     }
 }
 
@@ -241,7 +245,7 @@ impl fmt::Display for TemplateRenderError {
 }
 
 impl Template {
-    fn new(template_str: String) -> Result<Self, TemplateError> {
+    fn load(template_str: String) -> Result<Self, TemplateError> {
         let lexed = Self::lex(&template_str);
 
         // for i in &lexed {
@@ -251,11 +255,12 @@ impl Template {
         let tokens = &mut lexed.into_iter().peekable();
         let parsed = Self::parse(tokens)?;
 
+        let metadata = Self::get_metadata(&parsed);
         // for i in &parsed {
         //     println!("{:?}", i);
         // }
 
-        Ok(Template { ast: parsed })
+        Ok(Template { ast: parsed, metadata })
     }
 
     fn parse(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>) -> Result<Vec<TemplateNode>, TemplateError> {
@@ -576,24 +581,32 @@ impl Template {
         )))?;
         // println!("{:?}", current);
         for key in &ident_fields[1..] {
-          current = if let TemplateValue::Object(map) = current {
-            if let Some(obj) = map.get(key.as_str()) {
-                obj
-              } else {
-                return Err(TemplateRenderError::new(format!(
-                  "Can not find variable \"{}\" in context",
-                  ident_fields[0]
-                )));
-              }
-              
+            current = if let TemplateValue::Object(map) = current {
+                if let Some(obj) = map.get(key.as_str()) {
+                    obj
+                } else {
+                    return Err(TemplateRenderError::new(format!(
+                        "Can not find variable \"{}\" in context",
+                        ident_fields[0]
+                    )));
+                }
             } else {
-                return Err(TemplateRenderError::new(format!(
-                    "Variable  \"{}\" is not an object",
-                    ident_fields[0]
-                )));
+                return Err(TemplateRenderError::new(format!("Variable  \"{}\" is not an object", ident_fields[0])));
             };
         }
         Ok(current)
+    }
+
+    fn get_metadata(ast: &[TemplateNode]) -> Vec<String> {
+        ast.iter()
+            .filter_map(|node| {
+                if let TemplateNode::Variable(fields) = node {
+                    Some(fields.join("."))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 //  === end templating ===
@@ -608,7 +621,7 @@ fn comptime() {
     let asset_paths = walk_dir(ASSETS_PATH);
 
     let mut assets_str = String::new();
-    assets_str.push_str("fn get_assets() -> PathTrie {\n");
+    assets_str.push_str("fn load_embedded_assets() -> PathTrie {\n");
     assets_str.push_str("\tlet mut assets = PathTrie::new();\n");
 
     for asset_path in asset_paths {
@@ -629,21 +642,55 @@ fn comptime() {
     println!("cargo:warning=End of build script");
 }
 
-fn runtime() {
+fn runtime() -> Result<(), TemplateError> {
     #[cfg(generated)]
-    let assets: Arc<Mutex<PathTrie>> = Arc::new(Mutex::new(get_assets()));
+    let assets = load_embedded_assets();
     #[cfg(not(generated))]
-    let assets: Arc<Mutex<PathTrie>> = Arc::new(Mutex::new(PathTrie::new()));
+    let assets = PathTrie::new();
+
+    let assets = Arc::new(Mutex::new(assets));
+    let template_context = Arc::new(Mutex::new(HashMap::new()));
+
     println!("Asset count: {:?}", assets.lock().unwrap().len());
     let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
     println!("Started listening on socket http://{SOCKET_ADDR}");
 
+    let templates = load_templates("./assets/templates")?;
+
     let reload_assets = Arc::new(AtomicBool::new(false));
     #[cfg(debug_assertions)]
     {
-        hot_reloading(assets.clone(), ASSETS_PATH, reload_assets.clone());
+        hot_reloading(assets.clone(), template_context.clone(), ASSETS_PATH, reload_assets.clone());
     }
 
+    main_loop(listener, assets, reload_assets, templates);
+    Ok(())
+}
+
+fn load_templates<P: AsRef<Path> + Debug + Copy>(root_path: P) -> Result<(HashMap<String, Template>), TemplateError> {
+    let paths = walk_dir(root_path);
+
+    println!("Found {} template paths in {:?}", paths.len(), root_path);
+
+    let mut templates = HashMap::new();
+
+    for path in &paths {
+        let template_str = fs::read_to_string(path)?;
+        let template = Template::load(template_str)?;
+
+        let rel_path = path
+            .strip_prefix(root_path)
+            .map_err(|e| TemplateParseError::new(e.to_string()))?
+            .to_string_lossy()
+            .to_string();
+
+        templates.insert(rel_path, template);
+    }
+
+    Ok(templates)
+}
+
+fn main_loop(listener: TcpListener, assets: Arc<Mutex<PathTrie>>, reload_assets: Arc<AtomicBool>, templates: HashMap<String, Template>) {
     let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
     let mut active_streams: Vec<TcpStream> = vec![];
     let mut check_alive_timer = Instant::now();
@@ -1013,7 +1060,7 @@ impl Content {
             AssetType::Png | AssetType::Unknown => Content::Binary(fs::read(path).expect("Unable to read file into binary")),
             AssetType::Md => {
                 let markdown = fs::read_to_string(path).expect("Unable read file into string");
-                let html = Parser::html(Parser::parse(&markdown));
+                let html = MarkdownParser::html(MarkdownParser::parse(&markdown));
                 Content::Text(html)
             }
             _ => Content::Text(fs::read_to_string(path).expect("Unable read file into string")),
@@ -1021,17 +1068,15 @@ impl Content {
     }
 }
 
-fn walk_dir(dir_path: &'static str) -> Vec<PathBuf> {
-    let rootdir: PathBuf = PathBuf::from(dir_path);
-
+fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
     let mut asset_paths = vec![];
-    let mut stack = vec![rootdir];
+    let mut stack = vec![rootdir.as_ref().to_path_buf()];
 
     while let Some(dir_path) = stack.pop() {
         let dir = match fs::read_dir(&dir_path) {
             Ok(dir) => dir,
             Err(error) => {
-                println!("Error while trying to open asset dir at {dir_path:?}: {error}");
+                println!("Error while trying to open asset dir at {rootdir:?}: {error}");
                 continue;
             }
         };
@@ -1052,7 +1097,12 @@ fn walk_dir(dir_path: &'static str) -> Vec<PathBuf> {
     asset_paths
 }
 
-fn hot_reloading(asset_map: Arc<Mutex<PathTrie>>, dir_path: &'static str, changed: Arc<AtomicBool>) {
+fn hot_reloading(
+    asset_map: Arc<Mutex<PathTrie>>,
+    template_context: Arc<Mutex<HashMap<String, TemplateValue>>>,
+    dir_path: &'static str,
+    changed: Arc<AtomicBool>,
+) {
     let _ = thread::spawn(move || {
         println!("Started file watcher thread");
         loop {
@@ -1391,11 +1441,11 @@ enum BlockTyp {
     Table,
     Misc,
 }
-struct Parser<'a> {
+struct MarkdownParser<'a> {
     ast: MarkdownNode<'a>,
 }
 
-impl<'a> Parser<'a> {
+impl<'a> MarkdownParser<'a> {
     fn parse(input: &'a str) -> MarkdownNode<'a> {
         let mut active_block = vec![];
         let mut blocks: Vec<MarkDownBlock> = vec![];
