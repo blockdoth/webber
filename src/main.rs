@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
@@ -47,7 +46,7 @@ fn main() -> Result<(), TemplateError> {
         let html_template = fs::read_to_string("./assets/templates/test.html").expect("Cant find template");
 
         let template = Template::new(html_template)?;
-        let mut context: HashMap<String, &dyn TemplateValue> = HashMap::new();
+        let mut context: HashMap<String, TemplateValue> = HashMap::new();
 
         let posts = Posts {
             ball_container: BallContainer { is_empty: false },
@@ -65,14 +64,64 @@ fn main() -> Result<(), TemplateError> {
             ],
         };
 
-        context.insert("posts".to_string(), &posts);
+        context.insert("posts".to_string(), posts.to_template_value());
 
-        context.insert("variable".to_string(), &"arbitrary var");
+        context.insert("variable".to_string(), "arbitrary var".to_template_value());
 
         let html_string = template.render(context)?;
         println!("{html_string}");
     }
     Ok(())
+}
+
+// === Templating ===
+
+#[derive(Clone, Debug)]
+enum TemplateValue {
+    Text(String),
+    Bool(bool),
+    List(Vec<TemplateValue>),
+    Object(HashMap<String, TemplateValue>),
+}
+
+trait ToTemplateValue {
+    fn to_template_value(&self) -> TemplateValue;
+}
+
+impl ToTemplateValue for &str {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::Text(self.to_string())
+    }
+}
+
+impl ToTemplateValue for String {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::Text(self.to_string())
+    }
+}
+
+impl ToTemplateValue for bool {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::Bool(*self)
+    }
+}
+
+impl<T: ToTemplateValue> ToTemplateValue for Vec<T> {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::List(self.iter().map(|item| item.to_template_value()).collect())
+    }
+}
+
+macro_rules! impl_to_template_value {
+    ($type:ty, { $($field:ident),* }) => {
+        impl ToTemplateValue for $type {
+            fn to_template_value(&self) -> TemplateValue {
+                TemplateValue::Object(HashMap::from([
+                    $((stringify!($field).to_string(), self.$field.to_template_value())),*
+                ]))
+            }
+        }
+    };
 }
 
 struct Posts {
@@ -89,106 +138,9 @@ struct Post {
     display: bool,
 }
 
-trait TemplateValue {
-    fn get_field(&self, field: &str) -> Result<&dyn TemplateValue, TemplateRenderError>;
-    fn to_str(&self) -> String;
-    fn as_iter(&self) -> Result<Vec<&dyn TemplateValue>, TemplateRenderError> {
-        Err(TemplateRenderError::new(format!("Variable \"{}\" is not an iter", self.to_str())))
-    }
-    fn as_bool(&self) -> Result<bool, TemplateRenderError> {
-        Err(TemplateRenderError::new(format!("Variable \"{}\" is not a bool", self.to_str())))
-    }
-}
-
-impl TemplateValue for Posts {
-    fn get_field(&self, field: &str) -> Result<&dyn TemplateValue, TemplateRenderError> {
-        match field {
-            "ball_container" => Ok(&self.ball_container),
-            "data" => Ok(&self.data),
-            _ => Err(TemplateRenderError::new(format!("Unknown field '{}'", field))),
-        }
-    }
-
-    fn to_str(&self) -> String {
-        "posts".to_string()
-    }
-}
-
-impl TemplateValue for BallContainer {
-    fn get_field(&self, field: &str) -> Result<&dyn TemplateValue, TemplateRenderError> {
-        match field {
-            "is_empty" => Ok(&self.is_empty),
-            _ => Err(TemplateRenderError::new(format!("Unknown field '{}'", field))),
-        }
-    }
-
-    fn to_str(&self) -> String {
-        "BallContainer".to_string()
-    }
-}
-
-impl TemplateValue for Vec<Post> {
-    fn get_field(&self, _field: &str) -> Result<&dyn TemplateValue, TemplateRenderError> {
-        Err(TemplateRenderError::new("Vec does not support field access"))
-    }
-
-    fn to_str(&self) -> String {
-        format!("posts[{}]", self.len())
-    }
-
-    fn as_iter(&self) -> Result<Vec<&dyn TemplateValue>, TemplateRenderError> {
-        Ok(self.iter().map(|item| item as &dyn TemplateValue).collect())
-    }
-}
-
-impl TemplateValue for Post {
-    fn get_field(&self, field: &str) -> Result<&dyn TemplateValue, TemplateRenderError> {
-        match field {
-            "title" => Ok(&self.title),
-            "intro" => Ok(&self.intro),
-            "display" => Ok(&self.display),
-            _ => Err(TemplateRenderError::new(format!("Unknown field '{}'", field))),
-        }
-    }
-
-    fn to_str(&self) -> String {
-        self.title.clone()
-    }
-}
-
-impl TemplateValue for &str {
-    fn get_field(&self, field: &str) -> Result<&dyn TemplateValue, TemplateRenderError> {
-        Err(TemplateRenderError::new("&str does not support field access"))
-    }
-
-    fn to_str(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl TemplateValue for String {
-    fn get_field(&self, field: &str) -> Result<&dyn TemplateValue, TemplateRenderError> {
-        Err(TemplateRenderError::new("String does not support field access"))
-    }
-
-    fn to_str(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl TemplateValue for bool {
-    fn get_field(&self, field: &str) -> Result<&dyn TemplateValue, TemplateRenderError> {
-        Err(TemplateRenderError::new("bool does not support field access"))
-    }
-
-    fn to_str(&self) -> String {
-        self.to_string()
-    }
-
-    fn as_bool(&self) -> Result<bool, TemplateRenderError> {
-        Ok(*self)
-    }
-}
+impl_to_template_value!(BallContainer, { is_empty });
+impl_to_template_value!(Posts, { ball_container, data});
+impl_to_template_value!(Post, { title, intro, display});
 
 #[derive(Debug)]
 enum TemplateNode {
@@ -562,68 +514,90 @@ impl Template {
         lexed
     }
 
-    fn render(&self, context: HashMap<String, &dyn TemplateValue>) -> Result<String, TemplateError> {
+    fn render(&self, context: HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
         // println!("{:?}", &self.ast);
         Self::render_helper(&self.ast, &context)
     }
 
-    fn render_helper(nodes: &Vec<TemplateNode>, context: &HashMap<String, &dyn TemplateValue>) -> Result<String, TemplateError> {
+    fn render_helper(nodes: &Vec<TemplateNode>, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
         let mut res = String::new();
         for node in nodes {
-            let node_str = match node {
-                TemplateNode::Text(text) => text.into(),
-                TemplateNode::Variable(ident_fields) => Self::resolve_var(ident_fields, context)?.to_str(),
+            match node {
+                TemplateNode::Text(text) => res.push_str(text),
+                TemplateNode::Variable(ident_fields) => {
+                    if let TemplateValue::Text(text) = Self::resolve_var(ident_fields, context)? {
+                        res.push_str(text);
+                    } else {
+                        return Err(TemplateRenderError::new(format!("Variable {:?} is not text", ident_fields)))?;
+                    }
+                }
                 TemplateNode::If {
                     condition,
                     then_branch,
                     else_branch,
                 } => {
-                    if Self::resolve_var(condition, context)?.as_bool()? {
-                        Self::render_helper(then_branch, context)?
+                    if let TemplateValue::Bool(cond) = *Self::resolve_var(condition, context)? {
+                        let cond_str = if cond {
+                            Self::render_helper(then_branch, context)?
+                        } else {
+                            Self::render_helper(else_branch, context)?
+                        };
+                        res.push_str(&cond_str);
                     } else {
-                        Self::render_helper(else_branch, context)?
+                        return Err(TemplateRenderError::new(format!("Variable {:?} is not a bool", condition)))?;
                     }
                 }
                 TemplateNode::For { iter_bind, iter_src, body } => {
-                    let iter_src = Self::resolve_var(iter_src, context)?;
-                    let iter = iter_src.as_iter()?;
-
-                    let mut for_res = String::new();
-                    for it in iter {
-                        let mut local_context = context.clone();
-                        local_context
-                            .insert(iter_bind.to_string(), it)
-                            .ok_or(TemplateRenderError::new("Failed to insert iter in local context"));
-                        for_res.push_str(&Self::render_helper(body, &local_context)?);
+                    if let TemplateValue::List(iter) = Self::resolve_var(iter_src, context)? {
+                        let mut for_res = String::new();
+                        for it in iter {
+                            let mut local_context = context.clone(); // TODO use stack frames
+                            local_context
+                                .insert(iter_bind.to_string(), it.clone())
+                                .ok_or(TemplateRenderError::new("Failed to insert iter in local context"));
+                            for_res.push_str(&Self::render_helper(body, &local_context)?);
+                        }
+                        res.push_str(&for_res);
+                    } else {
+                        return Err(TemplateRenderError::new(format!("Variable {:?} is not iterable", iter_src)))?;
                     }
-                    for_res
                 }
             };
             // print!("> {}", &node_str);
-            res.push_str(&node_str);
         }
 
         Ok(res)
     }
 
-    fn resolve_var<'a>(
-        ident_fields: &[String],
-        context: &'a HashMap<String, &'a dyn TemplateValue>,
-    ) -> Result<&'a dyn TemplateValue, TemplateRenderError> {
-        let root_var = ident_fields.first().expect("Precondition for variable resolving");
-        match context.get(root_var) {
-            Some(ident) => {
-                if ident_fields.len() == 1 {
-                    Ok(*ident)
-                } else {
-                    Ok(ident_fields.iter().skip(1).try_fold(*ident, |acc, e| acc.get_field(e))?)
-                }
-            }
-            None => Err(TemplateRenderError::new(format!("Can not find variable \"{root_var}\" in context"))),
+    fn resolve_var<'a>(ident_fields: &[String], context: &'a HashMap<String, TemplateValue>) -> Result<&'a TemplateValue, TemplateRenderError> {
+        let mut current = context.get(&ident_fields[0]).ok_or(TemplateRenderError::new(format!(
+            "Can not find variable \"{}\" in context",
+            ident_fields[0]
+        )))?;
+        // println!("{:?}", current);
+        for key in &ident_fields[1..] {
+          current = if let TemplateValue::Object(map) = current {
+            if let Some(obj) = map.get(key.as_str()) {
+                obj
+              } else {
+                return Err(TemplateRenderError::new(format!(
+                  "Can not find variable \"{}\" in context",
+                  ident_fields[0]
+                )));
+              }
+              
+            } else {
+                return Err(TemplateRenderError::new(format!(
+                    "Variable  \"{}\" is not an object",
+                    ident_fields[0]
+                )));
+            };
         }
+        Ok(current)
     }
 }
-
+//  === end templating ===
+//
 fn comptime() {
     println!("cargo:rerun-if-changed=none");
     println!("cargo:rustc-cfg=generated");
