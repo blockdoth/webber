@@ -5,6 +5,7 @@
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::f32::consts::E;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
 use std::io::{self, Read, Write};
@@ -14,30 +15,17 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
+use std::thread::{panicking, sleep};
 use std::time::{Duration, Instant, SystemTime};
 use std::vec::IntoIter;
 use std::{char, fmt, fs, thread, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
+const TEMPLATES_PATH: &str = "./templates/";
 
 #[cfg(generated)]
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
-
-struct SimpleTemplate {
-    html: String,
-}
-
-impl SimpleTemplate {
-    fn populate(&self, content: Vec<(String, String)>) -> String {
-        let mut res = self.html.clone();
-        for (key, value) in content {
-            res = res.replace(&format!("{{{{{key}}}}}"), &value)
-        }
-        res
-    }
-}
 
 fn main() -> Result<(), TemplateError> {
     if std::env::args().any(|arg| arg.contains("build-script-build")) {
@@ -46,32 +34,6 @@ fn main() -> Result<(), TemplateError> {
     } else {
         println!("Running normally");
         runtime()?;
-
-        // let template = Template::load("assets/templates/test.html")?;
-        // let mut context: HashMap<String, TemplateValue> = HashMap::new();
-
-        // let posts = Posts {
-        //     ball_container: BallContainer { is_empty: false },
-        //     data: vec![
-        //         Post {
-        //             title: "title 1".to_string(),
-        //             intro: "intro 1".to_string(),
-        //             display: false,
-        //         },
-        //         Post {
-        //             title: "title 2".to_string(),
-        //             intro: "intro 2".to_string(),
-        //             display: true,
-        //         },
-        //     ],
-        // };
-
-        // context.insert("posts".to_string(), posts.to_template_value());
-
-        // context.insert("variable".to_string(), "arbitrary var".to_template_value());
-
-        // let html_string = template.render(context)?;
-        // println!("{html_string}");
     }
     Ok(())
 }
@@ -282,6 +244,8 @@ struct Position {
     line: usize,
     column: usize,
 }
+
+#[derive(Debug)]
 struct Template {
     ast: Vec<TemplateNode>,
     required_variables: Vec<String>,
@@ -331,7 +295,7 @@ enum TemplateParseErrorMsg {
 #[derive(Debug)]
 struct TemplateRenderError {
     typ: TemplateRenderErrorMsg,
-    // pos: Option<TemplatePositionData>,
+    path: String,
 }
 
 #[derive(Debug)]
@@ -374,8 +338,8 @@ impl TemplateParseError {
 }
 
 impl TemplateRenderError {
-    fn new(typ: TemplateRenderErrorMsg) -> Self {
-        Self { typ }
+    fn new(typ: TemplateRenderErrorMsg, path: String) -> Self {
+        Self { typ, path }
     }
 }
 
@@ -825,9 +789,9 @@ impl Template {
         })
     }
 
-    fn render(&self, context: HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
+    fn render(&self, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
         // println!("{:?}", &self.ast);
-        Self::render_helper(&self.ast, &context)
+        Self::render_helper(&self.ast, context)
     }
 
     fn render_helper(nodes: &Vec<TemplateNode>, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
@@ -837,13 +801,13 @@ impl Template {
             match &node.data {
                 Text(text) => res.push_str(text),
                 Variable(ident_fields) => {
-                    if let TemplateValue::Text(text) = Self::resolve_var(ident_fields, context)? {
+                    if let TemplateValue::Text(text) = Self::resolve_var(ident_fields, context, node.pos.file.as_str())? {
                         res.push_str(text);
                     } else {
-                        return Err(TemplateRenderError::new(TemplateRenderErrorMsg::NodeNotOfExpectedType(
-                            ident_fields.concat(),
-                            TemplateNodeKind::Text,
-                        )))?;
+                        return Err(TemplateRenderError::new(
+                            TemplateRenderErrorMsg::NodeNotOfExpectedType(ident_fields.concat(), TemplateNodeKind::Text),
+                            node.pos.file.to_string(),
+                        ))?;
                     }
                 }
                 If {
@@ -851,7 +815,7 @@ impl Template {
                     then_branch,
                     else_branch,
                 } => {
-                    if let TemplateValue::Bool(cond) = *Self::resolve_var(condition, context)? {
+                    if let TemplateValue::Bool(cond) = *Self::resolve_var(condition, context, node.pos.file.as_str())? {
                         let cond_str = if cond {
                             Self::render_helper(then_branch, context)?
                         } else {
@@ -859,14 +823,14 @@ impl Template {
                         };
                         res.push_str(&cond_str);
                     } else {
-                        return Err(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotOfExpectedType(
-                            condition.concat(),
-                            TemplateValueKind::Bool,
-                        )))?;
+                        return Err(TemplateRenderError::new(
+                            TemplateRenderErrorMsg::VariableNotOfExpectedType(condition.concat(), TemplateValueKind::Bool),
+                            node.pos.file.to_string(),
+                        ))?;
                     }
                 }
                 For { iter_bind, iter_src, body } => {
-                    if let TemplateValue::List(iter) = Self::resolve_var(iter_src, context)? {
+                    if let TemplateValue::List(iter) = Self::resolve_var(iter_src, context, node.pos.file.as_str())? {
                         let mut for_res = String::new();
                         for it in iter {
                             let mut local_context = context.clone(); // TODO use stack frames
@@ -875,10 +839,10 @@ impl Template {
                         }
                         res.push_str(&for_res);
                     } else {
-                        return Err(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotOfExpectedType(
-                            iter_src.concat(),
-                            TemplateValueKind::List,
-                        )))?;
+                        return Err(TemplateRenderError::new(
+                            TemplateRenderErrorMsg::VariableNotOfExpectedType(iter_src.concat(), TemplateValueKind::List),
+                            node.pos.file.to_string(),
+                        ))?;
                     }
                 }
             };
@@ -888,12 +852,15 @@ impl Template {
         Ok(res)
     }
 
-    fn resolve_var<'a>(ident_fields: &[String], context: &'a HashMap<String, TemplateValue>) -> Result<&'a TemplateValue, TemplateRenderError> {
-        let mut current = context
-            .get(&ident_fields[0])
-            .ok_or(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotFound(
-                ident_fields[0].to_string(),
-            )))?;
+    fn resolve_var<'a>(
+        ident_fields: &[String],
+        context: &'a HashMap<String, TemplateValue>,
+        path: &str,
+    ) -> Result<&'a TemplateValue, TemplateRenderError> {
+        let mut current = context.get(&ident_fields[0]).ok_or(TemplateRenderError::new(
+            TemplateRenderErrorMsg::VariableNotFound(ident_fields[0].to_string()),
+            path.to_string(),
+        ))?;
         // println!("{:?}", current);
         // println!("{:?}", context);
         let mut idx = 1;
@@ -902,16 +869,16 @@ impl Template {
                 if let Some(obj) = map.get(field.as_str()) {
                     obj
                 } else {
-                    return Err(TemplateRenderError::new(TemplateRenderErrorMsg::FieldNotFoundOnVariable(
-                        ident_fields[1..idx].concat(),
-                        field.to_string(),
-                    )));
+                    return Err(TemplateRenderError::new(
+                        TemplateRenderErrorMsg::FieldNotFoundOnVariable(ident_fields[1..idx].concat(), field.to_string()),
+                        path.to_string(),
+                    ));
                 }
             } else {
-                return Err(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotOfExpectedType(
-                    field.to_string(),
-                    TemplateValueKind::List,
-                )))?;
+                return Err(TemplateRenderError::new(
+                    TemplateRenderErrorMsg::VariableNotOfExpectedType(field.to_string(), TemplateValueKind::List),
+                    path.to_string(),
+                ))?;
             };
             idx += 1;
         }
@@ -951,7 +918,7 @@ fn comptime() {
 
         assets_str.push_str(&format!("\tlet path = PathBuf::from(\"{}\");\n", path_key));
         assets_str.push_str(&format!("\tlet asset_typ = AssetType::from_path(&PathBuf::from(\"{}\"));\n", full_path));
-        assets_str.push_str("\tlet content = Content::from_path(&path, &asset_typ);\n");
+        assets_str.push_str("\tlet content = Content::load_from_path(&path, &asset_typ);\n");
         assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now()};\n");
         assets_str.push_str("\tassets.insert(path,asset);\n");
         // println!("cargo:warning=Loaded {asset_path:?}");
@@ -965,24 +932,31 @@ fn comptime() {
 
 fn runtime() -> Result<(), TemplateError> {
     #[cfg(generated)]
-    let assets = load_embedded_assets();
+    let mut assets = load_embedded_assets();
     #[cfg(not(generated))]
-    let assets = PathTrie::new();
+    let mut assets = PathTrie::new();
+    println!("Asset count: {:?}", assets.len());
+
+    let templates = load_templates(TEMPLATES_PATH)?;
+    let mut template_context = HashMap::new();
+
+    insert_templates(&mut assets, &templates, &mut template_context)?;
+    // println!("Assets content");
+    // for path in &assets.paths {
+    //     println!("{:?}", path);
+    // }
 
     let assets = Arc::new(Mutex::new(assets));
-    let template_context = Arc::new(Mutex::new(HashMap::new()));
-
-    println!("Asset count: {:?}", assets.lock().unwrap().len());
-    let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
-    println!("Started listening on socket http://{SOCKET_ADDR}");
-
-    let templates = load_templates("./assets/templates")?;
+    let template_context = Arc::new(Mutex::new(template_context));
 
     let reload_assets = Arc::new(AtomicBool::new(false));
     #[cfg(debug_assertions)]
     {
-        hot_reloading(assets.clone(), template_context.clone(), ASSETS_PATH, reload_assets.clone());
+        fs_watcher(assets.clone(), template_context.clone(), reload_assets.clone());
     }
+
+    let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
+    println!("Started listening on socket http://{SOCKET_ADDR}");
 
     main_loop(listener, assets, reload_assets, templates);
     Ok(())
@@ -1008,6 +982,58 @@ fn load_templates<P: AsRef<Path> + Debug + Copy>(root_path: P) -> Result<(HashMa
     }
 
     Ok(templates)
+}
+
+fn insert_templates(
+    assets: &mut PathTrie,
+    templates: &HashMap<String, Template>,
+    template_context: &mut HashMap<String, TemplateValue>,
+) -> Result<(), TemplateError> {
+    println!("Inserting {} templates into assets", templates.len());
+
+    let posts = Posts {
+        ball_container: BallContainer { is_empty: false },
+        data: vec![
+            Post {
+                title: "title 1".to_string(),
+                intro: "intro 1".to_string(),
+                display: false,
+            },
+            Post {
+                title: "title 2".to_string(),
+                intro: "intro 2".to_string(),
+                display: true,
+            },
+        ],
+    };
+
+    template_context.insert("posts".to_string(), posts.to_template_value());
+    template_context.insert("variable".to_string(), "arbitrary var".to_template_value());
+    template_context.insert("hotreload".to_string(), true.to_template_value());
+
+    for key in templates.keys() {
+        println!("{:?}", key);
+    }
+
+    for (path, template) in templates {
+        let html = match template.render(template_context) {
+            Ok(html) => html,
+            Err(e) => {
+                println!("Required vars {:?}", template.required_variables);
+                Err(e)?
+            }
+        };
+        assets.insert(
+            format!("$templates/{}", path).into(),
+            Asset {
+                last_modified: SystemTime::now(),
+                content: Content::Text(html),
+                asset_typ: AssetType::Html,
+            },
+        );
+        // println!("{i:#?}");
+    }
+    Ok(())
 }
 
 fn main_loop(listener: TcpListener, assets: Arc<Mutex<PathTrie>>, reload_assets: Arc<AtomicBool>, templates: HashMap<String, Template>) {
@@ -1073,30 +1099,30 @@ fn main_loop(listener: TcpListener, assets: Arc<Mutex<PathTrie>>, reload_assets:
                     };
                     // println!("{:?}", asset);
                     let response = if let Some(asset) = asset {
-                        let response_content = if asset.asset_typ == AssetType::Md
-                            && let Content::Text(content) = asset.content
-                        {
-                            let main_template = {
-                                #[cfg(debug_assertions)]
-                                let template_path = PathBuf::from("./assets/templates/main-hotreload.html");
-                                #[cfg(not(debug_assertions))]
-                                let template_path = PathBuf::from("./assets/templates/main.html");
+                        // let response_content = if asset.asset_typ == AssetType::Md
+                        //     && let Content::Text(content) = asset.content
+                        // {
+                        //     let main_template = {
+                        //         #[cfg(debug_assertions)]
+                        //         let template_path = PathBuf::from("./assets/templates/main-hotreload.html");
+                        //         #[cfg(not(debug_assertions))]
+                        //         let template_path = PathBuf::from("./assets/templates/main.html");
 
-                                let guard = assets.lock().expect("unable to unlock");
-                                let asset = guard.get(&template_path).expect("Failed to find main template");
+                        //         let guard = assets.lock().expect("unable to unlock");
+                        //         let asset = guard.get(&template_path).expect("Failed to find main template");
 
-                                match (&asset.asset_typ, asset.content.clone()) {
-                                    (AssetType::Html, Content::Text(html)) => SimpleTemplate { html },
-                                    _ => panic!("Main template must be html"),
-                                }
-                            };
-                            Content::Text(main_template.populate(vec![("body".to_string(), content)]))
-                        } else {
-                            asset.content
-                        };
-                        println!("{:?}", response_content);
+                        //         match (&asset.asset_typ, asset.content.clone()) {
+                        //             (AssetType::Html, Content::Text(html)) => SimpleTemplate { html },
+                        //             _ => panic!("Main template must be html"),
+                        //         }
+                        //     };
+                        //     Content::Text(main_template.populate(vec![("body".to_string(), content)]))
+                        // } else {
+                        //     asset.content
+                        // };
+                        // println!("{:?}", response_content);
 
-                        build_response(HttpResponseCode::Ok, asset.asset_typ, response_content)
+                        build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
                     } else {
                         let body = Content::Text(format!("resource at {} not found", path));
                         build_response(HttpResponseCode::NotFound, AssetType::Text, body)
@@ -1375,7 +1401,7 @@ impl Content {
             Content::Text(text) => text.len(),
         }
     }
-    fn from_path(path: &Path, content_typ: &AssetType) -> Content {
+    fn load_from_path(path: &Path, content_typ: &AssetType) -> Content {
         match content_typ {
             AssetType::Png | AssetType::Unknown => Content::Binary(fs::read(path).expect("Unable to read file into binary")),
             AssetType::Md => {
@@ -1386,7 +1412,17 @@ impl Content {
             _ => Content::Text(fs::read_to_string(path).expect("Unable read file into string")),
         }
     }
+
+    fn load_template(path: &Path, template_context: &Arc<Mutex<HashMap<String, TemplateValue>>>) -> Result<String, TemplateError> {
+        let hashmap = template_context.lock().expect("Failed to acquite lock for template context");
+        Template::load(path)?.render(&hashmap)
+    }
 }
+
+// Err(e) => {
+//   println!("{e}");
+//   continue;
+// }
 
 fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
     let mut asset_paths = vec![];
@@ -1417,16 +1453,12 @@ fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
     asset_paths
 }
 
-fn hot_reloading(
-    asset_map: Arc<Mutex<PathTrie>>,
-    template_context: Arc<Mutex<HashMap<String, TemplateValue>>>,
-    dir_path: &'static str,
-    changed: Arc<AtomicBool>,
-) {
+fn fs_watcher(asset_map: Arc<Mutex<PathTrie>>, template_context: Arc<Mutex<HashMap<String, TemplateValue>>>, changed: Arc<AtomicBool>) {
     let _ = thread::spawn(move || {
         println!("Started file watcher thread");
         loop {
-            let asset_paths = walk_dir(dir_path);
+            let mut asset_paths = walk_dir(ASSETS_PATH);
+            asset_paths.append(&mut walk_dir(TEMPLATES_PATH));
             let asset_set: HashSet<PathBuf> = asset_paths.iter().cloned().collect();
 
             let mut map = asset_map.lock().expect("Unable to acquire lock");
@@ -1444,7 +1476,18 @@ fn hot_reloading(
                 match map.get_mut(path) {
                     Some(existing_asset) => {
                         if last_modified > existing_asset.last_modified {
-                            existing_asset.content = Content::from_path(path, &existing_asset.asset_typ);
+                            existing_asset.content = if path.starts_with(TEMPLATES_PATH) && existing_asset.asset_typ == AssetType::Html {
+                                Content::Text(match Content::load_template(path, &template_context) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        eprintln!("Template error: {}", e);
+                                        continue;
+                                    }
+                                })
+                            } else {
+                                Content::load_from_path(path, &existing_asset.asset_typ)
+                            };
+
                             existing_asset.last_modified = last_modified;
                             changed.store(true, Ordering::Release);
 
@@ -1457,11 +1500,23 @@ fn hot_reloading(
                     }
                     None => {
                         let content_typ = AssetType::from_path(path);
+                        let content = if path.starts_with(TEMPLATES_PATH) && content_typ == AssetType::Html {
+                            Content::Text(match Content::load_template(path, &template_context) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!("Template error: {}", e);
+                                    continue;
+                                }
+                            })
+                        } else {
+                            Content::load_from_path(path, &content_typ)
+                        };
+
                         map.insert(
                             path.clone(),
                             Asset {
                                 last_modified,
-                                content: Content::from_path(path, &content_typ),
+                                content,
                                 asset_typ: content_typ,
                             },
                         );
@@ -1474,7 +1529,7 @@ fn hot_reloading(
                     }
                 }
             }
-            if map.remove_other_than(asset_paths) {
+            if map.remove_other_than_except_generated(asset_paths) {
                 changed.store(true, Ordering::Release);
             }
 
@@ -1573,7 +1628,7 @@ impl PathTrie {
         // TODO remove the emtpy data nodes left behind
         true
     }
-    fn remove_other_than(&mut self, current_paths: Vec<PathBuf>) -> bool {
+    fn remove_other_than_except_generated(&mut self, current_paths: Vec<PathBuf>) -> bool {
         let current_paths_set: HashSet<PathBuf> = current_paths.into_iter().collect();
 
         let paths_to_delete: Vec<PathBuf> = self.paths.difference(&current_paths_set).cloned().collect();
@@ -1581,6 +1636,9 @@ impl PathTrie {
         let mut changed = false;
 
         for path in &paths_to_delete {
+            if path.to_string_lossy().starts_with("$") {
+                continue;
+            };
             println!("Removed file {:?}", path);
             changed |= self.remove(path);
         }
