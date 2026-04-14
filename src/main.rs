@@ -2,17 +2,21 @@
 #![allow(unexpected_cfgs)]
 #![allow(dead_code, unused, unused_mut)]
 
+use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
+use std::fs::Metadata;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
-use std::path::{Display, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
+use std::vec::IntoIter;
 use std::{char, fmt, fs, thread, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
@@ -42,7 +46,8 @@ fn main() -> Result<(), TemplateError> {
     } else {
         println!("Running normally");
         runtime()?;
-        // let template = Template::load(html_template)?;
+
+        // let template = Template::load("assets/templates/test.html")?;
         // let mut context: HashMap<String, TemplateValue> = HashMap::new();
 
         // let posts = Posts {
@@ -79,6 +84,25 @@ enum TemplateValue {
     Bool(bool),
     List(Vec<TemplateValue>),
     Object(HashMap<String, TemplateValue>),
+}
+
+#[derive(Clone, Debug)]
+enum TemplateValueKind {
+    Text,
+    Bool,
+    List,
+    Object,
+}
+
+impl TemplateValue {
+    fn kind(&self) -> TemplateValueKind {
+        match self {
+            TemplateValue::Text(_) => TemplateValueKind::Text,
+            TemplateValue::Bool(_) => TemplateValueKind::Bool,
+            TemplateValue::List(_) => TemplateValueKind::List,
+            TemplateValue::Object(_) => TemplateValueKind::Object,
+        }
+    }
 }
 
 trait ToTemplateValue {
@@ -140,7 +164,13 @@ impl_to_template_value!(Posts, { ball_container, data});
 impl_to_template_value!(Post, { title, intro, display});
 
 #[derive(Debug)]
-enum TemplateNode {
+struct TemplateNode {
+    data: TemplateNodeData,
+    pos: TemplatePositionData,
+}
+
+#[derive(Debug)]
+enum TemplateNodeData {
     Text(String),
     Variable(Vec<String>),
     If {
@@ -155,14 +185,70 @@ enum TemplateNode {
     },
 }
 
+#[derive(Clone, Debug)]
+enum TemplateNodeKind {
+    Text,
+    Variable,
+    If,
+    For,
+}
+
+impl TemplateNodeData {
+    fn kind(&self) -> TemplateNodeKind {
+        match self {
+            TemplateNodeData::Text(_) => TemplateNodeKind::Text,
+            TemplateNodeData::Variable(_) => TemplateNodeKind::Variable,
+            TemplateNodeData::If { .. } => TemplateNodeKind::If,
+            TemplateNodeData::For { .. } => TemplateNodeKind::For,
+        }
+    }
+}
+
+impl fmt::Display for TemplateNodeData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemplateNodeData::Text(text) => write!(f, "{}", text),
+            TemplateNodeData::Variable(parts) => {
+                write!(f, "{}", parts.join("."))
+            }
+            TemplateNodeData::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let then_branch_str = then_branch.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+
+                let else_branch_str = else_branch.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+
+                write!(
+                    f,
+                    "if {} then {{\n \t{}\n}} else {{\n\t{}\n}}",
+                    condition.join("."),
+                    then_branch_str,
+                    else_branch_str
+                )
+            }
+            TemplateNodeData::For { iter_bind, iter_src, body } => {
+                let body_str = body.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+
+                write!(f, "for {} in {} {{\n{}\n}}", iter_bind, iter_src.join("."), body_str)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TemplateToken {
+    kind: TemplateTokenKind,
+    metadata: TemplatePositionData,
+}
+
 #[derive(Debug, PartialEq, Clone)]
-enum TemplateToken {
+enum TemplateTokenKind {
     Text(String),
     Identifier(String),
     Dot,
     If,
-    // ParenOpen,
-    // ParenClose,
     Else,
     For,
     In,
@@ -170,21 +256,91 @@ enum TemplateToken {
     EndElse,
     EndFor,
     NewLine,
+    // ParenOpen(PositionData),
+    // ParenClose(PositionData),
 }
 
+#[derive(Debug, Clone)]
+struct TemplatePositionData {
+    file: Rc<String>,
+    start_pos: Position,
+    end_pos: Position,
+}
+
+impl Default for TemplatePositionData {
+    fn default() -> Self {
+        Self {
+            file: Rc::new("".to_owned()),
+            start_pos: Position { line: 0, column: 0 },
+            end_pos: Position { line: 0, column: 0 },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Position {
+    line: usize,
+    column: usize,
+}
 struct Template {
     ast: Vec<TemplateNode>,
-    metadata: Vec<String>,
+    required_variables: Vec<String>,
+    origin_file: String,
 }
 
 #[derive(Debug)]
 struct TemplateParseError {
-    message: String,
+    typ: TemplateParseErrorMsg,
+    pos: Option<TemplatePositionData>,
+}
+
+impl TemplatePositionData {
+    fn merge(&self, other: &TemplatePositionData) -> Result<Self, TemplateParseError> {
+        if self.file != other.file {
+            Err(TemplateParseError::no_info(TemplateParseErrorMsg::MergingSpansFromDifferentFiles(
+                self.file.to_string(),
+                other.file.to_string(),
+            )))
+        } else {
+            Ok(TemplatePositionData {
+                file: self.file.clone(),
+                start_pos: Position {
+                    line: min(self.start_pos.line, other.start_pos.line),
+                    column: min(self.start_pos.column, other.start_pos.column),
+                },
+                end_pos: Position {
+                    line: max(self.end_pos.line, other.end_pos.line),
+                    column: max(self.end_pos.line, other.end_pos.line),
+                },
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TemplateParseErrorMsg {
+    UnexpectedToken(TemplateTokenKind, TemplateTokenKind),
+    BrokenInvariant(TemplateTokenKind, TemplateTokenKind),
+    ExpectButEOF(TemplateTokenKind),
+    GenericError(String),
+    UnexpectedTemplateValueType(TemplateNodeKind, TemplateNodeKind),
+    MergingSpansFromDifferentFiles(String, String),
+    UnexpectedEOF,
 }
 
 #[derive(Debug)]
 struct TemplateRenderError {
-    message: String,
+    typ: TemplateRenderErrorMsg,
+    // pos: Option<TemplatePositionData>,
+}
+
+#[derive(Debug)]
+enum TemplateRenderErrorMsg {
+    VariableNotFound(String),
+    FieldNotFoundOnVariable(String, String),
+    NodeNotOfExpectedType(String, TemplateNodeKind),
+    VariableNotOfExpectedType(String, TemplateValueKind),
+    ContextError(String),
 }
 
 #[derive(Debug)]
@@ -204,19 +360,22 @@ impl fmt::Display for TemplateError {
 
 impl From<std::io::Error> for TemplateError {
     fn from(e: std::io::Error) -> Self {
-        TemplateError::Parse(TemplateParseError::new(e.to_string()))
+        TemplateError::Parse(TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))
     }
 }
 
 impl TemplateParseError {
-    fn new(msg: impl Into<String>) -> Self {
-        Self { message: msg.into() }
+    fn new(typ: TemplateParseErrorMsg, pos: TemplatePositionData) -> Self {
+        Self { typ, pos: Some(pos) }
+    }
+    fn no_info(typ: TemplateParseErrorMsg) -> Self {
+        Self { typ, pos: None }
     }
 }
 
 impl TemplateRenderError {
-    fn new(msg: impl Into<String>) -> Self {
-        Self { message: msg.into() }
+    fn new(typ: TemplateRenderErrorMsg) -> Self {
+        Self { typ }
     }
 }
 
@@ -234,179 +393,37 @@ impl From<TemplateRenderError> for TemplateError {
 
 impl fmt::Display for TemplateParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{:?} {:?}", self.typ, self.pos)
     }
 }
 
 impl fmt::Display for TemplateRenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{:?}", self.typ)
     }
 }
 
-impl Template {
-    fn load(template_str: String) -> Result<Self, TemplateError> {
-        let lexed = Self::lex(&template_str);
+struct TemplateParser {
+    tokens: Peekable<IntoIter<TemplateToken>>,
+    prev: Option<TemplateToken>,
+}
+
+impl TemplateParser {
+    fn lex(input_str: &str, path_string: &str) -> Self {
+        let lexed = Self::lex_template(input_str, path_string);
 
         // for i in &lexed {
-        //     println!("{:?}", i);
+        //     println!("{:?}", i.kind);
         // }
 
-        let tokens = &mut lexed.into_iter().peekable();
-        let parsed = Self::parse(tokens)?;
-
-        let metadata = Self::get_metadata(&parsed);
-        // for i in &parsed {
-        //     println!("{:?}", i);
-        // }
-
-        Ok(Template { ast: parsed, metadata })
-    }
-
-    fn parse(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>) -> Result<Vec<TemplateNode>, TemplateError> {
-        use TemplateToken::*;
-
-        Self::parse_until(tokens, &[])
-    }
-
-    fn parse_until(
-        tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>,
-        stop: &[TemplateToken],
-    ) -> Result<Vec<TemplateNode>, TemplateError> {
-        use TemplateToken::*;
-        let mut parsed = vec![];
-
-        while let Some(next_token) = tokens.peek() {
-            if stop.contains(next_token) {
-                break;
-            }
-            match next_token {
-                If => {
-                    parsed.push(Self::parse_if(tokens)?);
-                    // println!("Parsed if");
-                }
-                Identifier(ident) => {
-                    parsed.push(Self::parse_var(tokens)?);
-                    // println!("Parsed identifier");
-                }
-                For => {
-                    parsed.push(Self::parse_for(tokens)?);
-                    // println!("Parsed for");
-                }
-                Identifier(ident) => {}
-                Text(text) => {
-                    parsed.push(TemplateNode::Text(text.to_string())); // TODO not copy
-                    tokens.next();
-                }
-                _ => {
-                    tokens.next();
-                }
-            }
-        }
-
-        Ok(parsed)
-    }
-
-    fn parse_if(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>) -> Result<TemplateNode, TemplateError> {
-        use TemplateToken::*;
-        assert!(tokens.next().expect("peeked earlier") == If);
-
-        // Self::show_next_n_tokens(tokens, 3);
-        let condition = match Self::parse_var(tokens)? {
-            TemplateNode::Variable(path) => path,
-            _ => return Err(TemplateParseError::new("Condition is not a variable"))?,
-        };
-
-        // Self::show_next_n_tokens(tokens, 3);
-        let then_branch = Self::parse_until(tokens, &[Else, EndIf])?;
-
-        // Self::show_next_n_tokens(tokens, 3);
-        match tokens.next() {
-            Some(Else) => {
-                // Self::show_next_n_tokens(tokens, 3);
-                let else_branch = Self::parse_until(tokens, &[EndElse])?;
-                assert!(tokens.next().ok_or(TemplateParseError::new("Expected end else"))? == EndElse);
-                Ok(TemplateNode::If {
-                    condition,
-                    then_branch,
-                    else_branch,
-                })
-            }
-            Some(EndIf) => Ok(TemplateNode::If {
-                condition,
-                then_branch,
-                else_branch: vec![],
-            }),
-            Some(_) => todo!(),
-            None => todo!(),
+        Self {
+            tokens: lexed.into_iter().peekable(),
+            prev: None,
         }
     }
 
-    fn parse_for(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>) -> Result<TemplateNode, TemplateError> {
-        use TemplateToken::*;
-        assert!(tokens.next().ok_or(TemplateParseError::new("Expected token \"for\""))? == For); // "For"
-        // Self::show_next_n_tokens(tokens, 3);
-
-        let var = match tokens.next().ok_or(TemplateParseError::new("Expected next token after \"for\""))? {
-            TemplateToken::Identifier(text) => text,
-            _ => todo!(),
-        };
-
-        if tokens.next().ok_or(TemplateParseError::new("Expected next token after \"identifier\""))? != In {
-            return Err(TemplateParseError::new("Expected token \"in\""))?;
-        }
-
-        // Self::show_next_n_tokens(tokens, 3);
-        let iter_src = match Self::parse_var(tokens)? {
-            TemplateNode::Variable(path) => path,
-            _ => return Err(TemplateParseError::new("Expected iterator to be a variable"))?,
-        };
-
-        // Self::show_next_n_tokens(tokens, 3);
-        let body: Vec<TemplateNode> = Self::parse_until(tokens, &[EndFor])?;
-        assert!(tokens.next().ok_or(TemplateParseError::new("Expected token \"for\""))? == EndFor); // "For"
-
-        Ok(TemplateNode::For {
-            iter_bind: var,
-            iter_src,
-            body,
-        })
-    }
-
-    fn parse_var(tokens: &mut Peekable<impl Iterator<Item = TemplateToken>>) -> Result<TemplateNode, TemplateError> {
-        let mut ident = vec![];
-
-        loop {
-            match tokens.next().ok_or(TemplateParseError::new("Expected identifier"))? {
-                TemplateToken::Identifier(text) => ident.push(text),
-                _ => todo!(),
-            }
-
-            match tokens.peek().ok_or(TemplateParseError::new("Expected token \".\" after identifier"))? {
-                TemplateToken::Dot => {
-                    tokens.next().ok_or(TemplateParseError::new("Expected identifier after token \".\""));
-                }
-                _ => break,
-            }
-        }
-
-        Ok(TemplateNode::Variable(ident))
-    }
-
-    fn show_next_n_tokens(tokens: &mut Peekable<impl Iterator<Item = TemplateToken> + Clone>, n: usize) {
-        let mut clone = tokens.clone();
-        print!("Next {} tokens: ", n);
-        for _ in 0..n {
-            match clone.next() {
-                Some(tok) => print!("({:?}) ", tok),
-                None => break,
-            }
-        }
-        println!();
-    }
-
-    fn lex(input: &str) -> Vec<TemplateToken> {
-        use TemplateToken::*;
+    fn lex_template<'a>(input: &'a str, file_path: &'a str) -> Vec<TemplateToken> {
+        use TemplateTokenKind::*;
 
         let mut lexed = vec![];
         let mut cursor = 0;
@@ -415,45 +432,64 @@ impl Template {
         let mut in_block = false;
         let mut start_block = 0;
 
+        let mut metadata: TemplatePositionData = TemplatePositionData {
+            file: Rc::new(file_path.to_owned()),
+            start_pos: Position { line: 0, column: 0 },
+            end_pos: Position { line: 0, column: 0 },
+        };
+
         while cursor < input_len {
             let rest = &input[cursor..];
 
+            if rest.starts_with("\n") {
+                metadata.end_pos.line += 1;
+                metadata.end_pos.column = 0;
+            }
             if rest.starts_with("{{") {
                 if !in_block {
                     let prev_text = input[start_block..cursor].to_string();
-                    lexed.push(Text(prev_text));
+
+                    lexed.push(TemplateToken {
+                        kind: Text(prev_text),
+                        metadata: metadata.clone(),
+                    });
                 }
+                metadata.start_pos.column = metadata.end_pos.column;
                 cursor += 2;
+                metadata.end_pos.column += 2;
                 start_block = cursor;
                 in_block = true;
                 // lexed.push(TemplateToken::ParenOpen);
             } else if rest.starts_with("}}") {
                 if in_block {
                     let code_text = &input[start_block..cursor];
-                    let mut lexed_code = Self::lex_code(code_text);
+                    let mut lexed_code = Self::lex_code(code_text, file_path, &mut metadata);
                     lexed.append(&mut lexed_code);
                 }
                 // lexed.push(TemplateToken::ParenClose);
                 cursor += 2;
-
+                metadata.end_pos.column += 2;
                 // TODO make less hit
                 while cursor < input.len() && input[cursor..cursor + 1].starts_with(" ") {
-                    cursor += 1
+                    cursor += 1;
+                    metadata.end_pos.column += 1;
                 }
                 if input[cursor..].starts_with("\n") {
                     cursor += 1;
+                    metadata.end_pos.column += 1;
                 }
                 start_block = cursor;
                 in_block = false;
             } else {
                 cursor += 1;
+                metadata.end_pos.column += 1;
             }
         }
         lexed
     }
 
-    fn lex_code(input: &str) -> Vec<TemplateToken> {
-        use TemplateToken::*;
+    fn lex_code<'a>(input: &'a str, file_path: &'a str, metadata: &mut TemplatePositionData) -> Vec<TemplateToken> {
+        use TemplateTokenKind::*;
 
         let mut lexed = vec![];
 
@@ -468,42 +504,45 @@ impl Template {
 
             end_ident = cursor;
             let tok = if rest.starts_with(".") {
-                cursor += 1;
-                Some(Dot)
+                Some((Dot, 1, false))
             } else if rest.starts_with("if") {
-                cursor += 2;
-                Some(If)
+                Some((If, 2, false))
             } else if rest.starts_with("else") {
-                cursor += 4;
-                Some(Else)
+                Some((Else, 4, false))
             } else if rest.starts_with("for") {
-                cursor += 3;
-                Some(For)
+                Some((For, 3, false))
             } else if rest.starts_with(" in ") {
-                cursor += 4;
-                Some(In)
+                Some((In, 4, false))
             } else if rest.starts_with("endIf") {
-                cursor += 5;
-                Some(EndIf)
+                Some((EndIf, 5, false))
             } else if rest.starts_with("endElse") {
-                cursor += 6;
-                Some(EndElse)
+                Some((EndElse, 6, false))
             } else if rest.starts_with("endFor") {
-                cursor += 6;
-                Some(EndFor)
+                Some((EndFor, 6, false))
             } else if rest.starts_with(r"\n") {
-                cursor += 2;
-                Some(NewLine)
+                Some((NewLine, 2, true))
             } else {
                 None
             };
 
-            if let Some(tok) = tok {
+            if let Some((tok, tok_size, newline)) = tok {
+                cursor += tok_size;
+                metadata.end_pos.column += tok_size;
+                if newline {
+                    metadata.start_pos.line += 1;
+                }
+
                 if start_ident != end_ident {
                     let ident = input[start_ident..end_ident].trim().to_string();
-                    lexed.push(Identifier(ident));
+                    lexed.push(TemplateToken {
+                        kind: Identifier(ident),
+                        metadata: metadata.clone(),
+                    });
                 }
-                lexed.push(tok);
+                lexed.push(TemplateToken {
+                    kind: tok,
+                    metadata: metadata.clone(),
+                });
                 start_ident = cursor;
                 end_ident = cursor;
                 push_ident = false;
@@ -514,9 +553,276 @@ impl Template {
         if start_ident + 1 != cursor {
             let ident = input[start_ident..].trim().to_string();
 
-            lexed.push(Identifier(ident));
+            lexed.push(TemplateToken {
+                kind: Identifier(ident),
+                metadata: metadata.clone(),
+            });
         }
         lexed
+    }
+
+    fn next_token(&mut self) -> Result<TemplateToken, TemplateError> {
+        match self.tokens.next() {
+            Some(next) => {
+                self.prev = Some(next.clone());
+                Ok(next)
+            }
+            None => {
+                if let Some(prev) = &self.prev {
+                    Err(TemplateParseError::new(TemplateParseErrorMsg::UnexpectedEOF, prev.metadata.clone()))?
+                } else {
+                    Err(TemplateParseError::no_info(TemplateParseErrorMsg::UnexpectedEOF))?
+                }
+            }
+        }
+    }
+
+    fn peek(&mut self) -> Option<&TemplateToken> {
+        self.tokens.peek()
+    }
+
+    fn consume(&mut self, expected_token_kind: TemplateTokenKind) -> Result<TemplateToken, TemplateError> {
+        match self.tokens.next() {
+            Some(token) => {
+                if token.kind == expected_token_kind {
+                    Ok(token)
+                } else {
+                    Err(TemplateParseError::new(
+                        TemplateParseErrorMsg::UnexpectedToken(token.kind, expected_token_kind),
+                        token.metadata,
+                    ))?
+                }
+            }
+            None => {
+                let pos = if let Some(prev) = &self.prev {
+                    prev.metadata.clone()
+                } else {
+                    TemplatePositionData::default()
+                };
+                Err(TemplateParseError::new(TemplateParseErrorMsg::ExpectButEOF(expected_token_kind), pos))?
+            }
+        }
+    }
+
+    fn parse(&mut self) -> Result<Vec<TemplateNode>, TemplateError> {
+        self.parse_until(&[])
+    }
+
+    fn parse_until(&mut self, stop: &[TemplateTokenKind]) -> Result<Vec<TemplateNode>, TemplateError> {
+        use TemplateTokenKind::*;
+        let mut parsed = vec![];
+
+        while let Some(next_token) = &self.tokens.peek() {
+            if stop.contains(&next_token.kind) {
+                break;
+            }
+            match &next_token.kind {
+                If => {
+                    parsed.push(self.parse_if()?);
+                    // println!("Parsed if");
+                }
+                Identifier(ident) => {
+                    parsed.push(self.parse_var()?);
+                    // println!("Parsed identifier");
+                }
+                For => {
+                    parsed.push(self.parse_for()?);
+                    // println!("Parsed for");
+                }
+                Identifier(ident) => {}
+                Text(text) => {
+                    parsed.push(TemplateNode {
+                        data: TemplateNodeData::Text(text.to_owned()), // TODO not copy
+                        pos: next_token.metadata.clone(),
+                    });
+                    self.next_token()?;
+                }
+                _ => {
+                    self.next_token()?;
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+
+    fn parse_if(&mut self) -> Result<TemplateNode, TemplateError> {
+        use TemplateTokenKind::*;
+
+        let start_if = self.consume(If)?;
+
+        // self.show_next_n_tokens(3);
+        let cond_node = self.parse_var()?;
+        let condition = match cond_node.data {
+            TemplateNodeData::Variable(path) => path,
+            node => {
+                return Err(TemplateParseError::new(
+                    TemplateParseErrorMsg::UnexpectedTemplateValueType(TemplateNodeKind::Variable, node.kind()),
+                    cond_node.pos,
+                ))?;
+            }
+        };
+        // println!("{:?}", condition);
+        // self.show_next_n_tokens(3);
+        let then_branch = self.parse_until(&[Else, EndIf])?;
+        // println!("{:?}", then_branch);
+        // Self::show_next_n_tokens(tokens, 3);
+        match self.next_token()?.kind {
+            Else => {
+                // Self::show_next_n_tokens(tokens, 3);
+                let else_branch = self.parse_until(&[EndElse])?;
+                self.consume(EndElse)?;
+
+                let pos = match else_branch.last() {
+                    Some(else_branch) => start_if.metadata.merge(&else_branch.pos)?,
+                    None => match then_branch.last() {
+                        Some(then_branch) => start_if.metadata.merge(&then_branch.pos)?,
+                        None => start_if.metadata.merge(&cond_node.pos)?,
+                    },
+                };
+
+                Ok(TemplateNode {
+                    data: TemplateNodeData::If {
+                        condition,
+                        then_branch,
+                        else_branch,
+                    },
+                    pos,
+                })
+            }
+            EndIf => {
+                let pos = match then_branch.last() {
+                    Some(then_branch) => start_if.metadata.merge(&then_branch.pos)?,
+                    None => start_if.metadata.merge(&cond_node.pos)?,
+                };
+
+                Ok(TemplateNode {
+                    data: TemplateNodeData::If {
+                        condition,
+                        then_branch,
+                        else_branch: vec![],
+                    },
+                    pos,
+                })
+            }
+            _ => todo!(),
+        }
+    }
+
+    fn parse_for(&mut self) -> Result<TemplateNode, TemplateError> {
+        use TemplateTokenKind::*;
+        let start_token = self.consume(For)?;
+
+        // Self::show_next_n_tokens(tokens, 3);
+        let token = self.next_token()?;
+
+        let var = match token.kind {
+            Identifier(text) => text,
+            _ => todo!(),
+        };
+
+        self.consume(In)?;
+
+        // Self::show_next_n_tokens(tokens, 3);
+        let iter_node = self.parse_var()?;
+        let iter_src = match iter_node.data {
+            TemplateNodeData::Variable(path) => path,
+            node => {
+                return Err(TemplateParseError::new(
+                    TemplateParseErrorMsg::UnexpectedTemplateValueType(TemplateNodeKind::Variable, node.kind()),
+                    iter_node.pos,
+                ))?;
+            }
+        };
+
+        // Self::show_next_n_tokens(tokens, 3);
+        let body: Vec<TemplateNode> = self.parse_until(&[EndFor])?;
+        self.consume(EndFor)?;
+
+        let pos = match body.last() {
+            Some(last) => start_token.metadata.merge(&last.pos)?,
+            None => start_token.metadata.merge(&iter_node.pos)?,
+        };
+        Ok(TemplateNode {
+            data: TemplateNodeData::For {
+                iter_bind: var,
+                iter_src,
+                body,
+            },
+            pos,
+        })
+    }
+
+    fn parse_var(&mut self) -> Result<TemplateNode, TemplateError> {
+        use TemplateTokenKind::*;
+
+        let mut ident = vec![];
+
+        let mut current_token = self.next_token()?;
+        let start_token = current_token.clone();
+
+        while let TemplateTokenKind::Identifier(text) = &current_token.kind {
+            ident.push(text.clone());
+
+            match self.peek() {
+                Some(tok) if tok.kind == Dot => {
+                    self.consume(Dot);
+                    current_token = self.next_token()?;
+                }
+                _ => break,
+            }
+        }
+
+        let current_token_metadata = current_token.metadata;
+        Ok(TemplateNode {
+            data: TemplateNodeData::Variable(ident),
+            pos: start_token.metadata.merge(&current_token_metadata)?,
+        })
+    }
+
+    fn show_next_n_tokens(&mut self, n: usize) {
+        let mut clone = self.tokens.clone();
+        print!("Next {} tokens: ", n);
+        for _ in 0..n {
+            match clone.next() {
+                Some(tok) => print!("({:?}) ", tok.kind),
+                None => break,
+            }
+        }
+        println!();
+    }
+}
+
+impl Template {
+    fn load<P: AsRef<Path> + Debug + Copy>(path: P) -> Result<Self, TemplateError> {
+        let path_string = path.as_ref().to_string_lossy().to_string();
+
+        let template_str = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(TemplateParseError::new(
+                    TemplateParseErrorMsg::GenericError(e.to_string()),
+                    TemplatePositionData {
+                        file: Rc::new(path_string),
+                        start_pos: Position { line: 0, column: 0 },
+                        end_pos: Position { line: 0, column: 0 },
+                    },
+                ))?;
+            }
+        };
+
+        let parsed = TemplateParser::lex(&template_str, &path_string).parse()?;
+
+        // for i in &parsed {
+        //     print!("{}", i.data);
+        // }
+        let required_variables = Self::get_required_vars(&parsed);
+
+        Ok(Template {
+            ast: parsed,
+            required_variables,
+            origin_file: path_string,
+        })
     }
 
     fn render(&self, context: HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
@@ -525,18 +831,22 @@ impl Template {
     }
 
     fn render_helper(nodes: &Vec<TemplateNode>, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
+        use TemplateNodeData::*;
         let mut res = String::new();
         for node in nodes {
-            match node {
-                TemplateNode::Text(text) => res.push_str(text),
-                TemplateNode::Variable(ident_fields) => {
+            match &node.data {
+                Text(text) => res.push_str(text),
+                Variable(ident_fields) => {
                     if let TemplateValue::Text(text) = Self::resolve_var(ident_fields, context)? {
                         res.push_str(text);
                     } else {
-                        return Err(TemplateRenderError::new(format!("Variable {:?} is not text", ident_fields)))?;
+                        return Err(TemplateRenderError::new(TemplateRenderErrorMsg::NodeNotOfExpectedType(
+                            ident_fields.concat(),
+                            TemplateNodeKind::Text,
+                        )))?;
                     }
                 }
-                TemplateNode::If {
+                If {
                     condition,
                     then_branch,
                     else_branch,
@@ -549,22 +859,26 @@ impl Template {
                         };
                         res.push_str(&cond_str);
                     } else {
-                        return Err(TemplateRenderError::new(format!("Variable {:?} is not a bool", condition)))?;
+                        return Err(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotOfExpectedType(
+                            condition.concat(),
+                            TemplateValueKind::Bool,
+                        )))?;
                     }
                 }
-                TemplateNode::For { iter_bind, iter_src, body } => {
+                For { iter_bind, iter_src, body } => {
                     if let TemplateValue::List(iter) = Self::resolve_var(iter_src, context)? {
                         let mut for_res = String::new();
                         for it in iter {
                             let mut local_context = context.clone(); // TODO use stack frames
-                            local_context
-                                .insert(iter_bind.to_string(), it.clone())
-                                .ok_or(TemplateRenderError::new("Failed to insert iter in local context"));
+                            local_context.insert(iter_bind.to_string(), it.clone());
                             for_res.push_str(&Self::render_helper(body, &local_context)?);
                         }
                         res.push_str(&for_res);
                     } else {
-                        return Err(TemplateRenderError::new(format!("Variable {:?} is not iterable", iter_src)))?;
+                        return Err(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotOfExpectedType(
+                            iter_src.concat(),
+                            TemplateValueKind::List,
+                        )))?;
                     }
                 }
             };
@@ -575,32 +889,39 @@ impl Template {
     }
 
     fn resolve_var<'a>(ident_fields: &[String], context: &'a HashMap<String, TemplateValue>) -> Result<&'a TemplateValue, TemplateRenderError> {
-        let mut current = context.get(&ident_fields[0]).ok_or(TemplateRenderError::new(format!(
-            "Can not find variable \"{}\" in context",
-            ident_fields[0]
-        )))?;
+        let mut current = context
+            .get(&ident_fields[0])
+            .ok_or(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotFound(
+                ident_fields[0].to_string(),
+            )))?;
         // println!("{:?}", current);
-        for key in &ident_fields[1..] {
+        // println!("{:?}", context);
+        let mut idx = 1;
+        for field in &ident_fields[1..] {
             current = if let TemplateValue::Object(map) = current {
-                if let Some(obj) = map.get(key.as_str()) {
+                if let Some(obj) = map.get(field.as_str()) {
                     obj
                 } else {
-                    return Err(TemplateRenderError::new(format!(
-                        "Can not find variable \"{}\" in context",
-                        ident_fields[0]
+                    return Err(TemplateRenderError::new(TemplateRenderErrorMsg::FieldNotFoundOnVariable(
+                        ident_fields[1..idx].concat(),
+                        field.to_string(),
                     )));
                 }
             } else {
-                return Err(TemplateRenderError::new(format!("Variable  \"{}\" is not an object", ident_fields[0])));
+                return Err(TemplateRenderError::new(TemplateRenderErrorMsg::VariableNotOfExpectedType(
+                    field.to_string(),
+                    TemplateValueKind::List,
+                )))?;
             };
+            idx += 1;
         }
         Ok(current)
     }
 
-    fn get_metadata(ast: &[TemplateNode]) -> Vec<String> {
+    fn get_required_vars(ast: &[TemplateNode]) -> Vec<String> {
         ast.iter()
             .filter_map(|node| {
-                if let TemplateNode::Variable(fields) = node {
+                if let TemplateNodeData::Variable(fields) = &node.data {
                     Some(fields.join("."))
                 } else {
                     None
@@ -675,12 +996,11 @@ fn load_templates<P: AsRef<Path> + Debug + Copy>(root_path: P) -> Result<(HashMa
     let mut templates = HashMap::new();
 
     for path in &paths {
-        let template_str = fs::read_to_string(path)?;
-        let template = Template::load(template_str)?;
+        let template = Template::load(path)?;
 
         let rel_path = path
             .strip_prefix(root_path)
-            .map_err(|e| TemplateParseError::new(e.to_string()))?
+            .map_err(|e| TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))?
             .to_string_lossy()
             .to_string();
 
