@@ -33,12 +33,138 @@ fn main() -> Result<(), TemplateError> {
         comptime();
     } else {
         println!("Running normally");
-        runtime()?;
+
+        let mut assets = Assets::load_embedded_or_new();
+        println!("Asset count: {:?}", assets.asset_trie.lock().unwrap().len());
+
+        let templates = Templates::load_templates(TEMPLATES_PATH)?;
+
+        #[cfg(debug_assertions)]
+        fs_watcher(&assets, &templates);
+
+        let app = Router::new(assets, templates)
+            .route_static("/home", "/index.html")
+            .route_static("/about", "/projects.html")
+            .route_static("/posts", "/projects.html")
+            .route_dynamic("/posts/:name", "/post.html")
+            .fallback("/index.html");
+
+        let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
+        println!("Started listening on socket http://{SOCKET_ADDR}");
+
+        app.serve(listener);
     }
     Ok(())
 }
 
+fn comptime() {
+    println!("cargo:rerun-if-changed=none");
+    println!("cargo:rustc-cfg=generated");
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let file_path = Path::new(&out_dir).join("generated.rs");
+
+    let asset_paths = walk_dir(ASSETS_PATH);
+
+    let mut assets_str = String::new();
+    assets_str.push_str("fn load_embedded_assets() -> AssetTrie {\n");
+    assets_str.push_str("\tlet mut assets = AssetTrie::new();\n");
+
+    for asset_path in asset_paths {
+        let path_key = asset_path.to_string_lossy();
+        let full_path = format!("{}/{}", std::env::current_dir().expect("current dir").to_string_lossy(), path_key);
+
+        assets_str.push_str(&format!("\tlet path = PathBuf::from(\"{}\");\n", path_key));
+        assets_str.push_str(&format!("\tlet asset_typ = AssetType::from_path(&PathBuf::from(\"{}\"));\n", full_path));
+        assets_str.push_str("\tlet content = Content::load_from_path(&path, &asset_typ);\n");
+        assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now()};\n");
+        assets_str.push_str("\tassets.insert(path,asset);\n");
+        // println!("cargo:warning=Loaded {asset_path:?}");
+    }
+    assets_str.push_str("\tassets\n");
+    assets_str.push_str("}\n");
+
+    fs::write(&file_path, assets_str).unwrap();
+    println!("cargo:warning=End of build script");
+}
+
 // === Templating ===
+
+struct Templates {
+    templates: Arc<Mutex<HashMap<String, Template>>>,
+    context: Arc<Mutex<HashMap<String, TemplateValue>>>,
+}
+
+impl Templates {
+    fn load_templates<P: AsRef<Path> + Debug + Copy>(root_path: P) -> Result<Templates, TemplateError> {
+        let paths = walk_dir(root_path);
+
+        println!("Found {} template paths in {:?}", paths.len(), root_path);
+
+        let mut templates = HashMap::new();
+
+        for path in &paths {
+            let template = Template::load(path)?;
+
+            let rel_path = path
+                .strip_prefix(root_path)
+                .map_err(|e| TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))?
+                .to_string_lossy()
+                .to_string();
+
+            templates.insert(rel_path, template);
+        }
+
+        let mut template_context = HashMap::new();
+
+        Self::insert_templates(&templates, &mut template_context)?;
+
+        Ok(Templates {
+            templates: Arc::new(Mutex::new(templates)),
+            context: Arc::new(Mutex::new(template_context)),
+        })
+    }
+
+    fn insert_templates(templates: &HashMap<String, Template>, template_context: &mut HashMap<String, TemplateValue>) -> Result<(), TemplateError> {
+        println!("Inserting {} templates into assets", templates.len());
+
+        let posts = Posts {
+            ball_container: BallContainer { is_empty: false },
+            data: vec![
+                Post {
+                    title: "title 1".to_string(),
+                    intro: "intro 1".to_string(),
+                    display: false,
+                },
+                Post {
+                    title: "title 2".to_string(),
+                    intro: "intro 2".to_string(),
+                    display: true,
+                },
+            ],
+        };
+
+        template_context.insert("posts".to_string(), posts.to_template_value());
+        template_context.insert("variable".to_string(), "arbitrary var".to_template_value());
+        template_context.insert("hotreload".to_string(), true.to_template_value());
+
+        for key in templates.keys() {
+            println!("{:?}", key);
+        }
+
+        for (path, template) in templates {
+            let html = match template.render(template_context) {
+                Ok(html) => html,
+                Err(e) => {
+                    println!("Required vars {:?}", template.required_variables);
+                    Err(e)?
+                }
+            };
+            // println!("{i:#?}");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 enum TemplateValue {
@@ -899,357 +1025,185 @@ impl Template {
 }
 //  === end templating ===
 //
-fn comptime() {
-    println!("cargo:rerun-if-changed=none");
-    println!("cargo:rustc-cfg=generated");
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let file_path = Path::new(&out_dir).join("generated.rs");
+// === Routing ===
 
-    let asset_paths = walk_dir(ASSETS_PATH);
-
-    let mut assets_str = String::new();
-    assets_str.push_str("fn load_embedded_assets() -> PathTrie {\n");
-    assets_str.push_str("\tlet mut assets = PathTrie::new();\n");
-
-    for asset_path in asset_paths {
-        let path_key = asset_path.to_string_lossy();
-        let full_path = format!("{}/{}", std::env::current_dir().expect("current dir").to_string_lossy(), path_key);
-
-        assets_str.push_str(&format!("\tlet path = PathBuf::from(\"{}\");\n", path_key));
-        assets_str.push_str(&format!("\tlet asset_typ = AssetType::from_path(&PathBuf::from(\"{}\"));\n", full_path));
-        assets_str.push_str("\tlet content = Content::load_from_path(&path, &asset_typ);\n");
-        assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now()};\n");
-        assets_str.push_str("\tassets.insert(path,asset);\n");
-        // println!("cargo:warning=Loaded {asset_path:?}");
-    }
-    assets_str.push_str("\tassets\n");
-    assets_str.push_str("}\n");
-
-    fs::write(&file_path, assets_str).unwrap();
-    println!("cargo:warning=End of build script");
+struct Router {
+    assets: Assets,
+    templates: Templates,
+    routes: HashMap<PathBuf, String>,
 }
 
-fn runtime() -> Result<(), TemplateError> {
-    #[cfg(generated)]
-    let mut assets = load_embedded_assets();
-    #[cfg(not(generated))]
-    let mut assets = PathTrie::new();
-    println!("Asset count: {:?}", assets.len());
-
-    let templates = load_templates(TEMPLATES_PATH)?;
-    let mut template_context = HashMap::new();
-
-    insert_templates(&mut assets, &templates, &mut template_context)?;
-    // println!("Assets content");
-    // for path in &assets.paths {
-    //     println!("{:?}", path);
-    // }
-
-    let assets = Arc::new(Mutex::new(assets));
-    let template_context = Arc::new(Mutex::new(template_context));
-
-    let reload_assets = Arc::new(AtomicBool::new(false));
-    #[cfg(debug_assertions)]
-    {
-        fs_watcher(assets.clone(), template_context.clone(), reload_assets.clone());
-    }
-
-    let listener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind socket");
-    println!("Started listening on socket http://{SOCKET_ADDR}");
-
-    main_loop(listener, assets, reload_assets, templates);
-    Ok(())
-}
-
-fn load_templates<P: AsRef<Path> + Debug + Copy>(root_path: P) -> Result<(HashMap<String, Template>), TemplateError> {
-    let paths = walk_dir(root_path);
-
-    println!("Found {} template paths in {:?}", paths.len(), root_path);
-
-    let mut templates = HashMap::new();
-
-    for path in &paths {
-        let template = Template::load(path)?;
-
-        let rel_path = path
-            .strip_prefix(root_path)
-            .map_err(|e| TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))?
-            .to_string_lossy()
-            .to_string();
-
-        templates.insert(rel_path, template);
-    }
-
-    Ok(templates)
-}
-
-fn insert_templates(
-    assets: &mut PathTrie,
-    templates: &HashMap<String, Template>,
-    template_context: &mut HashMap<String, TemplateValue>,
-) -> Result<(), TemplateError> {
-    println!("Inserting {} templates into assets", templates.len());
-
-    let posts = Posts {
-        ball_container: BallContainer { is_empty: false },
-        data: vec![
-            Post {
-                title: "title 1".to_string(),
-                intro: "intro 1".to_string(),
-                display: false,
-            },
-            Post {
-                title: "title 2".to_string(),
-                intro: "intro 2".to_string(),
-                display: true,
-            },
-        ],
-    };
-
-    template_context.insert("posts".to_string(), posts.to_template_value());
-    template_context.insert("variable".to_string(), "arbitrary var".to_template_value());
-    template_context.insert("hotreload".to_string(), true.to_template_value());
-
-    for key in templates.keys() {
-        println!("{:?}", key);
-    }
-
-    for (path, template) in templates {
-        let html = match template.render(template_context) {
-            Ok(html) => html,
-            Err(e) => {
-                println!("Required vars {:?}", template.required_variables);
-                Err(e)?
-            }
-        };
-        assets.insert(
-            format!("$templates/{}", path).into(),
-            Asset {
-                last_modified: SystemTime::now(),
-                content: Content::Text(html),
-                asset_typ: AssetType::Html,
-            },
-        );
-        // println!("{i:#?}");
-    }
-    Ok(())
-}
-
-fn main_loop(listener: TcpListener, assets: Arc<Mutex<PathTrie>>, reload_assets: Arc<AtomicBool>, templates: HashMap<String, Template>) {
-    let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
-    let mut active_streams: Vec<TcpStream> = vec![];
-    let mut check_alive_timer = Instant::now();
-
-    let mut it = 0;
-
-    'main: loop {
-        print!("Loop it {it}\r");
-        it += 1;
-
-        if active_streams.is_empty() {
-            listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
-        } else {
-            listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
+impl Router {
+    fn new(assets: Assets, templates: Templates) -> Self {
+        Router {
+            assets,
+            templates,
+            routes: HashMap::new(),
         }
+    }
 
-        if let Ok((mut stream, peer_addr)) = listener.accept() {
-            println!("[{peer_addr}] Connected");
-            stream.set_nonblocking(true).expect("Failed to change blocking of stream");
+    fn route_static(mut self, path: &str, page: &str) -> Self {
+        self.routes.insert(path.into(), page.to_string());
+        self
+    }
 
-            let n = loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => {
-                        println!("[{peer_addr}] Disconnected");
-                        continue 'main;
-                    }
-                    Ok(n) => break n,
-                    _ => continue,
-                };
-            };
+    fn route_dynamic(mut self, path: &str, page: &str) -> Self {
+        let path = PathBuf::from(path);
 
-            let (header, body) = parse_request(&buffer[..n]).expect("Unable to parse request");
+        for asset in self.assets.asset_trie.lock().expect("Fs watcher died").get_partial(&path) {}
 
-            println!(
-                "[{peer_addr}] Received {:?} request for {:?} of length {}",
-                header.typ,
-                header.path,
-                body.len()
-            );
+        self.routes.insert(path, page.to_string());
+        self
+    }
 
-            let mut is_ws = false;
+    fn fallback(self, page: &str) -> Self {
+        self
+    }
 
-            match header.path.as_str() {
-                #[cfg(debug_assertions)]
-                "/ws" => {
-                    print!("[{peer_addr:?}] Upgrading websocket ... ");
-                    let response = upgrade_websocket(header);
-                    stream.write_all(&response).expect("Failed to write to stream");
-                    stream.flush().expect("Failed to flush stream");
-                    is_ws = true;
-                }
-                path => {
-                    let asset = match header.typ {
-                        HttpRequestType::GET => {
-                            let key = PathBuf::from(format!("./assets{}", path));
-                            // println!("{key:?}");
-                            let guard = assets.lock().expect("Cant get lock");
-                            guard.get(&key)
+    fn serve(&self, listener: TcpListener) {
+        let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
+        let mut active_streams: Vec<TcpStream> = vec![];
+        let mut check_alive_timer = Instant::now();
+
+        let mut it = 0;
+
+        'main: loop {
+            print!("Loop it {it}\r");
+            it += 1;
+
+            if active_streams.is_empty() {
+                listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
+            } else {
+                listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
+            }
+
+            if let Ok((mut stream, peer_addr)) = listener.accept() {
+                println!("[{peer_addr}] Connected");
+                stream.set_nonblocking(true).expect("Failed to change blocking of stream");
+
+                let n = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => {
+                            println!("[{peer_addr}] Disconnected");
+                            continue 'main;
                         }
+                        Ok(n) => break n,
+                        _ => continue,
                     };
-                    // println!("{:?}", asset);
-                    let response = if let Some(asset) = asset {
-                        // let response_content = if asset.asset_typ == AssetType::Md
-                        //     && let Content::Text(content) = asset.content
-                        // {
-                        //     let main_template = {
-                        //         #[cfg(debug_assertions)]
-                        //         let template_path = PathBuf::from("./assets/templates/main-hotreload.html");
-                        //         #[cfg(not(debug_assertions))]
-                        //         let template_path = PathBuf::from("./assets/templates/main.html");
+                };
 
-                        //         let guard = assets.lock().expect("unable to unlock");
-                        //         let asset = guard.get(&template_path).expect("Failed to find main template");
+                let (header, body) = HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
 
-                        //         match (&asset.asset_typ, asset.content.clone()) {
-                        //             (AssetType::Html, Content::Text(html)) => SimpleTemplate { html },
-                        //             _ => panic!("Main template must be html"),
-                        //         }
-                        //     };
-                        //     Content::Text(main_template.populate(vec![("body".to_string(), content)]))
-                        // } else {
-                        //     asset.content
-                        // };
-                        // println!("{:?}", response_content);
+                println!(
+                    "[{peer_addr}] Received {:?} request for {:?} of length {}",
+                    header.typ,
+                    header.path,
+                    body.len()
+                );
 
-                        build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
-                    } else {
-                        let body = Content::Text(format!("resource at {} not found", path));
-                        build_response(HttpResponseCode::NotFound, AssetType::Text, body)
-                    };
+                let mut is_ws = false;
 
-                    let _ = stream.write(&response).expect("Failed to write to stream");
-                    stream.flush().expect("Failed to flush stream");
-                    #[cfg(not(debug_assertions))]
-                    {
-                        stream.set_linger(Some(Duration::from_secs(0))).expect("Unable to change linger time");
-                        stream.shutdown(std::net::Shutdown::Both).expect("Unable to close connection");
+                match header.path.as_str() {
+                    #[cfg(debug_assertions)]
+                    "/ws" => {
+                        print!("[{peer_addr:?}] Upgrading websocket ... ");
+                        let response = HttpServer::upgrade_websocket(header);
+                        stream.write_all(&response).expect("Failed to write to stream");
+                        stream.flush().expect("Failed to flush stream");
+                        is_ws = true;
+                    }
+                    path => {
+                        let asset = match header.typ {
+                            HttpRequestType::GET => {
+                                let key = PathBuf::from(format!("./assets{}", path));
+                                // println!("{key:?}");
+                                let guard = self.assets.asset_trie.lock().expect("Cant get lock");
+                                guard.get(&key)
+                            }
+                        };
+                        // println!("{:?}", asset);
+                        let response = if let Some(asset) = asset {
+                            // let response_content = if asset.asset_typ == AssetType::Md
+                            //     && let Content::Text(content) = asset.content
+                            // {
+                            //     let main_template = {
+                            //         #[cfg(debug_assertions)]
+                            //         let template_path = PathBuf::from("./assets/templates/main-hotreload.html");
+                            //         #[cfg(not(debug_assertions))]
+                            //         let template_path = PathBuf::from("./assets/templates/main.html");
+
+                            //         let guard = assets.lock().expect("unable to unlock");
+                            //         let asset = guard.get(&template_path).expect("Failed to find main template");
+
+                            //         match (&asset.asset_typ, asset.content.clone()) {
+                            //             (AssetType::Html, Content::Text(html)) => SimpleTemplate { html },
+                            //             _ => panic!("Main template must be html"),
+                            //         }
+                            //     };
+                            //     Content::Text(main_template.populate(vec![("body".to_string(), content)]))
+                            // } else {
+                            //     asset.content
+                            // };
+                            // println!("{:?}", response_content);
+
+                            HttpServer::build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
+                        } else {
+                            let body = Content::Text(format!("resource at {} not found", path));
+                            HttpServer::build_response(HttpResponseCode::NotFound, AssetType::Text, body)
+                        };
+
+                        let _ = stream.write(&response).expect("Failed to write to stream");
+                        stream.flush().expect("Failed to flush stream");
+                        #[cfg(not(debug_assertions))]
+                        {
+                            stream.set_linger(Some(Duration::from_secs(0))).expect("Unable to change linger time");
+                            stream.shutdown(std::net::Shutdown::Both).expect("Unable to close connection");
+                        }
+                    }
+                };
+
+                #[cfg(debug_assertions)]
+                {
+                    if is_ws {
+                        // thread::sleep(Duration::from_secs(2));
+                        active_streams.push(stream);
+                        println!("Active connections {}", active_streams.len());
                     }
                 }
-            };
-
+            }
             #[cfg(debug_assertions)]
             {
-                if is_ws {
-                    // thread::sleep(Duration::from_secs(2));
-                    active_streams.push(stream);
-                    println!("Active connections {}", active_streams.len());
-                }
-            }
-        }
-        #[cfg(debug_assertions)]
-        {
-            let should_reload = reload_assets.load(Ordering::Relaxed);
+                let should_reload = self.assets.reload.load(Ordering::Relaxed);
 
-            if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
-                check_alive_timer = Instant::now();
-                active_streams.retain(|mut stream| {
-                    let connection_is_alive = match stream.read(&mut [0]) {
-                        Ok(0) => false,
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                        _ => false,
-                    };
+                if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
+                    check_alive_timer = Instant::now();
+                    active_streams.retain(|mut stream| {
+                        let connection_is_alive = match stream.read(&mut [0]) {
+                            Ok(0) => false,
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                            _ => false,
+                        };
 
-                    if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
-                        if should_reload {
-                            let _ = send_ws_message(stream, "reload");
-                            println!("[{peer_addr:?}] Reloaded");
+                        if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
+                            if should_reload {
+                                let _ = HttpServer::send_ws_message(stream, "reload");
+                                println!("[{peer_addr:?}] Reloaded");
+                            }
+                            // println!("[{peer_addr:?}] Connection still alive");
+                            true
+                        } else {
+                            println!("Closing connection");
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+
+                            false
                         }
-                        // println!("[{peer_addr:?}] Connection still alive");
-                        true
-                    } else {
-                        println!("Closing connection");
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-
-                        false
+                    });
+                    if should_reload {
+                        self.assets.reload.store(false, Ordering::Relaxed);
                     }
-                });
-                if should_reload {
-                    reload_assets.store(false, Ordering::Relaxed);
                 }
             }
-        }
-    }
-}
-
-fn upgrade_websocket(header: HttpRequestHeader) -> Vec<u8> {
-    if let Some(_) = header.upgrade
-        && let Some(sec_websocket_key) = header.sec_websocket_key
-        && let Some(_) = header.sec_websocket_version
-    {
-        let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        let websocket_accept = base64(&sha1(format!("{}{magic_string}", sec_websocket_key.trim())));
-        println!("Succeeded");
-        format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n")
-            .as_bytes()
-            .to_vec()
-    } else {
-        println!("Failed");
-        build_response(
-            HttpResponseCode::BadRequest,
-            AssetType::Text,
-            Content::Text("Invalid websocket upgrade request".to_owned()),
-        )
-    }
-}
-
-fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), io::Error> {
-    let mut frame = Vec::new();
-    frame.push(0x81); // first bit for FIN frame and 8th bit for message type text 
-    frame.push(msg.len() as u8); // should technically u7, but not needed for my use case
-    frame.extend_from_slice(msg.as_bytes());
-    stream.write_all(&frame)?;
-    stream.flush()
-}
-
-fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Error> {
-    if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-        let header = parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string()).expect("Unable to parse header");
-
-        let content = match header.content_typ {
-            AssetType::Png => Content::Binary(buffer[pos + 4..].to_vec()),
-            _ => Content::Text(String::from_utf8_lossy(&buffer[pos + 4..]).to_string()),
-        };
-
-        Ok((header, content))
-    } else {
-        Err(io::Error::new(io::ErrorKind::InvalidData, "could not find header/body separator"))
-    }
-}
-
-fn build_response(code: HttpResponseCode, content_typ: AssetType, content: Content) -> Vec<u8> {
-    let status = match code {
-        HttpResponseCode::Ok => "200 Ok",
-        HttpResponseCode::NotFound => "404 Not Found",
-        HttpResponseCode::BadRequest => "400 Bad Request",
-    };
-
-    match content {
-        Content::Text(txt) => format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {}\r\n\r\n{txt}",
-            txt.len()
-        )
-        .as_bytes()
-        .to_vec(),
-        Content::Binary(bytes) => {
-            let mut res = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {}\r\n\r\n",
-                bytes.len()
-            )
-            .as_bytes()
-            .to_vec();
-            res.extend_from_slice(&bytes);
-            res
         }
     }
 }
@@ -1278,66 +1232,144 @@ enum HttpRequestType {
     GET,
 }
 
-fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
-    let mut lines = header_str.lines();
+struct HttpServer {}
 
-    let first_line = lines.next().expect("Unable to get next line");
-    let mut first_line_words = first_line.split_ascii_whitespace();
-
-    let request_type = match first_line_words.next() {
-        Some("GET") => HttpRequestType::GET,
-        invalid => {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid request type {invalid:?}")));
+impl HttpServer {
+    fn upgrade_websocket(header: HttpRequestHeader) -> Vec<u8> {
+        if let Some(_) = header.upgrade
+            && let Some(sec_websocket_key) = header.sec_websocket_key
+            && let Some(_) = header.sec_websocket_version
+        {
+            let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+            let websocket_accept = base64(&sha1(format!("{}{magic_string}", sec_websocket_key.trim())));
+            println!("Succeeded");
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
+            )
+            .as_bytes()
+            .to_vec()
+        } else {
+            println!("Failed");
+            Self::build_response(
+                HttpResponseCode::BadRequest,
+                AssetType::Text,
+                Content::Text("Invalid websocket upgrade request".to_owned()),
+            )
         }
-    };
+    }
 
-    let path = if let Some(path) = first_line_words.next() {
-        path
-    } else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request path"));
-    };
+    fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), io::Error> {
+        let mut frame = Vec::new();
+        frame.push(0x81); // first bit for FIN frame and 8th bit for message type text 
+        frame.push(msg.len() as u8); // should technically u7, but not needed for my use case
+        frame.extend_from_slice(msg.as_bytes());
+        stream.write_all(&frame)?;
+        stream.flush()
+    }
 
-    let mut origin = None;
-    let mut sec_websocket_key = None;
-    let mut sec_websocket_version = None;
-    let mut user_agent = None;
-    let mut upgrade = None;
-    let mut content_typ = AssetType::Unknown;
+    fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Error> {
+        if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header = Self::parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string()).expect("Unable to parse header");
 
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            let value = value.to_string();
-            match key.to_ascii_lowercase().as_str() {
-                "origin" => origin = Some(value),
-                "sec-websocket-key" => sec_websocket_key = Some(value),
-                "sec-websocket-version" => sec_websocket_version = Some(value),
-                "user-agent" => user_agent = Some(value),
-                "upgrade" => upgrade = Some(value),
-                "content-type" => {
-                    content_typ = match value.as_str() {
-                        "text/plain" => AssetType::Text,
-                        "text/html" => AssetType::Html,
-                        "text/css" => AssetType::Css,
-                        "text/javascript" => AssetType::Js,
-                        "image/png" => AssetType::Png,
-                        _ => AssetType::Unknown,
-                    }
-                }
-                _ => {}
+            let content = match header.content_typ {
+                AssetType::Png => Content::Binary(buffer[pos + 4..].to_vec()),
+                _ => Content::Text(String::from_utf8_lossy(&buffer[pos + 4..]).to_string()),
+            };
+
+            Ok((header, content))
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "could not find header/body separator"))
+        }
+    }
+
+    fn build_response(code: HttpResponseCode, content_typ: AssetType, content: Content) -> Vec<u8> {
+        let status = match code {
+            HttpResponseCode::Ok => "200 Ok",
+            HttpResponseCode::NotFound => "404 Not Found",
+            HttpResponseCode::BadRequest => "400 Bad Request",
+        };
+
+        match content {
+            Content::Text(txt) => format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {}\r\n\r\n{txt}",
+                txt.len()
+            )
+            .as_bytes()
+            .to_vec(),
+            Content::Binary(bytes) => {
+                let mut res = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {}\r\n\r\n",
+                    bytes.len()
+                )
+                .as_bytes()
+                .to_vec();
+                res.extend_from_slice(&bytes);
+                res
             }
         }
     }
 
-    Ok(HttpRequestHeader {
-        typ: request_type,
-        path: path.to_owned(),
-        _origin: origin,
-        _user_agent: user_agent,
-        sec_websocket_key,
-        sec_websocket_version,
-        upgrade,
-        content_typ,
-    })
+    fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
+        let mut lines = header_str.lines();
+
+        let first_line = lines.next().expect("Unable to get next line");
+        let mut first_line_words = first_line.split_ascii_whitespace();
+
+        let request_type = match first_line_words.next() {
+            Some("GET") => HttpRequestType::GET,
+            invalid => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid request type {invalid:?}")));
+            }
+        };
+
+        let path = if let Some(path) = first_line_words.next() {
+            path
+        } else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request path"));
+        };
+
+        let mut origin = None;
+        let mut sec_websocket_key = None;
+        let mut sec_websocket_version = None;
+        let mut user_agent = None;
+        let mut upgrade = None;
+        let mut content_typ = AssetType::Unknown;
+
+        for line in lines {
+            if let Some((key, value)) = line.split_once(':') {
+                let value = value.to_string();
+                match key.to_ascii_lowercase().as_str() {
+                    "origin" => origin = Some(value),
+                    "sec-websocket-key" => sec_websocket_key = Some(value),
+                    "sec-websocket-version" => sec_websocket_version = Some(value),
+                    "user-agent" => user_agent = Some(value),
+                    "upgrade" => upgrade = Some(value),
+                    "content-type" => {
+                        content_typ = match value.as_str() {
+                            "text/plain" => AssetType::Text,
+                            "text/html" => AssetType::Html,
+                            "text/css" => AssetType::Css,
+                            "text/javascript" => AssetType::Js,
+                            "image/png" => AssetType::Png,
+                            _ => AssetType::Unknown,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(HttpRequestHeader {
+            typ: request_type,
+            path: path.to_owned(),
+            _origin: origin,
+            _user_agent: user_agent,
+            sec_websocket_key,
+            sec_websocket_version,
+            upgrade,
+            content_typ,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1455,7 +1487,10 @@ fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
     asset_paths
 }
 
-fn fs_watcher(asset_map: Arc<Mutex<PathTrie>>, template_context: Arc<Mutex<HashMap<String, TemplateValue>>>, changed: Arc<AtomicBool>) {
+fn fs_watcher(assets: &Assets, templates: &Templates) {
+    let template_context = templates.context.clone();
+    let asset_trie = assets.asset_trie.clone();
+    let reload = assets.reload.clone();
     let _ = thread::spawn(move || {
         println!("Started file watcher thread");
         loop {
@@ -1463,7 +1498,7 @@ fn fs_watcher(asset_map: Arc<Mutex<PathTrie>>, template_context: Arc<Mutex<HashM
             asset_paths.append(&mut walk_dir(TEMPLATES_PATH));
             let asset_set: HashSet<PathBuf> = asset_paths.iter().cloned().collect();
 
-            let mut map = asset_map.lock().expect("Unable to acquire lock");
+            let mut map = asset_trie.lock().expect("Unable to acquire lock");
             for path in &asset_paths {
                 let metadata = match path.metadata() {
                     Ok(m) => m,
@@ -1491,7 +1526,7 @@ fn fs_watcher(asset_map: Arc<Mutex<PathTrie>>, template_context: Arc<Mutex<HashM
                             };
 
                             existing_asset.last_modified = last_modified;
-                            changed.store(true, Ordering::Release);
+                            reload.store(true, Ordering::Release);
 
                             println!(
                                 "Updated file {:?}, edited {} minutes ago",
@@ -1522,7 +1557,7 @@ fn fs_watcher(asset_map: Arc<Mutex<PathTrie>>, template_context: Arc<Mutex<HashM
                                 asset_typ: content_typ,
                             },
                         );
-                        changed.store(true, Ordering::Release);
+                        reload.store(true, Ordering::Release);
                         println!(
                             "Added file {:?}, edited {:?} minutes ago",
                             path,
@@ -1532,7 +1567,7 @@ fn fs_watcher(asset_map: Arc<Mutex<PathTrie>>, template_context: Arc<Mutex<HashM
                 }
             }
             if map.remove_other_than_except_generated(asset_paths) {
-                changed.store(true, Ordering::Release);
+                reload.store(true, Ordering::Release);
             }
 
             sleep(Duration::from_millis(100));
@@ -1546,15 +1581,33 @@ struct TrieNode {
     children: HashMap<String, TrieNode>,
 }
 
+struct Assets {
+    asset_trie: Arc<Mutex<AssetTrie>>,
+    reload: Arc<AtomicBool>,
+}
+
+impl Assets {
+    fn load_embedded_or_new() -> Self {
+        #[cfg(generated)]
+        let assets = load_embedded_assets();
+        #[cfg(not(generated))]
+        let assets = AssetTrie::new();
+        Self {
+            asset_trie: Arc::new(Mutex::new(assets)),
+            reload: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 #[derive(Default, Debug, Clone)]
-struct PathTrie {
+struct AssetTrie {
     root: TrieNode,
     paths: HashSet<PathBuf>,
 }
 
-impl PathTrie {
+impl AssetTrie {
     fn new() -> Self {
-        PathTrie {
+        AssetTrie {
             root: TrieNode::default(),
             paths: HashSet::new(),
         }
@@ -1597,6 +1650,30 @@ impl PathTrie {
         }
 
         current_node.asset.clone()
+    }
+
+    fn get_partial(&self, path: &Path) -> Vec<&Asset> {
+        let mut current_node = &self.root;
+
+        for component in path.components() {
+            let key = component.as_os_str().to_string_lossy();
+
+            match current_node.children.get(key.as_ref()) {
+                Some(node) => current_node = node,
+                None => break,
+            }
+        }
+
+        let mut result = Vec::new();
+        let mut stack = vec![current_node];
+
+        while let Some(node) = stack.pop() {
+            if let Some(asset) = &node.asset {
+                result.push(asset);
+            }
+            stack.extend(node.children.values());
+        }
+        result
     }
 
     fn contains(&self, path: &Path) -> bool {
