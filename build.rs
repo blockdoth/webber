@@ -1,1 +1,1 @@
-src/main.rs
+main.rs

@@ -5,7 +5,7 @@ edition = "2024"
 
 [[bin]]
 name = "webber"
-path = "src/main.rs"
+path = "main.rs"
 
 [profile.release]
 opt-level = "z"

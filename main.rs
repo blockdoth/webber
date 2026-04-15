@@ -1286,7 +1286,9 @@ fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
 
     let request_type = match first_line_words.next() {
         Some("GET") => HttpRequestType::GET,
-        invalid => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid request type {invalid:?}"))),
+        invalid => {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid request type {invalid:?}")));
+        }
     };
 
     let path = if let Some(path) = first_line_words.next() {
