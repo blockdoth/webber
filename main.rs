@@ -35,7 +35,7 @@ fn main() -> Result<(), TemplateError> {
         println!("Running normally");
 
         let mut assets = Assets::load_embedded_or_new();
-        println!("Asset count: {:?}", assets.asset_trie.lock().unwrap().len());
+        println!("Asset count: {:?}", assets.static_.lock().unwrap().len());
 
         let templates = Templates::load_templates(TEMPLATES_PATH)?;
 
@@ -77,7 +77,7 @@ fn comptime() {
         assets_str.push_str(&format!("\tlet path = PathBuf::from(\"{}\");\n", path_key));
         assets_str.push_str(&format!("\tlet asset_typ = AssetType::from_path(&PathBuf::from(\"{}\"));\n", full_path));
         assets_str.push_str("\tlet content = Content::load_from_path(&path, &asset_typ);\n");
-        assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now()};\n");
+        assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now(), internal: false};\n");
         assets_str.push_str("\tassets.insert(path,asset);\n");
         // println!("cargo:warning=Loaded {asset_path:?}");
     }
@@ -1032,6 +1032,7 @@ struct Router {
     assets: Assets,
     templates: Templates,
     routes: HashMap<PathBuf, String>,
+    fallback: Option<String>,
 }
 
 impl Router {
@@ -1040,24 +1041,26 @@ impl Router {
             assets,
             templates,
             routes: HashMap::new(),
+            fallback: None,
         }
     }
 
-    fn route_static(mut self, path: &str, page: &str) -> Self {
-        self.routes.insert(path.into(), page.to_string());
+    fn route_static(mut self, path: &str, template: &str) -> Self {
+        self.routes.insert(path.into(), template.to_string());
         self
     }
 
-    fn route_dynamic(mut self, path: &str, page: &str) -> Self {
+    fn route_dynamic(mut self, path: &str, base_template: &str) -> Self {
         let path = PathBuf::from(path);
 
-        for asset in self.assets.asset_trie.lock().expect("Fs watcher died").get_partial(&path) {}
+        for asset in self.assets.generated.lock().expect("Fs watcher died").get_partial(&path) {}
 
-        self.routes.insert(path, page.to_string());
+        self.routes.insert(path, base_template.to_string());
         self
     }
 
-    fn fallback(self, page: &str) -> Self {
+    fn fallback(mut self, page: &str) -> Self {
+        self.fallback = Some(page.to_string());
         self
     }
 
@@ -1118,7 +1121,7 @@ impl Router {
                             HttpRequestType::GET => {
                                 let key = PathBuf::from(format!("./assets{}", path));
                                 // println!("{key:?}");
-                                let guard = self.assets.asset_trie.lock().expect("Cant get lock");
+                                let guard = self.assets.static_.lock().expect("Cant get lock");
                                 guard.get(&key)
                             }
                         };
@@ -1419,6 +1422,7 @@ impl fmt::Display for AssetType {
 struct Asset {
     last_modified: SystemTime,
     content: Content,
+    internal: bool,
     asset_typ: AssetType,
 }
 
@@ -1489,7 +1493,7 @@ fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
 
 fn fs_watcher(assets: &Assets, templates: &Templates) {
     let template_context = templates.context.clone();
-    let asset_trie = assets.asset_trie.clone();
+    let asset_trie = assets.static_.clone();
     let reload = assets.reload.clone();
     let _ = thread::spawn(move || {
         println!("Started file watcher thread");
@@ -1510,7 +1514,7 @@ fn fs_watcher(assets: &Assets, templates: &Templates) {
                     Err(_) => continue,
                 };
 
-                match map.get_mut(path) {
+                match map.get_ref_mut(path) {
                     Some(existing_asset) => {
                         if last_modified > existing_asset.last_modified {
                             existing_asset.content = if path.starts_with(TEMPLATES_PATH) && existing_asset.asset_typ == AssetType::Html {
@@ -1555,6 +1559,7 @@ fn fs_watcher(assets: &Assets, templates: &Templates) {
                                 last_modified,
                                 content,
                                 asset_typ: content_typ,
+                                internal: false,
                             },
                         );
                         reload.store(true, Ordering::Release);
@@ -1582,20 +1587,48 @@ struct TrieNode {
 }
 
 struct Assets {
-    asset_trie: Arc<Mutex<AssetTrie>>,
+    static_: Arc<Mutex<AssetTrie>>,
+    generated: Arc<Mutex<AssetTrie>>,
     reload: Arc<AtomicBool>,
 }
 
 impl Assets {
     fn load_embedded_or_new() -> Self {
         #[cfg(generated)]
-        let assets = load_embedded_assets();
+        let mut assets = load_embedded_assets();
         #[cfg(not(generated))]
-        let assets = AssetTrie::new();
+        let mut assets = AssetTrie::new();
+
+        let generated = Self::compile_generated_assets(&mut assets);
         Self {
-            asset_trie: Arc::new(Mutex::new(assets)),
+            static_: Arc::new(Mutex::new(assets)),
+            generated: Arc::new(Mutex::new(generated)),
             reload: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn compile_generated_assets(assets: &mut AssetTrie) -> AssetTrie {
+        let mut generated_assets = AssetTrie::new();
+
+        for (path, asset) in assets.collect_kv_mut() {
+            match asset.asset_typ {
+                AssetType::Md => {
+                    if let Content::Text(content) = &asset.content {
+                        let html = MarkdownParser::html(MarkdownParser::parse(content));
+                        asset.internal = true;
+                        generated_assets.insert(path, Asset { 
+                          last_modified: SystemTime::now(), 
+                          content: Content::Text(html), 
+                          internal: false, 
+                          asset_typ: AssetType::Html 
+                        });
+                      }
+                    }
+                _ => continue,
+            }
+        }
+        println!("Compiled {} generated assets", generated_assets.len());
+        generated_assets
     }
 }
 
@@ -1624,7 +1657,7 @@ impl AssetTrie {
         self.paths.insert(path);
     }
 
-    fn get_mut(&mut self, path: &Path) -> Option<&mut Asset> {
+    fn get_ref_mut(&mut self, path: &Path) -> Option<&mut Asset> {
         let mut current_node = &mut self.root;
 
         for component in path.components() {
@@ -1674,6 +1707,26 @@ impl AssetTrie {
             stack.extend(node.children.values());
         }
         result
+    }
+    // TODO less dirty
+    fn collect_kv_mut(&mut self) -> Vec<(PathBuf, &mut Asset)> {
+        let mut result = Vec::new();
+
+        Self::dfs(&mut self.root, &mut PathBuf::new(), &mut result);
+
+        result
+    }
+
+    fn dfs<'a>(node: &'a mut TrieNode, path: &mut PathBuf, result: &mut Vec<(PathBuf, &'a mut Asset)>) {
+        if let Some(asset) = node.asset.as_mut() {
+            result.push((path.clone(), asset));
+        }
+
+        for (key, child) in node.children.iter_mut() {
+            path.push(key);
+            Self::dfs(child, path, result);
+            path.pop();
+        }
     }
 
     fn contains(&self, path: &Path) -> bool {
