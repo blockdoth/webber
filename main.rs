@@ -5,13 +5,12 @@
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::f32::consts::E;
 use std::fmt::{Debug, Display};
 use std::fs::Metadata;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, StripPrefixError};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,19 +33,25 @@ fn main() -> Result<(), TemplateError> {
     } else {
         println!("Running normally");
 
-        let mut assets = Assets::load_embedded_or_new();
-        println!("Asset count: {:?}", assets.static_.lock().unwrap().len());
+        let templates = Templates::load_embedded()?;
 
-        let templates = Templates::load_templates(TEMPLATES_PATH)?;
+        let mut assets = Assets::load_embedded()?;
+        assets.insert_templates(&templates)?;
+
+        println!(
+            "Static/Generated asset count: {:?}/{:?}",
+            assets.static_.lock().unwrap().len(),
+            assets.generated.lock().unwrap().len()
+        );
 
         #[cfg(debug_assertions)]
         fs_watcher(&assets, &templates);
 
         let app = Router::new(assets, templates)
-            .route_static("/home", "/index.html")
-            .route_static("/about", "/projects.html")
-            .route_static("/posts", "/projects.html")
-            .route_dynamic("/posts/:name", "/post.html")
+            .route_static_page("/home", "/index.html")
+            .route_static_page("/about", "/projects.html")
+            .route_static_page("/posts", "/projects.html")
+            .route_dynamic_pages("/posts/:name", "/post.html", "posts")?
             .fallback("/index.html");
 
         let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
@@ -57,34 +62,94 @@ fn main() -> Result<(), TemplateError> {
     Ok(())
 }
 
+fn insert_context(template_context: &Arc<Mutex<HashMap<String, TemplateValue>>>) {
+    let mut template_context = template_context.lock().expect("failed to lock");
+    let posts = Posts {
+        ball_container: BallContainer { is_empty: false },
+        posts: vec![
+            Post {
+                title: "title 1".to_string(),
+                intro: "intro 1".to_string(),
+                display: false,
+            },
+            Post {
+                title: "title 2".to_string(),
+                intro: "intro 2".to_string(),
+                display: true,
+            },
+        ],
+    };
+
+    template_context.insert("posts".to_string(), posts.to_template_value());
+    template_context.insert("variable".to_string(), "arbitrary var".to_template_value());
+    template_context.insert("hotreload".to_string(), true.to_template_value());
+}
+
 fn comptime() {
     println!("cargo:rerun-if-changed=none");
     println!("cargo:rustc-cfg=generated");
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let file_path = Path::new(&out_dir).join("generated.rs");
+    let cwd = std::env::current_dir().expect("current dir");
+    let cwd = cwd.to_string_lossy();
 
     let asset_paths = walk_dir(ASSETS_PATH);
 
-    let mut assets_str = String::new();
-    assets_str.push_str("fn load_embedded_assets() -> AssetTrie {\n");
-    assets_str.push_str("\tlet mut assets = AssetTrie::new();\n");
+    let mut out = String::new();
 
+    //  === Assets ===
+
+    out.push_str("fn load_embedded_assets() -> Result<AssetTrie, io::Error>{\n");
+    out.push_str("\tlet mut assets = AssetTrie::new();\n");
+
+    out.push_str("\tlet paths = vec![\n");
     for asset_path in asset_paths {
         let path_key = asset_path.to_string_lossy();
-        let full_path = format!("{}/{}", std::env::current_dir().expect("current dir").to_string_lossy(), path_key);
+        let full_path = format!("{}/{}", cwd, path_key);
 
-        assets_str.push_str(&format!("\tlet path = PathBuf::from(\"{}\");\n", path_key));
-        assets_str.push_str(&format!("\tlet asset_typ = AssetType::from_path(&PathBuf::from(\"{}\"));\n", full_path));
-        assets_str.push_str("\tlet content = Content::load_from_path(&path, &asset_typ);\n");
-        assets_str.push_str("\tlet asset = Asset { content, asset_typ, last_modified: SystemTime::now(), internal: false};\n");
-        assets_str.push_str("\tassets.insert(path,asset);\n");
-        // println!("cargo:warning=Loaded {asset_path:?}");
+        out.push_str(&format!("\t\t(PathBuf::from({asset_path:?}),PathBuf::from(\"{full_path}\")),\n"));
     }
-    assets_str.push_str("\tassets\n");
-    assets_str.push_str("}\n");
+    out.push_str("\t];\n");
 
-    fs::write(&file_path, assets_str).unwrap();
+    out.push_str("\tfor (key, path) in paths {\n");
+    out.push_str("\t\tlet asset = Asset::new(Content::read_content(&path)?);\n");
+    out.push_str("\t\tassets.insert(key,asset);\n");
+    out.push_str("\t}\n");
+
+    out.push_str("\tOk(assets)\n");
+    out.push_str("}\n");
+
+    out.push('\n');
+    // === Templates ===
+
+    let template_paths = walk_dir(TEMPLATES_PATH);
+
+    out.push_str("fn load_embedded_templates() -> Result<Templates, TemplateError> {\n");
+    out.push_str("\tlet mut templates = HashMap::new();\n");
+
+    out.push_str("\tlet paths = vec![\n");
+    for template_path in template_paths {
+        let path_key = template_path.to_string_lossy();
+        let full_path = format!("{cwd}/{path_key}");
+        let stripped_key = path_key.strip_prefix(TEMPLATES_PATH).expect("Failed to find prefix");
+        out.push_str(&format!("\t\t({stripped_key:?}.to_string(),PathBuf::from(\"{full_path}\")),\n"));
+    }
+    out.push_str("\t];\n");
+
+    out.push_str("\tfor (key, path) in paths {\n");
+    out.push_str("\t\tlet template = Template::load(&path)?;\n");
+
+    out.push_str("\t\ttemplates.insert(key,template);\n");
+    out.push_str("\t}\n");
+
+    out.push_str("\tOk(Templates {\n");
+    out.push_str("\t\ttemplates: Arc::new(Mutex::new(templates)),\n");
+    out.push_str("\t\tcontext: Arc::new(Mutex::new(HashMap::new())),\n");
+    out.push_str("\t})\n");
+    out.push_str("}\n");
+
+    fs::write(&file_path, out).unwrap();
     println!("cargo:warning=End of build script");
 }
 
@@ -96,73 +161,22 @@ struct Templates {
 }
 
 impl Templates {
-    fn load_templates<P: AsRef<Path> + Debug + Copy>(root_path: P) -> Result<Templates, TemplateError> {
-        let paths = walk_dir(root_path);
+    fn load_embedded() -> Result<Templates, TemplateError> {
+        #[cfg(generated)]
+        let templates = load_embedded_templates()?;
+        #[cfg(not(generated))]
+        // Stub to make the compiler happy
+        let mut templates = Templates::new();
 
-        println!("Found {} template paths in {:?}", paths.len(), root_path);
-
-        let mut templates = HashMap::new();
-
-        for path in &paths {
-            let template = Template::load(path)?;
-
-            let rel_path = path
-                .strip_prefix(root_path)
-                .map_err(|e| TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))?
-                .to_string_lossy()
-                .to_string();
-
-            templates.insert(rel_path, template);
-        }
-
-        let mut template_context = HashMap::new();
-
-        Self::insert_templates(&templates, &mut template_context)?;
-
-        Ok(Templates {
-            templates: Arc::new(Mutex::new(templates)),
-            context: Arc::new(Mutex::new(template_context)),
-        })
+        insert_context(&templates.context);
+        Ok(templates)
     }
 
-    fn insert_templates(templates: &HashMap<String, Template>, template_context: &mut HashMap<String, TemplateValue>) -> Result<(), TemplateError> {
-        println!("Inserting {} templates into assets", templates.len());
-
-        let posts = Posts {
-            ball_container: BallContainer { is_empty: false },
-            data: vec![
-                Post {
-                    title: "title 1".to_string(),
-                    intro: "intro 1".to_string(),
-                    display: false,
-                },
-                Post {
-                    title: "title 2".to_string(),
-                    intro: "intro 2".to_string(),
-                    display: true,
-                },
-            ],
-        };
-
-        template_context.insert("posts".to_string(), posts.to_template_value());
-        template_context.insert("variable".to_string(), "arbitrary var".to_template_value());
-        template_context.insert("hotreload".to_string(), true.to_template_value());
-
-        for key in templates.keys() {
-            println!("{:?}", key);
+    fn new() -> Self {
+        Self {
+            templates: Arc::new(Mutex::new(HashMap::new())),
+            context: Arc::new(Mutex::new(HashMap::new())),
         }
-
-        for (path, template) in templates {
-            let html = match template.render(template_context) {
-                Ok(html) => html,
-                Err(e) => {
-                    println!("Required vars {:?}", template.required_variables);
-                    Err(e)?
-                }
-            };
-            // println!("{i:#?}");
-        }
-        Ok(())
     }
 }
 
@@ -235,7 +249,7 @@ macro_rules! impl_to_template_value {
 
 struct Posts {
     ball_container: BallContainer,
-    data: Vec<Post>,
+    posts: Vec<Post>,
 }
 struct BallContainer {
     is_empty: bool,
@@ -248,7 +262,7 @@ struct Post {
 }
 
 impl_to_template_value!(BallContainer, { is_empty });
-impl_to_template_value!(Posts, { ball_container, data});
+impl_to_template_value!(Posts, { ball_container, posts});
 impl_to_template_value!(Post, { title, intro, display});
 
 #[derive(Debug)]
@@ -450,6 +464,18 @@ impl fmt::Display for TemplateError {
 
 impl From<std::io::Error> for TemplateError {
     fn from(e: std::io::Error) -> Self {
+        TemplateError::Parse(TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for TemplateError {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        TemplateError::Parse(TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))
+    }
+}
+
+impl From<StripPrefixError> for TemplateError {
+    fn from(e: StripPrefixError) -> Self {
         TemplateError::Parse(TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))
     }
 }
@@ -1045,18 +1071,41 @@ impl Router {
         }
     }
 
-    fn route_static(mut self, path: &str, template: &str) -> Self {
+    fn route_static_page(mut self, path: &str, template: &str) -> Self {
         self.routes.insert(path.into(), template.to_string());
         self
     }
 
-    fn route_dynamic(mut self, path: &str, base_template: &str) -> Self {
+    fn route_dynamic_pages(mut self, path: &str, base_template: &str, template_context_var: &str) -> Result<Self, TemplateError> {
         let path = PathBuf::from(path);
 
-        for asset in self.assets.generated.lock().expect("Fs watcher died").get_partial(&path) {}
+        // let template_value = self
+        //     .templates
+        //     .context
+        //     .lock()
+        //     .expect("failed to acquire template context")
+        //     .get(template_context_var)
+        //     .expect(&format!("Failed to find var {} in context", template_context_var));
 
-        self.routes.insert(path, base_template.to_string());
-        self
+        // let base_template = self.templates.templates.lock().expect("fs watcher died").get(base_template).expect("not found");
+
+        // match template_value {
+        //     // TemplateValue::Object(kv) =>{
+        //     //   for
+        //     // }
+        //     TemplateValue::List(values) => {
+        //       for value in values {
+        //         let new_path = path;
+
+        //         // let page = base_template.render()?;
+
+        //         // self.routes.insert(new_path,page);
+        //       }
+        //     },
+        //     _ => todo!(),
+        // }
+
+        Ok(self)
     }
 
     fn fallback(mut self, page: &str) -> Self {
@@ -1150,10 +1199,10 @@ impl Router {
                             // };
                             // println!("{:?}", response_content);
 
-                            HttpServer::build_response(HttpResponseCode::Ok, asset.asset_typ, asset.content)
+                            HttpServer::build_response(HttpResponseCode::Ok, asset.content)
                         } else {
                             let body = Content::Text(format!("resource at {} not found", path));
-                            HttpServer::build_response(HttpResponseCode::NotFound, AssetType::Text, body)
+                            HttpServer::build_response(HttpResponseCode::NotFound, body)
                         };
 
                         let _ = stream.write(&response).expect("Failed to write to stream");
@@ -1226,7 +1275,7 @@ struct HttpRequestHeader {
     sec_websocket_key: Option<String>,
     sec_websocket_version: Option<String>,
     upgrade: Option<String>,
-    content_typ: AssetType,
+    content_typ: ContentTyp,
 }
 
 #[derive(Debug)]
@@ -1255,7 +1304,6 @@ impl HttpServer {
             println!("Failed");
             Self::build_response(
                 HttpResponseCode::BadRequest,
-                AssetType::Text,
                 Content::Text("Invalid websocket upgrade request".to_owned()),
             )
         }
@@ -1273,11 +1321,7 @@ impl HttpServer {
     fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, Content), io::Error> {
         if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
             let header = Self::parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string()).expect("Unable to parse header");
-
-            let content = match header.content_typ {
-                AssetType::Png => Content::Binary(buffer[pos + 4..].to_vec()),
-                _ => Content::Text(String::from_utf8_lossy(&buffer[pos + 4..]).to_string()),
-            };
+            let content = Content::from_asset_type(&buffer[pos + 4..], &header.content_typ);
 
             Ok((header, content))
         } else {
@@ -1285,31 +1329,25 @@ impl HttpServer {
         }
     }
 
-    fn build_response(code: HttpResponseCode, content_typ: AssetType, content: Content) -> Vec<u8> {
+    fn build_response(code: HttpResponseCode, content: Content) -> Vec<u8> {
         let status = match code {
             HttpResponseCode::Ok => "200 Ok",
             HttpResponseCode::NotFound => "404 Not Found",
             HttpResponseCode::BadRequest => "400 Bad Request",
         };
 
-        match content {
-            Content::Text(txt) => format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {}\r\n\r\n{txt}",
-                txt.len()
-            )
-            .as_bytes()
-            .to_vec(),
-            Content::Binary(bytes) => {
-                let mut res = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {content_typ}\r\nContent-Length: {}\r\n\r\n",
-                    bytes.len()
-                )
-                .as_bytes()
-                .to_vec();
-                res.extend_from_slice(&bytes);
-                res
-            }
-        }
+        let body = content.as_bytes();
+
+        let mut res = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+            content.typ(),
+            body.len()
+        )
+        .as_bytes()
+        .to_vec();
+
+        res.extend_from_slice(body);
+        res
     }
 
     fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
@@ -1336,7 +1374,7 @@ impl HttpServer {
         let mut sec_websocket_version = None;
         let mut user_agent = None;
         let mut upgrade = None;
-        let mut content_typ = AssetType::Unknown;
+        let mut content_typ = ContentTyp::Unknown;
 
         for line in lines {
             if let Some((key, value)) = line.split_once(':') {
@@ -1349,12 +1387,12 @@ impl HttpServer {
                     "upgrade" => upgrade = Some(value),
                     "content-type" => {
                         content_typ = match value.as_str() {
-                            "text/plain" => AssetType::Text,
-                            "text/html" => AssetType::Html,
-                            "text/css" => AssetType::Css,
-                            "text/javascript" => AssetType::Js,
-                            "image/png" => AssetType::Png,
-                            _ => AssetType::Unknown,
+                            "text/plain" => ContentTyp::Text,
+                            "text/html" => ContentTyp::Html,
+                            "text/css" => ContentTyp::Css,
+                            "text/javascript" => ContentTyp::Js,
+                            "image/png" => ContentTyp::Png,
+                            _ => ContentTyp::Unknown,
                         }
                     }
                     _ => {}
@@ -1376,7 +1414,7 @@ impl HttpServer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum AssetType {
+enum ContentTyp {
     Text = 1,
     Html = 2,
     Css = 3,
@@ -1386,35 +1424,21 @@ enum AssetType {
     Unknown = 7,
 }
 
-impl AssetType {
+impl ContentTyp {
     fn is_text(&self) -> bool {
-        use AssetType::*;
+        use ContentTyp::*;
         matches!(self, Text | Html | Css | Js | Md)
     }
-    fn from_path(path: &Path) -> AssetType {
+    fn from_path(path: &Path) -> ContentTyp {
         match path.extension().and_then(|s| s.to_str()) {
-            Some("html") => AssetType::Html,
-            Some("txt") => AssetType::Text,
-            Some("css") => AssetType::Css,
-            Some("js") => AssetType::Js,
-            Some("png") => AssetType::Png,
-            Some("md") => AssetType::Md,
-            _ => AssetType::Unknown,
+            Some("html") => ContentTyp::Html,
+            Some("txt") => ContentTyp::Text,
+            Some("css") => ContentTyp::Css,
+            Some("js") => ContentTyp::Js,
+            Some("png") => ContentTyp::Png,
+            Some("md") => ContentTyp::Md,
+            _ => ContentTyp::Unknown,
         }
-    }
-}
-
-impl fmt::Display for AssetType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            AssetType::Text => "text/plain",
-            AssetType::Html => "text/html",
-            AssetType::Css => "text/css",
-            AssetType::Js => "text/javascript",
-            AssetType::Png => "image/png",
-            AssetType::Md => "text/html",
-            AssetType::Unknown => "text/plain",
-        })
     }
 }
 
@@ -1423,37 +1447,91 @@ struct Asset {
     last_modified: SystemTime,
     content: Content,
     internal: bool,
-    asset_typ: AssetType,
+}
+
+impl Asset {
+    fn new(content: Content) -> Self {
+        Self {
+            last_modified: SystemTime::now(),
+            content,
+            internal: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 enum Content {
-    Binary(Vec<u8>),
     Text(String),
+    Html(String),
+    Css(String),
+    Js(String),
+    Png(Vec<u8>),
+    Md(String),
+    Unknown(String),
 }
 
 impl Content {
     fn len(&self) -> usize {
         match self {
-            Content::Binary(bytes) => bytes.len(),
-            Content::Text(text) => text.len(),
+            Content::Text(s) | Content::Html(s) | Content::Css(s) | Content::Js(s) | Content::Md(s) | Content::Unknown(s) => s.len(),
+            Content::Png(bytes) => bytes.len(),
         }
     }
-    fn load_from_path(path: &Path, content_typ: &AssetType) -> Content {
-        match content_typ {
-            AssetType::Png | AssetType::Unknown => Content::Binary(fs::read(path).expect("Unable to read file into binary")),
-            AssetType::Md => {
-                let markdown = fs::read_to_string(path).expect("Unable read file into string");
+    fn read_content(path: &Path) -> Result<Content, io::Error> {
+        let content = match path.extension().and_then(|s| s.to_str()) {
+            Some("png") => Content::Png(fs::read(path)?),
+            Some("md") => {
+                let markdown = fs::read_to_string(path)?;
                 let html = MarkdownParser::html(MarkdownParser::parse(&markdown));
-                Content::Text(html)
+                Content::Html(html)
             }
-            _ => Content::Text(fs::read_to_string(path).expect("Unable read file into string")),
+            Some("html") => Content::Html(fs::read_to_string(path)?),
+            Some("txt") => Content::Text(fs::read_to_string(path)?),
+            Some("css") => Content::Css(fs::read_to_string(path)?),
+            Some("js") => Content::Js(fs::read_to_string(path)?),
+            _ => Content::Unknown(fs::read_to_string(path)?),
+        };
+        Ok(content)
+    }
+
+    fn read_and_render_content(path: &Path, template_context: &Arc<Mutex<HashMap<String, TemplateValue>>>) -> Result<Content, TemplateError> {
+        if path.starts_with(TEMPLATES_PATH) && path.extension().and_then(|s| s.to_str()) == Some("html") {
+            let template_context = template_context.lock()?;
+            Ok(Content::Html(Template::load(path)?.render(&template_context)?))
+        } else {
+            Ok(Self::read_content(path)?)
         }
     }
 
-    fn load_template(path: &Path, template_context: &Arc<Mutex<HashMap<String, TemplateValue>>>) -> Result<String, TemplateError> {
-        let hashmap = template_context.lock().expect("Failed to acquite lock for template context");
-        Template::load(path)?.render(&hashmap)
+    fn typ(&self) -> &str {
+        match self {
+            Content::Text(_) => "text/plain",
+            Content::Html(_) => "text/html",
+            Content::Css(_) => "text/css",
+            Content::Js(_) => "text/javascript",
+            Content::Png(_) => "image/png",
+            Content::Md(_) => "text/plain",
+            Content::Unknown(_) => "text/plain",
+        }
+    }
+
+    fn from_asset_type(buffer: &[u8], content_typ: &ContentTyp) -> Content {
+        match content_typ {
+            ContentTyp::Png => Content::Png(buffer.to_vec()),
+            ContentTyp::Html => Content::Html(String::from_utf8_lossy(buffer).to_string()),
+            ContentTyp::Css => Content::Css(String::from_utf8_lossy(buffer).to_string()),
+            ContentTyp::Js => Content::Js(String::from_utf8_lossy(buffer).to_string()),
+            ContentTyp::Md => Content::Md(String::from_utf8_lossy(buffer).to_string()),
+            ContentTyp::Text => Content::Text(String::from_utf8_lossy(buffer).to_string()),
+            ContentTyp::Unknown => Content::Unknown(String::from_utf8_lossy(buffer).to_string()),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Content::Png(b) => b,
+            Content::Text(s) | Content::Html(s) | Content::Css(s) | Content::Js(s) | Content::Md(s) | Content::Unknown(s) => s.as_bytes(),
+        }
     }
 }
 
@@ -1493,91 +1571,72 @@ fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
 
 fn fs_watcher(assets: &Assets, templates: &Templates) {
     let template_context = templates.context.clone();
-    let asset_trie = assets.static_.clone();
+    let static_assets = assets.static_.clone();
+    let generated_assets = assets.generated.clone();
     let reload = assets.reload.clone();
     let _ = thread::spawn(move || {
         println!("Started file watcher thread");
         loop {
-            let mut asset_paths = walk_dir(ASSETS_PATH);
-            asset_paths.append(&mut walk_dir(TEMPLATES_PATH));
-            let asset_set: HashSet<PathBuf> = asset_paths.iter().cloned().collect();
-
-            let mut map = asset_trie.lock().expect("Unable to acquire lock");
-            for path in &asset_paths {
-                let metadata = match path.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                let last_modified = match metadata.modified() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-
-                match map.get_ref_mut(path) {
-                    Some(existing_asset) => {
-                        if last_modified > existing_asset.last_modified {
-                            existing_asset.content = if path.starts_with(TEMPLATES_PATH) && existing_asset.asset_typ == AssetType::Html {
-                                Content::Text(match Content::load_template(path, &template_context) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        eprintln!("Template error: {}", e);
-                                        continue;
-                                    }
-                                })
-                            } else {
-                                Content::load_from_path(path, &existing_asset.asset_typ)
-                            };
-
-                            existing_asset.last_modified = last_modified;
-                            reload.store(true, Ordering::Release);
-
-                            println!(
-                                "Updated file {:?}, edited {} minutes ago",
-                                path,
-                                last_modified.elapsed().unwrap().as_secs() / 60
-                            );
-                        }
-                    }
-                    None => {
-                        let content_typ = AssetType::from_path(path);
-                        let content = if path.starts_with(TEMPLATES_PATH) && content_typ == AssetType::Html {
-                            Content::Text(match Content::load_template(path, &template_context) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!("Template error: {}", e);
-                                    continue;
-                                }
-                            })
-                        } else {
-                            Content::load_from_path(path, &content_typ)
-                        };
-
-                        map.insert(
-                            path.clone(),
-                            Asset {
-                                last_modified,
-                                content,
-                                asset_typ: content_typ,
-                                internal: false,
-                            },
-                        );
-                        reload.store(true, Ordering::Release);
-                        println!(
-                            "Added file {:?}, edited {:?} minutes ago",
-                            path,
-                            last_modified.elapsed().expect("Unable to get time elapsed").as_secs() / 60
-                        );
-                    }
-                }
-            }
-            if map.remove_other_than_except_generated(asset_paths) {
-                reload.store(true, Ordering::Release);
+            if let Err(err) = update_assets(ASSETS_PATH, &static_assets, &reload, &template_context) {
+                println!("Error while updating assets: {err}")
             }
 
+            if let Err(err) = update_assets(TEMPLATES_PATH, &generated_assets, &reload, &template_context) {
+                println!("Error while updating templates: {err}")
+            }
             sleep(Duration::from_millis(100));
         }
     });
+}
+
+fn update_assets(
+    path: &str,
+    assets: &Arc<Mutex<AssetTrie>>,
+    reload: &Arc<AtomicBool>,
+    template_context: &Arc<Mutex<HashMap<String, TemplateValue>>>,
+) -> Result<(), TemplateError> {
+    let mut map = assets.lock()?;
+    let paths = walk_dir(path);
+
+    for path in &paths {
+        let last_modified = path.metadata()?.modified()?;
+
+        match map.get_ref_mut(path) {
+            Some(existing_asset) if last_modified > existing_asset.last_modified => {
+                existing_asset.content = Content::read_and_render_content(path, template_context)?;
+                existing_asset.last_modified = last_modified;
+                reload.store(true, Ordering::Release);
+
+                println!(
+                    "Updated file {:?}, edited {} minutes ago",
+                    path,
+                    last_modified.elapsed().unwrap().as_secs() / 60
+                );
+            }
+            Some(_) => {} // File not changed
+            None => {
+                let content = Content::read_and_render_content(path, template_context)?;
+                map.insert(
+                    path.clone(),
+                    Asset {
+                        last_modified,
+                        content,
+                        internal: false,
+                    },
+                );
+                reload.store(true, Ordering::Release);
+                println!(
+                    "Added file {:?}, edited {:?} minutes ago",
+                    path,
+                    last_modified.elapsed().expect("Unable to get time elapsed").as_secs() / 60
+                );
+            }
+        }
+    }
+    if map.remove_other_than_except_generated(paths) {
+        reload.store(true, Ordering::Release);
+    }
+    Ok(())
 }
 
 #[derive(Default, Debug, Clone)]
@@ -1593,42 +1652,66 @@ struct Assets {
 }
 
 impl Assets {
-    fn load_embedded_or_new() -> Self {
+    fn load_embedded() -> Result<Self, io::Error> {
         #[cfg(generated)]
-        let mut assets = load_embedded_assets();
+        let mut assets = load_embedded_assets()?;
         #[cfg(not(generated))]
+        // Stub to make the compiler happy
         let mut assets = AssetTrie::new();
 
         let generated = Self::compile_generated_assets(&mut assets);
-        Self {
+
+        println!("Loaded ");
+        Ok(Self {
             static_: Arc::new(Mutex::new(assets)),
             generated: Arc::new(Mutex::new(generated)),
             reload: Arc::new(AtomicBool::new(false)),
-        }
+        })
     }
 
     fn compile_generated_assets(assets: &mut AssetTrie) -> AssetTrie {
         let mut generated_assets = AssetTrie::new();
 
         for (path, asset) in assets.collect_kv_mut() {
-            match asset.asset_typ {
-                AssetType::Md => {
-                    if let Content::Text(content) = &asset.content {
-                        let html = MarkdownParser::html(MarkdownParser::parse(content));
-                        asset.internal = true;
-                        generated_assets.insert(path, Asset { 
-                          last_modified: SystemTime::now(), 
-                          content: Content::Text(html), 
-                          internal: false, 
-                          asset_typ: AssetType::Html 
-                        });
-                      }
-                    }
+            match &asset.content {
+                Content::Md(content) => {
+                    let html = MarkdownParser::html(MarkdownParser::parse(content));
+                    asset.internal = true;
+                    generated_assets.insert(
+                        path,
+                        Asset {
+                            last_modified: SystemTime::now(),
+                            content: Content::Html(html),
+                            internal: false,
+                        },
+                    );
+                }
                 _ => continue,
             }
         }
-        println!("Compiled {} generated assets", generated_assets.len());
+        // println!("Compiled {} generated assets", generated_assets.len());
         generated_assets
+    }
+
+    fn insert_templates(&mut self, templates: &Templates) -> Result<(), TemplateError> {
+        let context = templates.context.lock().expect("failed to acquire lockl");
+        let templates = templates.templates.lock().expect("failed to acquire lockl");
+        let mut generated_assets = self.generated.lock().expect("failed to acquite lock");
+        for (path, template) in templates.iter() {
+            match template.render(&context) {
+                Ok(html) => {
+                    let paths = format!("./templates/{path}");
+                    let asset = Asset::new(Content::Html(html));
+                    println!(" - Compiled {}", paths);
+                    generated_assets.insert(paths.into(), asset);
+                }
+                Err(e) => {
+                    println!("Required vars {:?}", template.required_variables);
+                    Err(e)?
+                }
+            };
+        }
+        Ok(())
     }
 }
 
