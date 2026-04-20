@@ -47,7 +47,7 @@ fn main() -> Result<(), TemplateError> {
         #[cfg(debug_assertions)]
         fs_watcher(&assets, &templates);
 
-        let app = Router::new(assets, templates)
+        let router = Router::new(assets, templates)
             .route_static_page("/home", "/index.html")
             .route_static_page("/about", "/projects.html")
             .route_static_page("/posts", "/projects.html")
@@ -57,7 +57,8 @@ fn main() -> Result<(), TemplateError> {
         let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
         println!("Started listening on socket http://{SOCKET_ADDR}");
 
-        app.serve(listener);
+        HttpServer::serve(listener, router);
+
     }
     Ok(())
 }
@@ -1133,157 +1134,39 @@ impl Router {
         self
     }
 
-    fn serve(&self, listener: TcpListener) {
-        let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
-        let mut active_streams: Vec<TcpStream> = vec![];
-        let mut check_alive_timer = Instant::now();
+    fn serve_asset(&self, header: HttpRequestHeader, body:Content) -> Result<&str,HttpError> {
+      let res = "";
 
-        let mut it = 0;
-
-        'main: loop {
-            print!("Loop it {it}\r");
-            it += 1;
-
-            if active_streams.is_empty() {
-                listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
-            } else {
-                listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
-            }
-
-            if let Ok((mut stream, peer_addr)) = listener.accept() {
-                println!("[{peer_addr}] Connected");
-                stream.set_nonblocking(true).expect("Failed to change blocking of stream");
-
-                let n = loop {
-                    match stream.read(&mut buffer) {
-                        Ok(0) => {
-                            println!("[{peer_addr}] Disconnected");
-                            continue 'main;
-                        }
-                        Ok(n) => break n,
-                        _ => continue,
-                    };
-                };
-
-                let (header, body) = HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
-
-                println!(
-                    "[{peer_addr}] Received {:?} request for {:?} of length {}",
-                    header.typ,
-                    header.path,
-                    body.len()
-                );
-
-                let mut is_ws = false;
-
-                match header.path.as_str() {
-                    #[cfg(debug_assertions)]
-                    "/ws" => {
-                        print!("[{peer_addr:?}] Upgrading websocket ... ");
-                        let response = HttpServer::upgrade_websocket(header);
-                        stream.write_all(&response).expect("Failed to write to stream");
-                        stream.flush().expect("Failed to flush stream");
-                        is_ws = true;
-                    }
-                    path => {
-                        let asset = match header.typ {
-                            HttpRequestType::GET => {
-                                let key = PathBuf::from(format!("./assets{}", path));
-                                // println!("{key:?}");
-                                let guard = self.assets.static_.lock().expect("Cant get lock");
-                                guard.get(&key)
-                            }
-                        };
-                        // println!("{:?}", asset);
-                        let response = if let Some(asset) = asset {
-                            // let response_content = if asset.asset_typ == AssetType::Md
-                            //     && let Content::Text(content) = asset.content
-                            // {
-                            //     let main_template = {
-                            //         #[cfg(debug_assertions)]
-                            //         let template_path = PathBuf::from("./assets/templates/main-hotreload.html");
-                            //         #[cfg(not(debug_assertions))]
-                            //         let template_path = PathBuf::from("./assets/templates/main.html");
-
-                            //         let guard = assets.lock().expect("unable to unlock");
-                            //         let asset = guard.get(&template_path).expect("Failed to find main template");
-
-                            //         match (&asset.asset_typ, asset.content.clone()) {
-                            //             (AssetType::Html, Content::Text(html)) => SimpleTemplate { html },
-                            //             _ => panic!("Main template must be html"),
-                            //         }
-                            //     };
-                            //     Content::Text(main_template.populate(vec![("body".to_string(), content)]))
-                            // } else {
-                            //     asset.content
-                            // };
-                            // println!("{:?}", response_content);
-
-                            HttpServer::build_response(HttpResponseCode::Ok, asset.content)
-                        } else {
-                            let body = Content::Text(format!("resource at {} not found", path));
-                            HttpServer::build_response(HttpResponseCode::NotFound, body)
-                        };
-
-                        let _ = stream.write(&response).expect("Failed to write to stream");
-                        stream.flush().expect("Failed to flush stream");
-                        #[cfg(not(debug_assertions))]
-                        {
-                            stream.set_linger(Some(Duration::from_secs(0))).expect("Unable to change linger time");
-                            stream.shutdown(std::net::Shutdown::Both).expect("Unable to close connection");
-                        }
-                    }
-                };
-
-                #[cfg(debug_assertions)]
-                {
-                    if is_ws {
-                        // thread::sleep(Duration::from_secs(2));
-                        active_streams.push(stream);
-                        println!("Active connections {}", active_streams.len());
-                    }
-                }
-            }
-            #[cfg(debug_assertions)]
-            {
-                let should_reload = self.assets.reload.load(Ordering::Relaxed);
-
-                if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
-                    check_alive_timer = Instant::now();
-                    active_streams.retain(|mut stream| {
-                        let connection_is_alive = match stream.read(&mut [0]) {
-                            Ok(0) => false,
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                            _ => false,
-                        };
-
-                        if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
-                            if should_reload {
-                                let _ = HttpServer::send_ws_message(stream, "reload");
-                                println!("[{peer_addr:?}] Reloaded");
-                            }
-                            // println!("[{peer_addr:?}] Connection still alive");
-                            true
-                        } else {
-                            println!("Closing connection");
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-
-                            false
-                        }
-                    });
-                    if should_reload {
-                        self.assets.reload.store(false, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
+      // let key = 
+      
+      Ok(res)
+    }
+    
+    fn serve_page(&self, header: HttpRequestHeader, body:Content)-> Result<&str,HttpError> {
+      let res = "";
+      
+      
+      Ok(res)
+    }
+    
+    fn serve_api(&self, header: HttpRequestHeader, body:Content)-> Result<&str, HttpError> {
+      let res = "";
+      
+      Ok(res)
     }
 }
 
+#[derive(Debug)]
 enum HttpResponseCode {
     Ok = 200,
     NotFound = 404,
     BadRequest = 400,
+  }
+
+#[derive(Debug)]
+struct HttpError {
+  code:HttpResponseCode,
+  message: String
 }
 
 #[derive(Debug)]
@@ -1303,6 +1186,7 @@ struct HttpRequestHeader {
 enum HttpRequestType {
     GET,
 }
+
 
 struct HttpServer {}
 
@@ -1431,6 +1315,121 @@ impl HttpServer {
             content_typ,
         })
     }
+
+    
+    fn serve(listener:TcpListener, router:Router) {
+      let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
+      let mut active_streams: Vec<TcpStream> = vec![];
+      let mut check_alive_timer = Instant::now();
+
+      let mut it = 0;
+
+      'main: loop {
+          print!("Loop it {it}\r");
+          it += 1;
+
+          if active_streams.is_empty() {
+              listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
+          } else {
+              listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
+          }
+
+          if let Ok((mut stream, peer_addr)) = listener.accept() {
+              println!("[{peer_addr}] Connected");
+              stream.set_nonblocking(true).expect("Failed to change blocking of stream");
+
+              let n = loop {
+                  match stream.read(&mut buffer) {
+                      Ok(0) => {
+                          println!("[{peer_addr}] Disconnected");
+                          continue 'main;
+                      }
+                      Ok(n) => break n,
+                      _ => continue,
+                  };
+              };
+
+              let (header, body) = HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
+
+              println!(
+                  "[{peer_addr}] Received {:?} request for {:?} of length {}",
+                  header.typ,
+                  header.path,
+                  body.len()
+              );
+
+              let mut is_ws = false;
+
+              match header.path.as_str() {
+                  #[cfg(debug_assertions)]
+                  "/ws" => {
+                      print!("[{peer_addr:?}] Upgrading websocket ... ");
+                      let response = HttpServer::upgrade_websocket(header);
+                      stream.write_all(&response).expect("Failed to write to stream");
+                      stream.flush().expect("Failed to flush stream");
+                      is_ws = true;
+                  }
+                  path => {
+                      let res = if path.starts_with("/assets") {
+                        router.serve_asset(header, body)
+                      } else if path.starts_with("/api") {
+                        router.serve_api(header, body)
+                      } else {
+                        router.serve_page(header, body)
+                      };
+                      match res {
+                        Ok(res) => stream.write(res.as_bytes()),
+                        Err(err) => stream.write(err),
+                      }  
+                    
+                      
+                  }
+              };
+
+              #[cfg(debug_assertions)]
+              {
+                  if is_ws {
+                      // thread::sleep(Duration::from_secs(2));
+                      active_streams.push(stream);
+                      println!("Active connections {}", active_streams.len());
+                  }
+              }
+          }
+          #[cfg(debug_assertions)]
+          {
+              let should_reload = router.assets.reload.load(Ordering::Relaxed);
+
+              if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
+                  check_alive_timer = Instant::now();
+                  active_streams.retain(|mut stream| {
+                      let connection_is_alive = match stream.read(&mut [0]) {
+                          Ok(0) => false,
+                          Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                          _ => false,
+                      };
+
+                      if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
+                          if should_reload {
+                              let _ = HttpServer::send_ws_message(stream, "reload");
+                              println!("[{peer_addr:?}] Reloaded");
+                          }
+                          // println!("[{peer_addr:?}] Connection still alive");
+                          true
+                      } else {
+                          println!("Closing connection");
+                          let _ = stream.shutdown(std::net::Shutdown::Both);
+
+                          false
+                      }
+                  });
+                  if should_reload {
+                    router.assets.reload.store(false, Ordering::Relaxed);
+                  }
+              }
+          }
+      }
+    }
+
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
