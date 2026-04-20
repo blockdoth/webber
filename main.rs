@@ -5,7 +5,7 @@
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug, Display, format};
 use std::fs::Metadata;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
@@ -105,16 +105,24 @@ fn comptime() {
 
     out.push_str("\tlet paths = vec![\n");
     for asset_path in asset_paths {
-        let path_key = asset_path.to_string_lossy();
-        let full_path = format!("{}/{}", cwd, path_key);
+        let global_path = format!("{cwd}/{}", asset_path.to_string_lossy());
 
-        out.push_str(&format!("\t\t(PathBuf::from({asset_path:?}),PathBuf::from(\"{full_path}\")),\n"));
+        let content_str = match asset_path.extension().and_then(|s| s.to_str()) {
+            Some("png") => &format!("Content::Png(include_bytes!({global_path:?}).to_vec())"),
+            Some("md") => &format!("Content::Html(MarkdownParser::html(MarkdownParser::parse(include_str!({global_path:?}))))"),
+            Some("html") => &format!("Content::Html(include_str!({global_path:?}))"),
+            Some("txt") => &format!("Content::Text(include_str!({global_path:?}))"),
+            Some("css") => &format!("Content::Css(include_str!({global_path:?}))"),
+            Some("js") => &format!("Content::Js(include_str!({global_path:?}))"),
+            _ => &format!("Content::Unknown(include_str!({global_path:?}))"),
+        };
+
+        out.push_str(&format!("\t\t(PathBuf::from({asset_path:?}),{content_str}),\n"));
     }
     out.push_str("\t];\n");
 
-    out.push_str("\tfor (key, path) in paths {\n");
-    out.push_str("\t\tlet asset = Asset::new(Content::read_content(&path)?);\n");
-    out.push_str("\t\tassets.insert(key,asset);\n");
+    out.push_str("\tfor (key, content) in paths {\n");
+    out.push_str("\t\tassets.insert(key,Asset::new(content));\n");
     out.push_str("\t}\n");
 
     out.push_str("\tOk(assets)\n");
@@ -131,16 +139,21 @@ fn comptime() {
     out.push_str("\tlet paths = vec![\n");
     for template_path in template_paths {
         let path_key = template_path.to_string_lossy();
-        let full_path = format!("{cwd}/{path_key}");
+        let global_path = format!("{cwd}/{path_key}");
         let stripped_key = path_key.strip_prefix(TEMPLATES_PATH).expect("Failed to find prefix");
-        out.push_str(&format!("\t\t({stripped_key:?}.to_string(),PathBuf::from(\"{full_path}\")),\n"));
+        
+        let content_str = match template_path.extension().and_then(|s| s.to_str()) {
+          Some("html") => &format!("include_str!({global_path:?})"),
+          _ => continue,
+      };
+        out.push_str(&format!("\t\t({path_key:?},{stripped_key:?},{content_str}),\n"));
     }
     out.push_str("\t];\n");
 
-    out.push_str("\tfor (key, path) in paths {\n");
-    out.push_str("\t\tlet template = Template::load(&path)?;\n");
+    out.push_str("\tfor (origin_file, key, template_str) in paths {\n");
+    out.push_str("\t\tlet template = Template::from_str(origin_file.to_string(), template_str)?;\n");
 
-    out.push_str("\t\ttemplates.insert(key,template);\n");
+    out.push_str("\t\ttemplates.insert(key.to_string(),template);\n");
     out.push_str("\t}\n");
 
     out.push_str("\tOk(Templates {\n");
@@ -486,6 +499,16 @@ impl TemplateParseError {
     }
     fn no_info(typ: TemplateParseErrorMsg) -> Self {
         Self { typ, pos: None }
+    }
+    fn only_file(typ: TemplateParseErrorMsg, file: &str) -> Self {
+        Self {
+            typ,
+            pos: Some(TemplatePositionData {
+                file: Rc::new(file.to_owned()),
+                start_pos: Position { line: 0, column: 0 },
+                end_pos: Position { line: 0, column: 0 },
+            }),
+        }
     }
 }
 
@@ -910,24 +933,21 @@ impl TemplateParser {
 }
 
 impl Template {
-    fn load<P: AsRef<Path> + Debug + Copy>(path: P) -> Result<Self, TemplateError> {
+    fn from_path<P: AsRef<Path> + Debug + Copy>(path: P) -> Result<Self, TemplateError> {
         let path_string = path.as_ref().to_string_lossy().to_string();
 
         let template_str = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                return Err(TemplateParseError::new(
-                    TemplateParseErrorMsg::GenericError(e.to_string()),
-                    TemplatePositionData {
-                        file: Rc::new(path_string),
-                        start_pos: Position { line: 0, column: 0 },
-                        end_pos: Position { line: 0, column: 0 },
-                    },
-                ))?;
+                return Err(TemplateParseError::only_file(TemplateParseErrorMsg::GenericError(e.to_string()), &path_string))?;
             }
         };
 
-        let parsed = TemplateParser::lex(&template_str, &path_string).parse()?;
+        Self::from_str(path_string, &template_str)
+    }
+
+    fn from_str(path_string: String, template_str: &str) -> Result<Self, TemplateError> {
+        let parsed = TemplateParser::lex(template_str, &path_string).parse()?;
 
         // for i in &parsed {
         //     print!("{}", i.data);
@@ -1497,7 +1517,7 @@ impl Content {
     fn read_and_render_content(path: &Path, template_context: &Arc<Mutex<HashMap<String, TemplateValue>>>) -> Result<Content, TemplateError> {
         if path.starts_with(TEMPLATES_PATH) && path.extension().and_then(|s| s.to_str()) == Some("html") {
             let template_context = template_context.lock()?;
-            Ok(Content::Html(Template::load(path)?.render(&template_context)?))
+            Ok(Content::Html(Template::from_path(path)?.render(&template_context)?))
         } else {
             Ok(Self::read_content(path)?)
         }
