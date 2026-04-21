@@ -41,7 +41,7 @@ fn main() -> Result<(), TemplateError> {
         println!(
             "Static/Generated asset count: {:?}/{:?}",
             assets.static_.lock().unwrap().len(),
-            assets.generated.lock().unwrap().len()
+            assets.templates.lock().unwrap().len()
         );
 
         #[cfg(debug_assertions)]
@@ -58,7 +58,6 @@ fn main() -> Result<(), TemplateError> {
         println!("Started listening on socket http://{SOCKET_ADDR}");
 
         HttpServer::serve(listener, router);
-
     }
     Ok(())
 }
@@ -142,11 +141,11 @@ fn comptime() {
         let path_key = template_path.to_string_lossy();
         let global_path = format!("{cwd}/{path_key}");
         let stripped_key = path_key.strip_prefix(TEMPLATES_PATH).expect("Failed to find prefix");
-        
+
         let content_str = match template_path.extension().and_then(|s| s.to_str()) {
-          Some("html") => &format!("include_str!({global_path:?})"),
-          _ => continue,
-      };
+            Some("html") => &format!("include_str!({global_path:?})"),
+            _ => continue,
+        };
         out.push_str(&format!("\t\t({path_key:?},{stripped_key:?},{content_str}),\n"));
     }
     out.push_str("\t];\n");
@@ -940,7 +939,10 @@ impl Template {
         let template_str = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                return Err(TemplateParseError::only_file(TemplateParseErrorMsg::GenericError(e.to_string()), &path_string))?;
+                return Err(TemplateParseError::only_file(
+                    TemplateParseErrorMsg::GenericError(e.to_string()),
+                    &path_string,
+                ))?;
             }
         };
 
@@ -1078,7 +1080,7 @@ impl Template {
 struct Router {
     assets: Assets,
     templates: Templates,
-    routes: HashMap<PathBuf, String>,
+    routes: HashMap<String, String>,
     fallback: Option<String>,
 }
 
@@ -1134,25 +1136,40 @@ impl Router {
         self
     }
 
-    fn serve_asset(&self, header: HttpRequestHeader, body:Content) -> Result<&str,HttpError> {
-      let res = "";
+    fn serve_asset(&self, mut stream: &TcpStream, header: HttpRequestHeader, body: Content) -> Result<(), HttpServerError> {
+        let static_assets = self.assets.static_.lock()?;
 
-      // let key = 
-      
-      Ok(res)
+        match static_assets.get(&PathBuf::from(header.path)) {
+            Some(route) => stream.write_all(route.content.as_bytes())?,
+            None => stream.write_all(HttpResponseCode::NotFound.as_bytes())?,
+        };
+
+        Ok(())
     }
-    
-    fn serve_page(&self, header: HttpRequestHeader, body:Content)-> Result<&str,HttpError> {
-      let res = "";
-      
-      
-      Ok(res)
+
+    fn serve_page(&self, mut stream: &TcpStream, header: HttpRequestHeader, body: Content) -> Result<(), HttpServerError> {
+        Ok(())
     }
-    
-    fn serve_api(&self, header: HttpRequestHeader, body:Content)-> Result<&str, HttpError> {
-      let res = "";
-      
-      Ok(res)
+
+    fn serve_api(&self, mut stream: &TcpStream, header: HttpRequestHeader, body: Content) -> Result<(), HttpServerError> {
+        Ok(())
+    }
+}
+
+enum HttpServerError {
+    LockFailed,
+    StreamWriteFailed,
+}
+
+impl<T> From<std::sync::PoisonError<T>> for HttpServerError {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        HttpServerError::LockFailed
+    }
+}
+
+impl From<std::io::Error> for HttpServerError {
+    fn from(value: std::io::Error) -> Self {
+        HttpServerError::StreamWriteFailed
     }
 }
 
@@ -1161,12 +1178,18 @@ enum HttpResponseCode {
     Ok = 200,
     NotFound = 404,
     BadRequest = 400,
-  }
+    InternalServer = 500,
+}
 
-#[derive(Debug)]
-struct HttpError {
-  code:HttpResponseCode,
-  message: String
+impl HttpResponseCode {
+    pub fn as_bytes(&self) -> &'static [u8] {
+        match self {
+            HttpResponseCode::Ok => b"200 OK",
+            HttpResponseCode::NotFound => b"404 Not Found",
+            HttpResponseCode::BadRequest => b"400 Bad Request",
+            HttpResponseCode::InternalServer => b"500 Internal Server Error",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1186,7 +1209,6 @@ struct HttpRequestHeader {
 enum HttpRequestType {
     GET,
 }
-
 
 struct HttpServer {}
 
@@ -1238,6 +1260,7 @@ impl HttpServer {
             HttpResponseCode::Ok => "200 Ok",
             HttpResponseCode::NotFound => "404 Not Found",
             HttpResponseCode::BadRequest => "400 Bad Request",
+            HttpResponseCode::InternalServer => "500 Internal Server Error",
         };
 
         let body = content.as_bytes();
@@ -1316,120 +1339,112 @@ impl HttpServer {
         })
     }
 
-    
-    fn serve(listener:TcpListener, router:Router) {
-      let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
-      let mut active_streams: Vec<TcpStream> = vec![];
-      let mut check_alive_timer = Instant::now();
+    fn serve(listener: TcpListener, router: Router) {
+        let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
+        let mut active_streams: Vec<TcpStream> = vec![];
+        let mut check_alive_timer = Instant::now();
 
-      let mut it = 0;
+        let mut it = 0;
 
-      'main: loop {
-          print!("Loop it {it}\r");
-          it += 1;
+        'main: loop {
+            print!("Loop it {it}\r");
+            it += 1;
 
-          if active_streams.is_empty() {
-              listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
-          } else {
-              listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
-          }
+            if active_streams.is_empty() {
+                listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
+            } else {
+                listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
+            }
 
-          if let Ok((mut stream, peer_addr)) = listener.accept() {
-              println!("[{peer_addr}] Connected");
-              stream.set_nonblocking(true).expect("Failed to change blocking of stream");
+            if let Ok((mut stream, peer_addr)) = listener.accept() {
+                println!("[{peer_addr}] Connected");
+                stream.set_nonblocking(true).expect("Failed to change blocking of stream");
 
-              let n = loop {
-                  match stream.read(&mut buffer) {
-                      Ok(0) => {
-                          println!("[{peer_addr}] Disconnected");
-                          continue 'main;
-                      }
-                      Ok(n) => break n,
-                      _ => continue,
-                  };
-              };
+                let n = loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => {
+                            println!("[{peer_addr}] Disconnected");
+                            continue 'main;
+                        }
+                        Ok(n) => break n,
+                        _ => continue,
+                    };
+                };
 
-              let (header, body) = HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
+                let (header, body) = HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
 
-              println!(
-                  "[{peer_addr}] Received {:?} request for {:?} of length {}",
-                  header.typ,
-                  header.path,
-                  body.len()
-              );
+                println!(
+                    "[{peer_addr}] Received {:?} request for {:?} of length {}",
+                    header.typ,
+                    header.path,
+                    body.len()
+                );
 
-              let mut is_ws = false;
+                let mut is_ws = false;
 
-              match header.path.as_str() {
-                  #[cfg(debug_assertions)]
-                  "/ws" => {
-                      print!("[{peer_addr:?}] Upgrading websocket ... ");
-                      let response = HttpServer::upgrade_websocket(header);
-                      stream.write_all(&response).expect("Failed to write to stream");
-                      stream.flush().expect("Failed to flush stream");
-                      is_ws = true;
-                  }
-                  path => {
-                      let res = if path.starts_with("/assets") {
-                        router.serve_asset(header, body)
-                      } else if path.starts_with("/api") {
-                        router.serve_api(header, body)
-                      } else {
-                        router.serve_page(header, body)
-                      };
-                      match res {
-                        Ok(res) => stream.write(res.as_bytes()),
-                        Err(err) => stream.write(err),
-                      }  
-                    
-                      
-                  }
-              };
+                match header.path.as_str() {
+                    #[cfg(debug_assertions)]
+                    "/ws" => {
+                        print!("[{peer_addr:?}] Upgrading websocket ... ");
+                        let response = HttpServer::upgrade_websocket(header);
+                        stream.write_all(&response).expect("Failed to write to stream");
+                        stream.flush().expect("Failed to flush stream");
+                        is_ws = true;
+                    }
+                    path => {
+                        if path.starts_with("/assets") {
+                            router.serve_asset(&stream, header, body)
+                        } else if path.starts_with("/api") {
+                            router.serve_api(&stream, header, body)
+                        } else {
+                            router.serve_page(&stream, header, body)
+                        };
+                    }
+                };
 
-              #[cfg(debug_assertions)]
-              {
-                  if is_ws {
-                      // thread::sleep(Duration::from_secs(2));
-                      active_streams.push(stream);
-                      println!("Active connections {}", active_streams.len());
-                  }
-              }
-          }
-          #[cfg(debug_assertions)]
-          {
-              let should_reload = router.assets.reload.load(Ordering::Relaxed);
+                #[cfg(debug_assertions)]
+                {
+                    if is_ws {
+                        // thread::sleep(Duration::from_secs(2));
+                        active_streams.push(stream);
+                        println!("Active connections {}", active_streams.len());
+                    }
+                }
+            }
+            #[cfg(debug_assertions)]
+            {
+                let should_reload = router.assets.reload.load(Ordering::Relaxed);
 
-              if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
-                  check_alive_timer = Instant::now();
-                  active_streams.retain(|mut stream| {
-                      let connection_is_alive = match stream.read(&mut [0]) {
-                          Ok(0) => false,
-                          Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                          _ => false,
-                      };
+                if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
+                    check_alive_timer = Instant::now();
+                    active_streams.retain(|mut stream| {
+                        let connection_is_alive = match stream.read(&mut [0]) {
+                            Ok(0) => false,
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                            _ => false,
+                        };
 
-                      if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
-                          if should_reload {
-                              let _ = HttpServer::send_ws_message(stream, "reload");
-                              println!("[{peer_addr:?}] Reloaded");
-                          }
-                          // println!("[{peer_addr:?}] Connection still alive");
-                          true
-                      } else {
-                          println!("Closing connection");
-                          let _ = stream.shutdown(std::net::Shutdown::Both);
+                        if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
+                            if should_reload {
+                                let _ = HttpServer::send_ws_message(stream, "reload");
+                                println!("[{peer_addr:?}] Reloaded");
+                            }
+                            // println!("[{peer_addr:?}] Connection still alive");
+                            true
+                        } else {
+                            println!("Closing connection");
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
 
-                          false
-                      }
-                  });
-                  if should_reload {
-                    router.assets.reload.store(false, Ordering::Relaxed);
-                  }
-              }
-          }
-      }
+                            false
+                        }
+                    });
+                    if should_reload {
+                        router.assets.reload.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1591,7 +1606,7 @@ fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
 fn fs_watcher(assets: &Assets, templates: &Templates) {
     let template_context = templates.context.clone();
     let static_assets = assets.static_.clone();
-    let generated_assets = assets.generated.clone();
+    let generated_assets = assets.templates.clone();
     let reload = assets.reload.clone();
     let _ = thread::spawn(move || {
         println!("Started file watcher thread");
@@ -1666,7 +1681,7 @@ struct TrieNode {
 
 struct Assets {
     static_: Arc<Mutex<AssetTrie>>,
-    generated: Arc<Mutex<AssetTrie>>,
+    templates: Arc<Mutex<AssetTrie>>,
     reload: Arc<AtomicBool>,
 }
 
@@ -1683,7 +1698,7 @@ impl Assets {
         println!("Loaded ");
         Ok(Self {
             static_: Arc::new(Mutex::new(assets)),
-            generated: Arc::new(Mutex::new(generated)),
+            templates: Arc::new(Mutex::new(generated)),
             reload: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1715,7 +1730,7 @@ impl Assets {
     fn insert_templates(&mut self, templates: &Templates) -> Result<(), TemplateError> {
         let context = templates.context.lock().expect("failed to acquire lockl");
         let templates = templates.templates.lock().expect("failed to acquire lockl");
-        let mut generated_assets = self.generated.lock().expect("failed to acquite lock");
+        let mut generated_assets = self.templates.lock().expect("failed to acquite lock");
         for (path, template) in templates.iter() {
             match template.render(&context) {
                 Ok(html) => {
