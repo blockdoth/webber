@@ -1,17 +1,34 @@
-<h1>my blog</h1>
+<head>
+  {{if hotreload}}
+  <script>
+    const ws = new WebSocket("ws://127.0.0.1:4000/ws");
+    ws.onopen = () => console.log("Websocket connected!");
+    ws.onmessage = (event) => {
+      if ( event.data == "reload" ) {
+        window.location.reload();
+      };
+    }
+    </script>
+  {{endIf}}  
+</head>
 
-"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. 
-Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. 
-Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. 
-Excepteur sint occaecat  cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum."
+titleee
 
-<h3>Posts</h3>
+{{if posts.ball_container.is_empty }}
+<h1>has balls</h1>
+{{else}}   
+<h1>no balls</h1>
+{{endElse}}  
 
+{{variable}}
+
+<h1>Loop:</h1>
 {{for post in posts.posts}}
 
-<h4>post.title</h4>
-<p>post.intro</p>
-<p>post.date</p>
-<hr>
+{{if post.display }}
+<h1>condition in for loop</h1>
+{{endIf}}  
 
+<p>{{post.title}}</p>
+<p>{{post.intro}}</p>
 {{endFor}}
