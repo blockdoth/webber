@@ -7,6 +7,9 @@ edition = "2024"
 name = "webber"
 path = "main.rs"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(generated)'] }
+
 [profile.release]
 opt-level = "z"
 lto = true

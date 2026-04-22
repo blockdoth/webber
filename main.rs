@@ -1,19 +1,16 @@
 #![feature(tcp_linger)]
-#![allow(unexpected_cfgs)]
-#![allow(dead_code, unused, unused_mut)]
+#![allow(unused, unused_mut)]
 
 use std::cmp::{max, min};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::error::Error;
-use std::fmt::{Debug, Display, format};
-use std::fs::Metadata;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{panicking, sleep};
+use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 use std::vec::IntoIter;
 use std::{char, fmt, fs, thread, vec};
@@ -371,14 +368,6 @@ struct Position {
 }
 
 #[derive(Debug)]
-struct Template {
-    ast: Vec<TemplateNode>,
-    required_variables: Vec<String>,
-    origin_file: String,
-    last_modified: SystemTime,
-}
-
-#[derive(Debug)]
 struct TemplateParseError {
     typ: TemplateParseErrorMsg,
     pos: Option<TemplatePositionData>,
@@ -575,7 +564,7 @@ impl TemplateParser {
             } else if rest.starts_with("}}") {
                 if in_block {
                     let code_text = &input[start_block..cursor];
-                    let mut lexed_code = Self::lex_code(code_text, file_path, &mut metadata);
+                    let mut lexed_code = Self::lex_code(code_text, &mut metadata);
                     lexed.append(&mut lexed_code);
                 }
                 // lexed.push(TemplateToken::ParenClose);
@@ -600,7 +589,7 @@ impl TemplateParser {
         lexed
     }
 
-    fn lex_code<'a>(input: &'a str, file_path: &'a str, metadata: &mut TemplatePositionData) -> Vec<TemplateToken> {
+    fn lex_code(input: &str, metadata: &mut TemplatePositionData) -> Vec<TemplateToken> {
         use TemplateTokenKind::*;
 
         let mut lexed = vec![];
@@ -608,13 +597,11 @@ impl TemplateParser {
         let mut cursor = 0;
         let input_len = input.len();
 
-        let mut push_ident = false;
         let mut start_ident = 0;
-        let mut end_ident = 0;
         while cursor < input_len {
             let rest = &input[cursor..];
 
-            end_ident = cursor;
+            let end_ident = cursor;
             let tok = if rest.starts_with(".") {
                 Some((Dot, 1, false))
             } else if rest.starts_with("if") {
@@ -656,8 +643,6 @@ impl TemplateParser {
                     metadata: metadata.clone(),
                 });
                 start_ident = cursor;
-                end_ident = cursor;
-                push_ident = false;
             }
 
             cursor += 1;
@@ -733,7 +718,7 @@ impl TemplateParser {
                     parsed.push(self.parse_if()?);
                     // println!("Parsed if");
                 }
-                Identifier(ident) => {
+                Identifier(_) => {
                     parsed.push(self.parse_var()?);
                     // println!("Parsed identifier");
                 }
@@ -741,7 +726,6 @@ impl TemplateParser {
                     parsed.push(self.parse_for()?);
                     // println!("Parsed for");
                 }
-                Identifier(ident) => {}
                 Text(text) => {
                     parsed.push(TemplateNode {
                         data: TemplateNodeData::Text(text.to_owned()), // TODO not copy
@@ -878,7 +862,7 @@ impl TemplateParser {
 
             match self.peek() {
                 Some(tok) if tok.kind == Dot => {
-                    self.consume(Dot);
+                    self.consume(Dot)?;
                     current_token = self.next_token()?;
                 }
                 _ => break,
@@ -903,6 +887,14 @@ impl TemplateParser {
         }
         println!();
     }
+}
+
+#[derive(Debug)]
+struct Template {
+    ast: Vec<TemplateNode>,
+    required_variables: Vec<String>,
+    origin_file: String,
+    last_modified: SystemTime,
 }
 
 impl Template {
@@ -1018,7 +1010,6 @@ impl Template {
                     }
                 }
             };
-            // print!("> {}", &node_str);
         }
 
         Ok(res)
@@ -1033,8 +1024,7 @@ impl Template {
             TemplateRenderErrorMsg::VariableNotFound(ident_fields[0].to_string()),
             path.to_string(),
         ))?;
-        // println!("{:?}", current);
-        // println!("{:?}", context);
+
         let mut idx = 1;
         for field in &ident_fields[1..] {
             current = if let TemplateValue::Object(map) = current {
@@ -1102,7 +1092,7 @@ impl Router {
         self
     }
 
-    fn route_dynamic_pages(mut self, path: &str, base_template: &str, template_context_var: &str) -> Result<Self, TemplateError> {
+    fn route_dynamic_pages(self, path: &str, base_template: &str, template_context_var: &str) -> Result<Self, TemplateError> {
         let path = PathBuf::from(path);
 
         // let template_value = self
@@ -1139,7 +1129,7 @@ impl Router {
         self
     }
 
-    fn serve_asset(&self, header: HttpRequestHeader, body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_asset(&self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         let assets = self.assets.lock()?;
 
         match assets.get(&PathBuf::from(header.path)) {
@@ -1148,7 +1138,7 @@ impl Router {
         }
     }
 
-    fn serve_page(&self, header: HttpRequestHeader, body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_page(&self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         // println!("{:#?}", self.templates);
         // println!("{:?}", header);
         if let Some(route) = self.routes.get(&header.path)
@@ -1167,7 +1157,7 @@ impl Router {
         }
     }
 
-    fn serve_api(&self, header: HttpRequestHeader, body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_api(&self, _header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         Err(HttpServerError::Todo)
     }
 }
@@ -1181,13 +1171,13 @@ enum HttpServerError {
 }
 
 impl<T> From<std::sync::PoisonError<T>> for HttpServerError {
-    fn from(e: std::sync::PoisonError<T>) -> Self {
+    fn from(_e: std::sync::PoisonError<T>) -> Self {
         HttpServerError::LockFailed
     }
 }
 
 impl From<std::io::Error> for HttpServerError {
-    fn from(value: std::io::Error) -> Self {
+    fn from(_value: std::io::Error) -> Self {
         HttpServerError::StreamWriteFailed
     }
 }
@@ -1570,15 +1560,6 @@ impl AssetData {
         Ok(content)
     }
 
-    fn read_and_render_content(path: &Path, template_context: &Arc<Mutex<HashMap<String, TemplateValue>>>) -> Result<AssetData, TemplateError> {
-        if path.starts_with(TEMPLATES_PATH) && path.extension().and_then(|s| s.to_str()) == Some("html") {
-            let template_context = template_context.lock()?;
-            Ok(AssetData::Html(Template::from_path(path)?.render(&template_context)?))
-        } else {
-            Ok(Self::read_asset(path)?)
-        }
-    }
-
     fn typ(&self) -> &str {
         match self {
             AssetData::Text(_) => "text/plain",
@@ -1752,15 +1733,15 @@ impl Content {
         #[cfg(generated)]
         let mut assets = load_embedded_assets()?;
         #[cfg(generated)]
-        let (mut templates, mut templates_context) = load_embedded_templates()?;
+        let (templates, templates_context) = load_embedded_templates()?;
 
         #[cfg(not(generated))]
         // Stub to make the compiler happy
         let mut assets = AssetTrie::new();
         #[cfg(not(generated))]
-        let mut templates = HashMap::new();
+        let templates = HashMap::new();
         #[cfg(not(generated))]
-        let mut templates_context = HashMap::new();
+        let templates_context = HashMap::new();
 
         let generated = Self::compile_generated_assets(&mut assets); // TODO
         // assets
@@ -2117,12 +2098,10 @@ enum BlockTyp {
     Table,
     Misc,
 }
-struct MarkdownParser<'a> {
-    ast: MarkdownNode<'a>,
-}
+struct MarkdownParser {}
 
-impl<'a> MarkdownParser<'a> {
-    fn parse(input: &'a str) -> MarkdownNode<'a> {
+impl MarkdownParser {
+    fn parse(input: &str) -> MarkdownNode<'_> {
         let mut active_block = vec![];
         let mut blocks: Vec<MarkDownBlock> = vec![];
 
@@ -2235,7 +2214,7 @@ impl<'a> MarkdownParser<'a> {
         MarkdownNode::Document(blocks.into_iter().map(Self::parse_block).collect())
     }
 
-    fn parse_block(block: MarkDownBlock<'a>) -> MarkdownNode<'a> {
+    fn parse_block(block: MarkDownBlock) -> MarkdownNode {
         match block {
             MarkDownBlock::Heading { level, content } => MarkdownNode::Heading {
                 level,
@@ -2258,7 +2237,7 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
-    fn parse_inline(input: &'a str) -> Vec<MarkdownNode<'a>> {
+    fn parse_inline(input: &str) -> Vec<MarkdownNode<'_>> {
         let mut res = Vec::new();
         let mut stack: Vec<(char, usize, usize)> = Vec::new();
         let mut cursor = 0;
