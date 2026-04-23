@@ -1,6 +1,7 @@
 #![feature(tcp_linger)]
 #![allow(unused, unused_mut)]
 
+use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -889,9 +890,16 @@ impl TemplateParser {
     }
 }
 
+
+#[derive(Debug)]
+enum TemplateState {
+  Parsed(Vec<TemplateNode>),
+  Cached(String)
+}
+
 #[derive(Debug)]
 struct Template {
-    ast: Vec<TemplateNode>,
+    state: TemplateState,
     required_variables: Vec<String>,
     origin_file: String,
     last_modified: SystemTime,
@@ -930,7 +938,7 @@ impl Template {
         let parsed = TemplateParser::lex(&template_str, &path_string).parse()?;
         let required_variables = Self::get_required_vars(&parsed);
 
-        template.ast = parsed;
+        template.state = TemplateState::Parsed(parsed);
         template.required_variables = required_variables;
         template.last_modified = SystemTime::now();
 
@@ -946,16 +954,28 @@ impl Template {
         let required_variables = Self::get_required_vars(&parsed);
 
         Ok(Template {
-            ast: parsed,
+            state: TemplateState::Parsed(parsed),
             required_variables,
             origin_file: path_string,
             last_modified: SystemTime::now(),
         })
     }
 
-    fn render(&self, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
-        // println!("{:?}", &self.ast);
-        Self::render_helper(&self.ast, context)
+    fn render(&mut self, context: &Arc<Mutex<HashMap<String, TemplateValue>>>, other_templates: &Arc<Mutex<HashMap<String, Template>>>) -> Result<String, TemplateError> {
+      let templates = other_templates.lock()?;
+      match &self.state {
+        TemplateState::Parsed(template_nodes) => {
+              let context = context.lock()?;
+
+              let res = Self::render_helper(&template_nodes, &context)?;
+              if self.required_variables.len() == 0 { //TODO add more heuristics
+                self.state = TemplateState::Cached(res.clone());
+                println!("Cached template");
+              }
+              Ok(res)
+            }
+            TemplateState::Cached(template) => Ok(template.to_string()),
+        }
     }
 
     fn render_helper(nodes: &Vec<TemplateNode>, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
@@ -1142,16 +1162,14 @@ impl Router {
         // println!("{:#?}", self.templates);
         // println!("{:?}", header);
         if let Some(route) = self.routes.get(&header.path)
-            && let Some(template) = self.templates.lock()?.get(route)
+            && let Some(template) = self.templates.lock()?.get_mut(route)
         {
             println!("Serving page: {:?}", route);
-            let context = self.templates_context.lock()?;
-            Ok(AssetData::Html(template.render(&context)?))
+            Ok(AssetData::Html(template.render(&self.templates_context, &self.templates)?))
         } else if let Some(fallback) = &self.fallback
-            && let Some(fallback_template) = self.templates.lock()?.get(fallback)
+            && let Some(fallback_template) = self.templates.lock()?.get_mut(fallback)
         {
-            let context = self.templates_context.lock()?;
-            Ok(AssetData::Html(fallback_template.render(&context)?))
+            Ok(AssetData::Html(fallback_template.render(&self.templates_context, &self.templates)?))
         } else {
             Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned()))
         }
