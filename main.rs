@@ -35,12 +35,9 @@ fn main() -> Result<(), TemplateError> {
 
         println!(
             "Static/Generated asset count: {:?}/{:?}",
-            content.assets.lock().unwrap().len(),
-            content.templates.lock().unwrap().len()
+            content.assets.len(),
+            content.templates.len()
         );
-
-        #[cfg(debug_assertions)]
-        fs_watcher(&content);
 
         let router = Router::new(content)
             .route_static_page("/home", "pages/home.html")
@@ -73,13 +70,16 @@ fn insert_context(content: &mut Content) {
             },
         ],
     };
-    let mut context = content.templates_context.lock().expect("Failed to acquire lock");
+    let context = &mut content.templates_context;
 
     context.insert("posts".to_string(), posts.to_template_value());
     context.insert("variable".to_string(), "arbitrary var".to_template_value());
 
     #[cfg(debug_assertions)]
-    context.insert("hotreload".to_string(), true.to_template_value());
+    let hotreload = true;
+    #[cfg(not(debug_assertions))]
+    let hotreload = false;
+    context.insert("hotreload".to_string(), hotreload.to_template_value() );
 }
 
 fn comptime() {
@@ -961,12 +961,10 @@ impl Template {
         })
     }
 
-    fn render(&mut self, context: &Arc<Mutex<HashMap<String, TemplateValue>>>, other_templates: &Arc<Mutex<HashMap<String, Template>>>) -> Result<String, TemplateError> {
-      let templates = other_templates.lock()?;
+    fn render(&mut self, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
       match &self.state {
         TemplateState::Parsed(template_nodes) => {
-              let context = context.lock()?;
-
+              println!("Parsed template");
               let res = Self::render_helper(&template_nodes, &context)?;
               if self.required_variables.len() == 0 { //TODO add more heuristics
                 self.state = TemplateState::Cached(res.clone());
@@ -1031,7 +1029,6 @@ impl Template {
                 }
             };
         }
-
         Ok(res)
     }
 
@@ -1086,10 +1083,7 @@ impl Template {
 
 #[derive(Debug)]
 struct Router {
-    assets: Arc<Mutex<AssetTrie>>,
-    templates: Arc<Mutex<HashMap<String, Template>>>,
-    templates_context: Arc<Mutex<HashMap<String, TemplateValue>>>,
-    reload: Arc<AtomicBool>,
+    content: Content,
 
     routes: HashMap<String, String>,
     fallback: Option<String>,
@@ -1098,10 +1092,7 @@ struct Router {
 impl Router {
     fn new(content: Content) -> Self {
         Router {
-            assets: content.assets,
-            templates: content.templates,
-            templates_context: content.templates_context,
-            reload: content.reload,
+            content,
             routes: HashMap::new(),
             fallback: None,
         }
@@ -1150,26 +1141,24 @@ impl Router {
     }
 
     fn serve_asset(&self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
-        let assets = self.assets.lock()?;
-
-        match assets.get(&PathBuf::from(header.path)) {
+        match self.content.assets.get(&PathBuf::from(header.path)) {
             Some(asset) => Ok(asset.data),
             None => Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned())),
         }
     }
 
-    fn serve_page(&self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_page(&mut self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         // println!("{:#?}", self.templates);
         // println!("{:?}", header);
         if let Some(route) = self.routes.get(&header.path)
-            && let Some(template) = self.templates.lock()?.get_mut(route)
+            && let Some(template) = self.content.templates.get_mut(route)
         {
             println!("Serving page: {:?}", route);
-            Ok(AssetData::Html(template.render(&self.templates_context, &self.templates)?))
+            Ok(AssetData::Html(template.render(&self.content.templates_context)?))
         } else if let Some(fallback) = &self.fallback
-            && let Some(fallback_template) = self.templates.lock()?.get_mut(fallback)
+            && let Some(fallback_template) = self.content.templates.get_mut(fallback)
         {
-            Ok(AssetData::Html(fallback_template.render(&self.templates_context, &self.templates)?))
+            Ok(AssetData::Html(fallback_template.render(&self.content.templates_context)?))
         } else {
             Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned()))
         }
@@ -1372,10 +1361,11 @@ impl HttpServer {
         })
     }
 
-    fn serve(listener: TcpListener, router: Router) {
+    fn serve(listener: TcpListener, mut router: Router) {
         let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
         let mut active_streams: Vec<TcpStream> = vec![];
         let mut check_alive_timer = Instant::now();
+        let mut check_fs_timer = Instant::now();
 
         let mut it = 0;
 
@@ -1459,11 +1449,17 @@ impl HttpServer {
                     }
                 }
             }
+
+            
             #[cfg(debug_assertions)]
             {
-                let should_reload = router.reload.load(Ordering::Relaxed);
+                if check_fs_timer.elapsed() > Duration::from_millis(100) {
+                  check_fs_timer = Instant::now();
+                  router.content.check_update();
+                }  
 
-                if should_reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
+
+                if router.content.reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
                     check_alive_timer = Instant::now();
                     active_streams.retain(|mut stream| {
                         let connection_is_alive = match stream.read(&mut [0]) {
@@ -1473,7 +1469,7 @@ impl HttpServer {
                         };
 
                         if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
-                            if should_reload {
+                            if router.content.reload {
                                 let _ = HttpServer::send_ws_message(stream, "reload");
                                 println!("[{peer_addr:?}] Reloaded");
                             }
@@ -1486,8 +1482,8 @@ impl HttpServer {
                             false
                         }
                     });
-                    if should_reload {
-                        router.reload.store(false, Ordering::Relaxed);
+                    if router.content.reload {
+                        router.content.reload = false;
                     }
                 }
             }
@@ -1617,133 +1613,18 @@ impl AssetData {
 //   continue;
 // }
 
-fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
-    let mut asset_paths = vec![];
-    let mut stack = vec![rootdir.as_ref().to_path_buf()];
 
-    while let Some(dir_path) = stack.pop() {
-        let dir = match fs::read_dir(&dir_path) {
-            Ok(dir) => dir,
-            Err(error) => {
-                println!("Error while trying to open asset dir at {rootdir:?}: {error}");
-                continue;
-            }
-        };
-
-        for file in dir {
-            if let Ok(file) = file
-                && let Ok(metadata) = file.metadata()
-            {
-                if metadata.is_dir() {
-                    stack.push(file.path());
-                    continue;
-                };
-                let file_path = file.path();
-                asset_paths.push(file_path.clone());
-            }
-        }
-    }
-    asset_paths
-}
-
-fn fs_watcher(content: &Content) {
-    let content = content.clone();
-    let _ = thread::spawn(move || {
-        println!("Started file watcher thread");
-        loop {
-            if let Err(err) = update_assets(&content) {
-                println!("Error while updating assets: {err}")
-            }
-
-            if let Err(err) = update_templates(&content) {
-                println!("Error while updating templates: {err}")
-            }
-            sleep(Duration::from_millis(100));
-        }
-    });
-}
-
-fn update_templates(content: &Content) -> Result<(), TemplateError> {
-    let paths = walk_dir(TEMPLATES_PATH);
-    let mut templates = content.templates.lock()?;
-
-    for path in &paths {
-        let last_modified = path.metadata()?.modified()?;
-        let path_str = path.strip_prefix(TEMPLATES_PATH)?.to_string_lossy().to_string();
-        match templates.get_mut(&path_str) {
-            Some(template) => {
-                if template.last_modified < last_modified {
-                    Template::update_from_path(template, path)?;
-                    content.reload.store(true, Ordering::Release);
-                    println!(
-                        "Updated template {:?}, last edited {} minutes ago",
-                        path,
-                        last_modified.elapsed().unwrap().as_secs() / 60
-                    );
-                }
-            }
-            None => {
-                let template = Template::from_path(path)?;
-                println!("Added template {path_str:?}");
-                templates.insert(path_str, template);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn update_assets(content: &Content) -> Result<(), TemplateError> {
-    let paths = walk_dir(ASSETS_PATH);
-    let mut map = content.assets.lock()?;
-
-    for path in &paths {
-        let last_modified = path.metadata()?.modified()?;
-
-        match map.get_ref_mut(path) {
-            Some(existing_asset) if last_modified > existing_asset.last_modified => {
-                existing_asset.data = AssetData::read_asset(path)?;
-                existing_asset.last_modified = last_modified;
-                content.reload.store(true, Ordering::Release);
-
-                println!(
-                    "Updated file {:?}, edited {} minutes ago",
-                    path,
-                    last_modified.elapsed().unwrap().as_secs() / 60
-                );
-            }
-            Some(_) => {} // File not changed
-            None => {
-                let asset = AssetData::read_asset(path)?;
-                map.insert(
-                    path.clone(),
-                    Asset {
-                        last_modified,
-                        data: asset,
-                        internal: false,
-                    },
-                );
-                content.reload.store(true, Ordering::Release);
-                println!("Added file {:?}", path);
-            }
-        }
-    }
-    if map.remove_other_than_except_generated(paths) {
-        content.reload.store(true, Ordering::Release);
-    }
-    Ok(())
-}
-
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug)]
 struct TrieNode {
     asset: Option<Asset>,
     children: HashMap<String, TrieNode>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Content {
-    assets: Arc<Mutex<AssetTrie>>,
-    templates: Arc<Mutex<HashMap<String, Template>>>,
-    templates_context: Arc<Mutex<HashMap<String, TemplateValue>>>,
-    reload: Arc<AtomicBool>,
+    assets: AssetTrie,
+    templates: HashMap<String, Template>,
+    templates_context: HashMap<String, TemplateValue>,
+    reload: bool,
 }
 
 impl Content {
@@ -1765,10 +1646,10 @@ impl Content {
         // assets
         println!("Loaded ");
         Ok(Self {
-            assets: Arc::new(Mutex::new(assets)),
-            templates: Arc::new(Mutex::new(templates)),
-            templates_context: Arc::new(Mutex::new(templates_context)),
-            reload: Arc::new(AtomicBool::new(false)),
+            assets,
+            templates,
+            templates_context,
+            reload: false,
         })
     }
 
@@ -1795,9 +1676,118 @@ impl Content {
         // println!("Compiled {} generated assets", generated_assets.len());
         generated_assets
     }
+
+
+  
+  fn check_update(&mut self) {
+    if let Err(err) = self.update_assets() {
+      println!("Error while updating assets: {err}")
+    }
+
+    if let Err(err) = self.update_templates() {
+        println!("Error while updating templates: {err}")
+    }
+  }
+  
+  fn update_templates(&mut self) -> Result<(), TemplateError> {
+      let paths = walk_dir(TEMPLATES_PATH);
+      for path in &paths {
+          let last_modified = path.metadata()?.modified()?;
+          let path_str = path.strip_prefix(TEMPLATES_PATH)?.to_string_lossy().to_string();
+          match self.templates.get_mut(&path_str) {
+              Some(template) => {
+                  if template.last_modified < last_modified {
+                      Template::update_from_path(template, path)?;
+                      self.reload = true;
+                      println!(
+                          "Updated template {:?}, last edited {} minutes ago",
+                          path,
+                          last_modified.elapsed().unwrap().as_secs() / 60
+                      );
+                  }
+              }
+              None => {
+                  let template = Template::from_path(path)?;
+                  println!("Added template {path_str:?}");
+                  self.templates.insert(path_str, template);
+              }
+          }
+      }
+      Ok(())
+  }
+  
+  fn update_assets(&mut self) -> Result<(), TemplateError> {
+      let paths = walk_dir(ASSETS_PATH);
+  
+      for path in &paths {
+          let last_modified = path.metadata()?.modified()?;
+  
+          match self.assets.get_ref_mut(path) {
+              Some(existing_asset) if last_modified > existing_asset.last_modified => {
+                  existing_asset.data = AssetData::read_asset(path)?;
+                  existing_asset.last_modified = last_modified;
+                  self.reload = true;
+  
+                  println!(
+                      "Updated file {:?}, edited {} minutes ago",
+                      path,
+                      last_modified.elapsed().unwrap().as_secs() / 60
+                  );
+              }
+              Some(_) => {} // File not changed
+              None => {
+                  let asset = AssetData::read_asset(path)?;
+                  self.assets.insert(
+                      path.clone(),
+                      Asset {
+                          last_modified,
+                          data: asset,
+                          internal: false,
+                      },
+                  );
+                  self.reload = true;
+                  println!("Added file {:?}", path);
+              }
+          }
+      }
+      if self.assets.remove_other_than_except_generated(paths) {
+        self.reload = true;
+      }
+      Ok(())
+  }
+  
 }
 
-#[derive(Default, Debug, Clone)]
+fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
+  let mut asset_paths = vec![];
+  let mut stack = vec![rootdir.as_ref().to_path_buf()];
+
+  while let Some(dir_path) = stack.pop() {
+      let dir = match fs::read_dir(&dir_path) {
+          Ok(dir) => dir,
+          Err(error) => {
+              println!("Error while trying to open asset dir at {rootdir:?}: {error}");
+              continue;
+          }
+      };
+
+      for file in dir {
+          if let Ok(file) = file
+              && let Ok(metadata) = file.metadata()
+          {
+              if metadata.is_dir() {
+                  stack.push(file.path());
+                  continue;
+              };
+              let file_path = file.path();
+              asset_paths.push(file_path.clone());
+          }
+      }
+  }
+  asset_paths
+}
+
+#[derive(Default, Debug)]
 struct AssetTrie {
     root: TrieNode,
     paths: HashSet<PathBuf>,
