@@ -33,17 +33,13 @@ fn main() -> Result<(), TemplateError> {
         let mut content = Content::load_embedded()?;
         insert_context(&mut content);
 
-        println!(
-            "Static/Generated asset count: {:?}/{:?}",
-            content.assets.len(),
-            content.templates.len()
-        );
+        println!("Static/Generated asset count: {:?}/{:?}", content.assets.len(), content.templates.len());
 
         let router = Router::new(content)
             .route_static_page("/home", "pages/home.html")
             .route_static_page("/about", "pages/projects.html")
             .route_static_page("/posts", "pages/projects.html")
-            .route_dynamic_pages("/posts/:name", "pages/post.html", "posts")?
+            .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
             .fallback("pages/home.html");
 
         let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
@@ -55,9 +51,8 @@ fn main() -> Result<(), TemplateError> {
 }
 
 fn insert_context(content: &mut Content) {
-    let posts = Posts {
-        ball_container: BallContainer { is_empty: false },
-        posts: vec![
+    let posts = TemplateValue::List(
+        vec![
             Post {
                 title: "title 1".to_string(),
                 intro: "intro 1".to_string(),
@@ -68,18 +63,32 @@ fn insert_context(content: &mut Content) {
                 intro: "intro 2".to_string(),
                 display: true,
             },
-        ],
-    };
+        ]
+        .iter()
+        .map(|post| {
+            if let TemplateValue::Object(obj) = post.to_template_value() {
+                TemplateValue::DynPageObject {
+                    slug: post.title.replace(" ", "-"),
+                    object: obj,
+                }
+            } else {
+                todo!()
+            }
+        })
+        .collect(),
+    );
+
     let context = &mut content.templates_context;
 
-    context.insert("posts".to_string(), posts.to_template_value());
+    context.insert("posts".to_string(), posts);
     context.insert("variable".to_string(), "arbitrary var".to_template_value());
+    context.insert("balls".to_string(), true.to_template_value());
 
     #[cfg(debug_assertions)]
     let hotreload = true;
     #[cfg(not(debug_assertions))]
     let hotreload = false;
-    context.insert("hotreload".to_string(), hotreload.to_template_value() );
+    context.insert("hotreload".to_string(), hotreload.to_template_value());
 }
 
 fn comptime() {
@@ -169,6 +178,7 @@ enum TemplateValue {
     Bool(bool),
     List(Vec<TemplateValue>),
     Object(HashMap<String, TemplateValue>),
+    DynPageObject { slug: String, object: HashMap<String, TemplateValue> },
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +187,7 @@ enum TemplateValueKind {
     Bool,
     List,
     Object,
+    DynPageObject,
 }
 
 impl TemplateValue {
@@ -186,6 +197,7 @@ impl TemplateValue {
             TemplateValue::Bool(_) => TemplateValueKind::Bool,
             TemplateValue::List(_) => TemplateValueKind::List,
             TemplateValue::Object(_) => TemplateValueKind::Object,
+            TemplateValue::DynPageObject { .. } => TemplateValueKind::DynPageObject,
         }
     }
 }
@@ -230,10 +242,6 @@ macro_rules! impl_to_template_value {
     };
 }
 
-struct Posts {
-    ball_container: BallContainer,
-    posts: Vec<Post>,
-}
 struct BallContainer {
     is_empty: bool,
 }
@@ -245,7 +253,6 @@ struct Post {
 }
 
 impl_to_template_value!(BallContainer, { is_empty });
-impl_to_template_value!(Posts, { ball_container, posts});
 impl_to_template_value!(Post, { title, intro, display});
 
 #[derive(Debug)]
@@ -890,11 +897,10 @@ impl TemplateParser {
     }
 }
 
-
 #[derive(Debug)]
 enum TemplateState {
-  Parsed(Vec<TemplateNode>),
-  Cached(String)
+    Parsed(Vec<TemplateNode>),
+    Cached(String),
 }
 
 #[derive(Debug)]
@@ -962,15 +968,16 @@ impl Template {
     }
 
     fn render(&mut self, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
-      match &self.state {
-        TemplateState::Parsed(template_nodes) => {
-              println!("Parsed template");
-              let res = Self::render_helper(&template_nodes, &context)?;
-              if self.required_variables.len() == 0 { //TODO add more heuristics
-                self.state = TemplateState::Cached(res.clone());
-                println!("Cached template");
-              }
-              Ok(res)
+        match &self.state {
+            TemplateState::Parsed(template_nodes) => {
+                println!("Parsed template");
+                let res = Self::render_helper(&template_nodes, &context)?;
+                if self.required_variables.len() == 0 {
+                    //TODO add more heuristics
+                    self.state = TemplateState::Cached(res.clone());
+                    println!("Cached template");
+                }
+                Ok(res)
             }
             TemplateState::Cached(template) => Ok(template.to_string()),
         }
@@ -1044,21 +1051,24 @@ impl Template {
 
         let mut idx = 1;
         for field in &ident_fields[1..] {
-            current = if let TemplateValue::Object(map) = current {
-                if let Some(obj) = map.get(field.as_str()) {
-                    obj
-                } else {
-                    return Err(TemplateRenderError::new(
-                        TemplateRenderErrorMsg::FieldNotFoundOnVariable(ident_fields[1..idx].concat(), field.to_string()),
-                        path.to_string(),
-                    ));
+            // println!("Field: {field}\n{current:#?}");
+            current = match current {
+                TemplateValue::Object(map) | TemplateValue::DynPageObject { object: map, .. } => {
+                    if let Some(obj) = map.get(field.as_str()) {
+                        obj
+                    } else {
+                        return Err(TemplateRenderError::new(
+                            TemplateRenderErrorMsg::FieldNotFoundOnVariable(ident_fields[1..idx].concat(), field.to_string()),
+                            path.to_string(),
+                        ));
+                    }
                 }
-            } else {
-                return Err(TemplateRenderError::new(
+                _ => Err(TemplateRenderError::new(
                     TemplateRenderErrorMsg::VariableNotOfExpectedType(field.to_string(), TemplateValueKind::List),
                     path.to_string(),
-                ))?;
+                ))?,
             };
+
             idx += 1;
         }
         Ok(current)
@@ -1103,34 +1113,58 @@ impl Router {
         self
     }
 
-    fn route_dynamic_pages(self, path: &str, base_template: &str, template_context_var: &str) -> Result<Self, TemplateError> {
-        let path = PathBuf::from(path);
+    fn route_dynamic_pages(mut self, path: &str, base_template: &str, list_name: &str) -> Result<Self, TemplateError> {
+        let (base_path, key) = path.rsplit_once(':').expect("expected path to contain ':'");
 
-        // let template_value = self
-        //     .templates
-        //     .context
-        //     .lock()
-        //     .expect("failed to acquire template context")
-        //     .get(template_context_var)
-        //     .expect(&format!("Failed to find var {} in context", template_context_var));
+        let template_value = self
+            .content
+            .templates_context
+            .get(list_name)
+            .expect(&format!("Failed to find var {} in context", list_name));
 
-        // let base_template = self.templates.templates.lock().expect("fs watcher died").get(base_template).expect("not found");
+        let mut generated = Vec::new();
 
-        // match template_value {
-        //     // TemplateValue::Object(kv) =>{
-        //     //   for
-        //     // }
-        //     TemplateValue::List(values) => {
-        //       for value in values {
-        //         let new_path = path;
+        match template_value {
+            // TemplateValue::Object(kv) =>{
+            //   for
+            // }
+            TemplateValue::List(page_list) => {
+                let base_template = self.content.templates.get_mut(base_template).expect("not found");
 
-        //         // let page = base_template.render()?;
+                for page in page_list {
+                    if let TemplateValue::DynPageObject { slug, object } = page {
+                        let mut context = self.content.templates_context.clone(); // TODO explore if can do this without clone
 
-        //         // self.routes.insert(new_path,page);
-        //       }
-        //     },
-        //     _ => todo!(),
-        // }
+                        context.insert(key.to_owned(), TemplateValue::Object(object.clone()));
+                        // println!("{:?}", key);
+                        // println!("{:?}", context.keys());
+                        let page = base_template.render(&context)?;
+
+                        let url = format!("{base_path}{slug}");
+                        let asset_url = format!("/generated{url}.html");
+
+                        let template = Template {
+                            state: TemplateState::Cached(page),
+                            required_variables: vec![],
+                            origin_file: "generated".to_owned(),
+                            last_modified: SystemTime::now(),
+                        };
+
+                        generated.push((url, asset_url, template));
+                    } else {
+                        // println!("{template_value:?}");
+                        todo!("error");
+                    }
+                }
+            }
+            _ => todo!(),
+        }
+
+        // Dont outside of loop because of mut checking
+        for (url, asset_url, template) in generated {
+            self.content.templates.insert(asset_url.clone(), template);
+            self.routes.insert(url, asset_url);
+        }
 
         Ok(self)
     }
@@ -1149,7 +1183,9 @@ impl Router {
 
     fn serve_page(&mut self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         // println!("{:#?}", self.templates);
-        // println!("{:?}", header);
+        // println!("{:#?}", self.routes.keys());
+        // println!("{:#?}", self.content.templates.keys());
+        // println!("{:?}", header.path);
         if let Some(route) = self.routes.get(&header.path)
             && let Some(template) = self.content.templates.get_mut(route)
         {
@@ -1158,6 +1194,7 @@ impl Router {
         } else if let Some(fallback) = &self.fallback
             && let Some(fallback_template) = self.content.templates.get_mut(fallback)
         {
+            println!("Path {} not found, serving fallback {fallback}", header.path);
             Ok(AssetData::Html(fallback_template.render(&self.content.templates_context)?))
         } else {
             Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned()))
@@ -1432,7 +1469,7 @@ impl HttpServer {
                         let bytes = match res {
                             Ok(content) => Self::build_response(HttpResponseCode::Ok, content),
                             Err(err) => {
-                                println!("Server error {err:?}");
+                                println!("Server error {err:#?}");
                                 Self::build_response(HttpResponseCode::InternalServer, AssetData::Empty)
                             }
                         };
@@ -1450,14 +1487,12 @@ impl HttpServer {
                 }
             }
 
-            
             #[cfg(debug_assertions)]
             {
                 if check_fs_timer.elapsed() > Duration::from_millis(100) {
-                  check_fs_timer = Instant::now();
-                  router.content.check_update();
-                }  
-
+                    check_fs_timer = Instant::now();
+                    router.content.check_update();
+                }
 
                 if router.content.reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
                     check_alive_timer = Instant::now();
@@ -1613,7 +1648,6 @@ impl AssetData {
 //   continue;
 // }
 
-
 #[derive(Default, Debug)]
 struct TrieNode {
     asset: Option<Asset>,
@@ -1677,114 +1711,129 @@ impl Content {
         generated_assets
     }
 
+    fn check_update(&mut self) {
+        if let Err(err) = self.update_assets() {
+            println!("Error while updating assets: {err}")
+        }
 
-  
-  fn check_update(&mut self) {
-    if let Err(err) = self.update_assets() {
-      println!("Error while updating assets: {err}")
+        if let Err(err) = self.update_templates() {
+            println!("Error while updating templates: {err}")
+        }
     }
 
-    if let Err(err) = self.update_templates() {
-        println!("Error while updating templates: {err}")
+    fn update_templates(&mut self) -> Result<(), TemplateError> {
+        let paths = walk_dir(TEMPLATES_PATH);
+        for path in &paths {
+            let last_modified = path.metadata()?.modified()?;
+            let path_str = path.strip_prefix(TEMPLATES_PATH)?.to_string_lossy().to_string();
+
+            // Update normal template
+            match self.templates.get_mut(&path_str) {
+                Some(template) => {
+                    if template.last_modified < last_modified {
+                        Template::update_from_path(template, path)?;
+                        self.reload = true;
+                        println!(
+                            "Updated template {:?}, last edited {} minutes ago",
+                            path,
+                            last_modified.elapsed().unwrap().as_secs() / 60
+                        );
+                    }
+                }
+                None => {
+                    let template = Template::from_path(path)?;
+                    println!("Added template {path_str:?}");
+                    self.templates.insert(path_str.clone(), template);
+                }
+            }
+            let mut path_segment = path
+              .strip_prefix(TEMPLATES_PATH)?
+              .to_path_buf();
+        
+            path_segment.set_extension("");
+            let path_segment = path_segment.strip_prefix("pages").unwrap_or(path_segment.as_path());
+
+            let path_segment = path_segment
+              .to_string_lossy()
+              .to_string();
+
+            let prefix = format!("/generated/{path_segment}");
+
+
+            // Update dynamic templates
+            println!("path_str: {:?}", &prefix);
+        }
+        Ok(())
     }
-  }
-  
-  fn update_templates(&mut self) -> Result<(), TemplateError> {
-      let paths = walk_dir(TEMPLATES_PATH);
-      for path in &paths {
-          let last_modified = path.metadata()?.modified()?;
-          let path_str = path.strip_prefix(TEMPLATES_PATH)?.to_string_lossy().to_string();
-          match self.templates.get_mut(&path_str) {
-              Some(template) => {
-                  if template.last_modified < last_modified {
-                      Template::update_from_path(template, path)?;
-                      self.reload = true;
-                      println!(
-                          "Updated template {:?}, last edited {} minutes ago",
-                          path,
-                          last_modified.elapsed().unwrap().as_secs() / 60
-                      );
-                  }
-              }
-              None => {
-                  let template = Template::from_path(path)?;
-                  println!("Added template {path_str:?}");
-                  self.templates.insert(path_str, template);
-              }
-          }
-      }
-      Ok(())
-  }
-  
-  fn update_assets(&mut self) -> Result<(), TemplateError> {
-      let paths = walk_dir(ASSETS_PATH);
-  
-      for path in &paths {
-          let last_modified = path.metadata()?.modified()?;
-  
-          match self.assets.get_ref_mut(path) {
-              Some(existing_asset) if last_modified > existing_asset.last_modified => {
-                  existing_asset.data = AssetData::read_asset(path)?;
-                  existing_asset.last_modified = last_modified;
-                  self.reload = true;
-  
-                  println!(
-                      "Updated file {:?}, edited {} minutes ago",
-                      path,
-                      last_modified.elapsed().unwrap().as_secs() / 60
-                  );
-              }
-              Some(_) => {} // File not changed
-              None => {
-                  let asset = AssetData::read_asset(path)?;
-                  self.assets.insert(
-                      path.clone(),
-                      Asset {
-                          last_modified,
-                          data: asset,
-                          internal: false,
-                      },
-                  );
-                  self.reload = true;
-                  println!("Added file {:?}", path);
-              }
-          }
-      }
-      if self.assets.remove_other_than_except_generated(paths) {
-        self.reload = true;
-      }
-      Ok(())
-  }
-  
+
+    fn update_assets(&mut self) -> Result<(), TemplateError> {
+        let paths = walk_dir(ASSETS_PATH);
+
+        for path in &paths {
+            let last_modified = path.metadata()?.modified()?;
+
+            match self.assets.get_ref_mut(path) {
+                Some(existing_asset) if last_modified > existing_asset.last_modified => {
+                    existing_asset.data = AssetData::read_asset(path)?;
+                    existing_asset.last_modified = last_modified;
+                    self.reload = true;
+
+                    println!(
+                        "Updated file {:?}, edited {} minutes ago",
+                        path,
+                        last_modified.elapsed().unwrap().as_secs() / 60
+                    );
+                }
+                Some(_) => {} // File not changed
+                None => {
+                    let asset = AssetData::read_asset(path)?;
+                    self.assets.insert(
+                        path.clone(),
+                        Asset {
+                            last_modified,
+                            data: asset,
+                            internal: false,
+                        },
+                    );
+                    self.reload = true;
+                    println!("Added file {:?}", path);
+                }
+            }
+        }
+        if self.assets.remove_other_than_except_generated(paths) {
+            self.reload = true;
+        }
+        Ok(())
+    }
 }
 
 fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
-  let mut asset_paths = vec![];
-  let mut stack = vec![rootdir.as_ref().to_path_buf()];
+    let mut asset_paths = vec![];
+    let mut stack = vec![rootdir.as_ref().to_path_buf()];
 
-  while let Some(dir_path) = stack.pop() {
-      let dir = match fs::read_dir(&dir_path) {
-          Ok(dir) => dir,
-          Err(error) => {
-              println!("Error while trying to open asset dir at {rootdir:?}: {error}");
-              continue;
-          }
-      };
+    while let Some(dir_path) = stack.pop() {
+        let dir = match fs::read_dir(&dir_path) {
+            Ok(dir) => dir,
+            Err(error) => {
+                println!("Error while trying to open asset dir at {rootdir:?}: {error}");
+                continue;
+            }
+        };
 
-      for file in dir {
-          if let Ok(file) = file
-              && let Ok(metadata) = file.metadata()
-          {
-              if metadata.is_dir() {
-                  stack.push(file.path());
-                  continue;
-              };
-              let file_path = file.path();
-              asset_paths.push(file_path.clone());
-          }
-      }
-  }
-  asset_paths
+        for file in dir {
+            if let Ok(file) = file
+                && let Ok(metadata) = file.metadata()
+            {
+                if metadata.is_dir() {
+                    stack.push(file.path());
+                    continue;
+                };
+                let file_path = file.path();
+                asset_paths.push(file_path.clone());
+            }
+        }
+    }
+    asset_paths
 }
 
 #[derive(Default, Debug)]
@@ -1923,7 +1972,7 @@ impl AssetTrie {
         let mut changed = false;
 
         for path in &paths_to_delete {
-            if path.to_string_lossy().starts_with("$") {
+            if path.to_string_lossy().starts_with("/generated") {
                 continue;
             };
             println!("Removed file {:?}", path);
