@@ -40,7 +40,7 @@ fn main() -> Result<(), TemplateError> {
             .route_static_page("/about", "pages/about.html")
             .route_static_page("/posts", "pages/posts.html")
             .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
-            .fallback("pages/home.html");
+            .fallback("/home");
 
         let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
         println!("Started listening on socket http://{SOCKET_ADDR}");
@@ -1440,10 +1440,9 @@ impl Router {
 
                 None if let Some(fallback) = &self.fallback =>
                 {
-                    let page = Self::render_template(&self.content.templates, &mut self.context, &fallback)?;
-
-                    println!("Path {} not found, serving fallback {fallback}", header.path);
-                    Ok(AssetData::Html(page))
+                    println!("Path {} not found, redirecting to {fallback}", header.path);
+                    
+                    Err(HttpServerError::Redirect(fallback.to_string()))
                 }
                 _ => Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned())),
             },
@@ -1477,6 +1476,7 @@ impl Router {
 
 #[derive(Debug)]
 enum HttpServerError {
+    Redirect(String),
     LockFailed,
     StreamWriteFailed,
     TemplatingError(TemplateError),
@@ -1503,19 +1503,21 @@ impl From<TemplateError> for HttpServerError {
 
 #[derive(Debug)]
 enum HttpResponseCode {
-    Ok = 200,
-    NotFound = 404,
-    BadRequest = 400,
-    InternalServer = 500,
+    Ok,
+    RedirectOther(String),
+    BadRequest,
+    NotFound,
+    InternalServer,
 }
 
 impl HttpResponseCode {
-    pub fn to_string(&self) -> &str {
+    pub fn to_string(&self) -> String {
         match self {
-            HttpResponseCode::Ok => "200 OK",
-            HttpResponseCode::NotFound => "404 Not Found",
-            HttpResponseCode::BadRequest => "400 Bad Request",
-            HttpResponseCode::InternalServer => "500 Internal Server Error",
+            HttpResponseCode::Ok => "200 OK".to_string(),
+            HttpResponseCode::RedirectOther(redirect) => format!("303 See Other\r\nLocation: {redirect}"),
+            HttpResponseCode::NotFound => "404 Not Found".to_string(),
+            HttpResponseCode::BadRequest => "400 Bad Request".to_string(),
+            HttpResponseCode::InternalServer => "500 Internal Server Error".to_string(),
         }
     }
 }
@@ -1584,12 +1586,7 @@ impl HttpServer {
     }
 
     fn build_response(code: HttpResponseCode, content: AssetData) -> Vec<u8> {
-        let status = match code {
-            HttpResponseCode::Ok => "200 Ok",
-            HttpResponseCode::NotFound => "404 Not Found",
-            HttpResponseCode::BadRequest => "400 Bad Request",
-            HttpResponseCode::InternalServer => "500 Internal Server Error",
-        };
+        let status = code.to_string();
 
         let body = content.as_bytes();
 
@@ -1746,6 +1743,9 @@ impl HttpServer {
 
                         let bytes = match res {
                             Ok(content) => Self::build_response(HttpResponseCode::Ok, content),
+                            Err(HttpServerError::Redirect(redirect_path)) => {
+                              Self::build_response(HttpResponseCode::RedirectOther(redirect_path), AssetData::Empty)
+                            },
                             Err(err) => {
                                 println!("Server error {err:#?}");
                                 Self::build_response(HttpResponseCode::InternalServer, AssetData::Empty)
