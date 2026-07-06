@@ -5,6 +5,7 @@
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
@@ -34,9 +35,10 @@ fn main() -> Result<(), TemplateError> {
         println!("Static/Generated asset count: {:?}/{:?}", content.assets.len(), content.templates.len());
 
         let router = Router::new(content, context)
+            .route_static_page("/layout", "layout.html")
             .route_static_page("/home", "pages/home.html")
-            .route_static_page("/about", "pages/projects.html")
-            .route_static_page("/posts", "pages/projects.html")
+            .route_static_page("/about", "pages/about.html")
+            .route_static_page("/posts", "pages/posts.html")
             .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
             .fallback("pages/home.html");
 
@@ -120,9 +122,9 @@ fn comptime() {
             Some("ico") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
             Some("md") => &format!("AssetData::Html(MarkdownParser::html(MarkdownParser::parse(include_str!({global_path:?}))))"),
             Some("html") => &format!("AssetData::Html(include_str!({global_path:?}))"),
-            Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}))"),
-            Some("css") => &format!("AssetData::Css(include_str!({global_path:?}))"),
-            Some("js") => &format!("AssetData::Js(include_str!({global_path:?}))"),
+            Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
+            Some("css") => &format!("AssetData::Css(include_str!({global_path:?}).to_string())"),
+            Some("js") => &format!("AssetData::Js(include_str!({global_path:?}).to_string())"),
             _ => &format!("AssetData::Unknown(include_str!({global_path:?}))"),
         };
 
@@ -257,13 +259,13 @@ struct Post {
 impl_to_template_value!(BallContainer, { is_empty });
 impl_to_template_value!(Post, { title, intro, display});
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TemplateNode {
     data: TemplateNodeData,
     pos: TemplatePositionData,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TemplateNodeData {
     Text(String),
     Variable(Vec<String>),
@@ -277,6 +279,10 @@ enum TemplateNodeData {
         iter_src: Vec<String>,
         body: Vec<TemplateNode>,
     },
+    Block {
+        ident: String,
+        body: Vec<TemplateNode>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +291,7 @@ enum TemplateNodeKind {
     Variable,
     If,
     For,
+    Block,
 }
 
 impl TemplateNodeData {
@@ -294,6 +301,7 @@ impl TemplateNodeData {
             TemplateNodeData::Variable(_) => TemplateNodeKind::Variable,
             TemplateNodeData::If { .. } => TemplateNodeKind::If,
             TemplateNodeData::For { .. } => TemplateNodeKind::For,
+            TemplateNodeData::Block { .. } => TemplateNodeKind::Block,
         }
     }
 }
@@ -327,6 +335,12 @@ impl fmt::Display for TemplateNodeData {
 
                 write!(f, "for {} in {} {{\n{}\n}}", iter_bind, iter_src.join("."), body_str)
             }
+            TemplateNodeData::Block { ident, body } => {
+                let body_str = body.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+                write!(f, "block {ident} {{\n{body_str}\n}}")
+            } // TemplateNodeData::Extends { path } => {
+              //     write!(f, "extends \"{path}\"")
+              // }
         }
     }
 }
@@ -341,6 +355,7 @@ struct TemplateToken {
 enum TemplateTokenKind {
     Text(String),
     Identifier(String),
+    Path(String),
     Dot,
     If,
     Else,
@@ -350,6 +365,9 @@ enum TemplateTokenKind {
     EndElse,
     EndFor,
     NewLine,
+    Block,
+    EndBlock,
+    Extends,
     // ParenOpen(PositionData),
     // ParenClose(PositionData),
 }
@@ -414,6 +432,7 @@ enum TemplateParseErrorMsg {
     GenericError(String),
     UnexpectedTemplateValueType(TemplateNodeKind, TemplateNodeKind),
     MergingSpansFromDifferentFiles(String, String),
+    ExtendsNotFirstLine,
     UnexpectedEOF,
 }
 
@@ -523,8 +542,10 @@ impl TemplateParser {
     fn lex(input_str: &str, path_string: &str) -> Self {
         let lexed = Self::lex_template(input_str, path_string);
 
+
+        // println!("File: {}", path_string);
         // for i in &lexed {
-        //     println!("{:?}", i.kind);
+        //     println!("\t{:?}", i.kind);
         // }
 
         Self {
@@ -552,12 +573,19 @@ impl TemplateParser {
         while cursor < input_len {
             let rest = &input[cursor..];
 
+            // if rest.starts_with(char::is_whitespace) {
+            //   cursor += 1;
+            //   metadata.end_pos.column += 1;
+            //   continue;
+            // }
+
             if rest.starts_with("\n") {
                 metadata.end_pos.line += 1;
                 metadata.end_pos.column = 0;
             }
+
             if rest.starts_with("{{") {
-                if !in_block {
+                if !in_block && cursor != 0 {
                     let prev_text = input[start_block..cursor].to_string();
 
                     lexed.push(TemplateToken {
@@ -621,8 +649,39 @@ impl TemplateParser {
         let mut start_ident = 0;
         while cursor < input_len {
             let rest = &input[cursor..];
-
             let end_ident = cursor;
+
+            if rest.starts_with("\"") {
+                if start_ident != cursor {
+                    let ident = input[start_ident..cursor].trim().to_string();
+                    if !ident.is_empty() {
+                        lexed.push(TemplateToken {
+                            kind: Identifier(ident),
+                            metadata: metadata.clone(),
+                        });
+                    }
+                }
+                cursor += 1;
+                metadata.end_pos.column += 1;
+
+                let start_path = cursor;
+                while cursor < input.len() && !input[cursor..cursor + 1].starts_with("\"") {
+                    cursor += 1;
+                    metadata.end_pos.column += 1;
+                }
+                let path_str = input[start_path..cursor].to_string();
+
+                cursor += 1;
+                metadata.end_pos.column += 1;
+
+                lexed.push(TemplateToken {
+                    kind: TemplateTokenKind::Path(path_str),
+                    metadata: metadata.clone(),
+                });
+                start_ident = cursor;
+                continue;
+            }
+
             let tok = if rest.starts_with(".") {
                 Some((Dot, 1, false))
             } else if rest.starts_with("if") {
@@ -639,6 +698,12 @@ impl TemplateParser {
                 Some((EndElse, 6, false))
             } else if rest.starts_with("endFor") {
                 Some((EndFor, 6, false))
+            } else if rest.starts_with("block") {
+                Some((Block, 5, false))
+            } else if rest.starts_with("endBlock") {
+                Some((EndBlock, 8, false))
+            } else if rest.starts_with("extends") {
+                Some((Extends, 7, false))
             } else if rest.starts_with(r"\n") {
                 Some((NewLine, 2, true))
             } else {
@@ -655,10 +720,12 @@ impl TemplateParser {
 
                 if start_ident != end_ident {
                     let ident = input[start_ident..end_ident].trim().to_string();
-                    lexed.push(TemplateToken {
-                        kind: Identifier(ident),
-                        metadata: metadata.clone(),
-                    });
+                    if !ident.is_empty() {
+                      lexed.push(TemplateToken {
+                          kind: Identifier(ident),
+                          metadata: metadata.clone(),
+                      });
+                  }
                 }
                 lexed.push(TemplateToken {
                     kind: tok,
@@ -672,10 +739,12 @@ impl TemplateParser {
         if start_ident + 1 != cursor {
             let ident = input[start_ident..].trim().to_string();
 
-            lexed.push(TemplateToken {
-                kind: Identifier(ident),
-                metadata: metadata.clone(),
-            });
+            if !ident.is_empty() {
+              lexed.push(TemplateToken {
+                  kind: Identifier(ident),
+                  metadata: metadata.clone(),
+              });
+          }
         }
         lexed
     }
@@ -723,8 +792,8 @@ impl TemplateParser {
         }
     }
 
-    fn parse(&mut self) -> Result<Vec<TemplateNode>, TemplateError> {
-        self.parse_until(&[])
+    fn parse(&mut self) -> Result<(Option<String>, Vec<TemplateNode>), TemplateError> {
+        Ok((self.parse_extends()?, self.parse_until(&[])?))
     }
 
     fn parse_until(&mut self, stop: &[TemplateTokenKind]) -> Result<Vec<TemplateNode>, TemplateError> {
@@ -748,6 +817,18 @@ impl TemplateParser {
                     parsed.push(self.parse_for()?);
                     // println!("Parsed for");
                 }
+                Block => {
+                    parsed.push(self.parse_block()?);
+                    // println!("Parsed for");
+                }
+                Extends => {
+                    return Err(TemplateParseError::new(
+                        TemplateParseErrorMsg::ExtendsNotFirstLine,
+                        next_token.metadata.clone(),
+                    ))?;
+
+                    // println!("Parsed for");
+                }
                 Text(text) => {
                     parsed.push(TemplateNode {
                         data: TemplateNodeData::Text(text.to_owned()), // TODO not copy
@@ -762,6 +843,27 @@ impl TemplateParser {
         }
 
         Ok(parsed)
+    }
+
+    fn parse_extends(&mut self) -> Result<Option<String>, TemplateError> {
+        use TemplateTokenKind::*;
+        // self.show_next_n_tokens(10);
+
+        match self.peek() {
+            Some(token) if token.kind == Extends => {
+                self.consume(Extends)?;
+
+                let token = self.next_token()?;
+                match token.kind {
+                    Path(path) => Ok(Some(path)),
+                    other => Err(TemplateParseError::new(
+                        TemplateParseErrorMsg::UnexpectedToken(other, Identifier("<path>".to_string())),
+                        token.metadata,
+                    ))?,
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     fn parse_if(&mut self) -> Result<TemplateNode, TemplateError> {
@@ -825,6 +927,39 @@ impl TemplateParser {
             }
             _ => todo!(),
         }
+    }
+
+    fn parse_block(&mut self) -> Result<TemplateNode, TemplateError> {
+        use TemplateTokenKind::*;
+
+        let start_block = self.consume(Block)?;
+
+        let ident_node = self.parse_var()?;
+
+        let ident = match ident_node.data {
+            ref node @ TemplateNodeData::Variable(ref var) if var.len() > 1 => {
+                return Err(TemplateParseError::new(
+                    TemplateParseErrorMsg::GenericError(format!("blocks can only contain single level identifiers {node}")),
+                    ident_node.pos,
+                ))?;
+            }
+            TemplateNodeData::Variable(var) => var.first().expect("invariant").clone(),
+            node => {
+                return Err(TemplateParseError::new(
+                    TemplateParseErrorMsg::UnexpectedTemplateValueType(TemplateNodeKind::Variable, node.kind()),
+                    ident_node.pos,
+                ))?;
+            }
+        };
+
+        let body = self.parse_until(&[EndBlock])?;
+        Ok(TemplateNode {
+            data: TemplateNodeData::Block {
+                ident: ident.to_string(),
+                body,
+            },
+            pos: ident_node.pos,
+        })
     }
 
     fn parse_for(&mut self) -> Result<TemplateNode, TemplateError> {
@@ -911,9 +1046,16 @@ impl TemplateParser {
     }
 }
 
+struct ParsedTemplate {
+    extends: Option<String>,
+    template: Vec<TemplateNode>,
+}
+
 #[derive(Debug)]
 struct Template {
     template: Vec<TemplateNode>,
+    parent: Option<String>,
+    blocks: HashMap<String, Vec<TemplateNode>>,
     required_variables: Vec<String>,
     origin_file: String,
     last_modified: SystemTime,
@@ -949,10 +1091,11 @@ impl Template {
             }
         };
 
-        let parsed = TemplateParser::lex(&template_str, &path_string).parse()?;
-        let required_variables = Self::get_required_vars(&parsed);
+        let (extends, new_template) = TemplateParser::lex(&template_str, &path_string).parse()?;
+        let required_variables = Self::get_required_vars(&new_template);
 
-        template.template = parsed;
+        template.template = new_template;
+        template.parent = extends;
         template.required_variables = required_variables;
         template.last_modified = SystemTime::now();
 
@@ -960,26 +1103,42 @@ impl Template {
     }
 
     fn from_str(path_string: String, template_str: &str) -> Result<Self, TemplateError> {
-        let parsed = TemplateParser::lex(template_str, &path_string).parse()?;
+        let (extends, template_nodes) = TemplateParser::lex(template_str, &path_string).parse()?;
 
         // for i in &parsed {
         //     print!("{}", i.data);
         // }
-        let required_variables = Self::get_required_vars(&parsed);
+        let required_variables = Self::get_required_vars(&template_nodes);
+        let blocks = template_nodes
+            .iter()
+            .filter_map(|node| {
+                if let TemplateNodeData::Block { ident, body } = &node.data {
+                    Some((ident.clone(), body.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         Ok(Template {
-            template: parsed,
+            template: template_nodes,
+            parent: extends,
             required_variables,
             origin_file: path_string,
             last_modified: SystemTime::now(),
+            blocks,
         })
     }
 
     fn render(&self, context: &mut Context) -> Result<String, TemplateError> {
-        Self::render_helper(&self.template, context)
+        Self::render_helper(&self.template, context, &HashMap::new())
     }
 
-    fn render_helper(nodes: &Vec<TemplateNode>, context: &mut Context) -> Result<String, TemplateError> {
+    fn render_with_blocks(&self, context: &mut Context, blocks: &HashMap<String, Vec<TemplateNode>>) -> Result<String, TemplateError> {
+        Self::render_helper(&self.template, context, blocks)
+    }
+
+    fn render_helper(nodes: &Vec<TemplateNode>, context: &mut Context, blocks: &HashMap<String, Vec<TemplateNode>>) -> Result<String, TemplateError> {
         use TemplateNodeData::*;
         let mut res = String::new();
         for node in nodes {
@@ -1002,9 +1161,9 @@ impl Template {
                 } => {
                     if let TemplateValue::Bool(cond) = *Self::resolve_var(condition, context, &node.pos)? {
                         let cond_str = if cond {
-                            Self::render_helper(then_branch, context)?
+                            Self::render_helper(then_branch, context, blocks)?
                         } else {
-                            Self::render_helper(else_branch, context)?
+                            Self::render_helper(else_branch, context, blocks)?
                         };
                         res.push_str(&cond_str);
                     } else {
@@ -1020,7 +1179,7 @@ impl Template {
                         for it in iter {
                             context.push();
                             context.insert_local(iter_bind, it.clone());
-                            for_res.push_str(&Self::render_helper(body, context)?);
+                            for_res.push_str(&Self::render_helper(body, context, blocks)?);
                             context.pop();
                         }
                         res.push_str(&for_res);
@@ -1029,6 +1188,15 @@ impl Template {
                             TemplateRenderErrorMsg::VariableNotOfExpectedType(iter_src.concat(), TemplateValueKind::List),
                             node.pos.clone(),
                         ))?;
+                    }
+                }
+                Block { ident, body } => {
+                    if let Some(override_body) = blocks.get(ident) {
+                        let body_str = Self::render_helper(override_body, context, blocks)?;
+                        res.push_str(&body_str);
+                    } else {
+                        let body_str = Self::render_helper(body, context, blocks)?;
+                        res.push_str(&body_str);
                     }
                 }
             };
@@ -1110,7 +1278,7 @@ impl Context {
     }
 
     fn insert_local(&mut self, key: &str, value: TemplateValue) {
-        self.local_context.first_mut().expect("invariant").insert(key.to_owned(), value);
+        self.local_context.last_mut().expect("invariant").insert(key.to_owned(), value);
     }
     fn insert_global(&mut self, key: &str, value: TemplateValue) {
         self.global_context.insert(key.to_owned(), value);
@@ -1249,9 +1417,9 @@ impl Router {
 
                 Ok(AssetData::Html(cached.to_string()))
             }
-            Some(route) if let Some(template) = self.content.templates.get(&route.path) => {
+            Some(route) => {
                 println!("Serving page {}", header.path);
-                let page = template.render(&mut self.context)?;
+                let page = Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
                 Ok(AssetData::Html(page))
             }
             _ => match self.dynamic_routes.get(&header.path) {
@@ -1260,23 +1428,45 @@ impl Router {
 
                     Ok(AssetData::Html(cached.to_string()))
                 }
-                Some(dyn_route) if let Some(template) = self.content.templates.get(&dyn_route.template_path) => {
+                Some(dyn_route) => {
                     println!("Serving dynamic page {}", header.path);
                     self.context.push();
                     self.context.insert_local(&dyn_route.page_var_name, dyn_route.page_context_var.clone());
 
-                    let page = template.render(&mut self.context)?;
+                    let page = Self::render_template(&self.content.templates, &mut self.context, &dyn_route.template_path)?;
                     self.context.pop();
                     Ok(AssetData::Html(page))
                 }
-                None if let Some(fallback) = &self.fallback
-                    && let Some(fallback_template) = self.content.templates.get_mut(fallback) =>
+
+                None if let Some(fallback) = &self.fallback =>
                 {
+                    let page = Self::render_template(&self.content.templates, &mut self.context, &fallback)?;
+
                     println!("Path {} not found, serving fallback {fallback}", header.path);
-                    Ok(AssetData::Html(fallback_template.render(&mut self.context)?))
+                    Ok(AssetData::Html(page))
                 }
                 _ => Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned())),
             },
+        }
+    }
+
+    fn render_template(templates: &HashMap<String, Template>, context: &mut Context, path: &str) -> Result<String, TemplateError> {
+        let template = templates.get(path).expect("template not found");
+        // println!("{template:#?}");
+        if let Some(parent_path) = &template.parent {
+            let parent = templates.get(parent_path).expect("Parent template not found: {parent_path}");
+            if parent.parent.is_some() {
+                return Err(TemplateParseError::only_file(
+                    TemplateParseErrorMsg::GenericError(format!(
+                        "Nested extends are not allowed: {parent_path} extends {parent_path}, but {parent_path} also extends another template"
+                    )),
+                    parent_path,
+                ))?;
+            }
+
+            Ok(parent.render_with_blocks(context, &template.blocks)?)
+        } else {
+            Ok(template.render(context)?)
         }
     }
 
@@ -1840,12 +2030,7 @@ impl Content {
 
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
-            let key_path = format!(
-                "/{}",
-                path.strip_prefix(ASSETS_PATH)
-                    .expect("Failed to strip prefix")
-                    .to_string_lossy()
-            );
+            let key_path = format!("/{}", path.strip_prefix(ASSETS_PATH).expect("Failed to strip prefix").to_string_lossy());
 
             match self.assets.get_ref_mut(&key_path) {
                 Some(existing_asset) if last_modified > existing_asset.last_modified => {
@@ -1877,12 +2062,7 @@ impl Content {
         }
         let str_paths = paths
             .iter()
-            .map(|p| {
-                format!(
-                    "/{}",
-                    p.strip_prefix(ASSETS_PATH).expect("Failed to strip prefix").to_string_lossy()
-                )
-            })
+            .map(|p| format!("/{}", p.strip_prefix(ASSETS_PATH).expect("Failed to strip prefix").to_string_lossy()))
             .collect(); // Todo unfuck
         if self.assets.remove_other_than_except_generated(str_paths) {
             self.reload = true;
