@@ -1,7 +1,7 @@
 #![feature(tcp_linger)]
+#![feature(if_let_guard)]
 #![allow(unused, unused_mut)]
 
-use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -9,12 +9,10 @@ use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::sleep;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use std::vec::IntoIter;
-use std::{char, fmt, fs, thread, vec};
+use std::{char, fmt, fs, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
@@ -30,12 +28,12 @@ fn main() -> Result<(), TemplateError> {
     } else {
         println!("Running normally");
 
-        let mut content = Content::load_embedded()?;
-        insert_context(&mut content);
+        let content = Content::load_embedded()?;
+        let context = initial_context();
 
         println!("Static/Generated asset count: {:?}/{:?}", content.assets.len(), content.templates.len());
 
-        let router = Router::new(content)
+        let router = Router::new(content, context)
             .route_static_page("/home", "pages/home.html")
             .route_static_page("/about", "pages/projects.html")
             .route_static_page("/posts", "pages/projects.html")
@@ -50,9 +48,9 @@ fn main() -> Result<(), TemplateError> {
     Ok(())
 }
 
-fn insert_context(content: &mut Content) {
+fn initial_context() -> Context {
     let posts = TemplateValue::List(
-        vec![
+        [
             Post {
                 title: "title 1".to_string(),
                 intro: "intro 1".to_string(),
@@ -78,17 +76,17 @@ fn insert_context(content: &mut Content) {
         .collect(),
     );
 
-    let context = &mut content.templates_context;
+    let mut context = Context::new();
 
-    context.insert("posts".to_string(), posts);
-    context.insert("variable".to_string(), "arbitrary var".to_template_value());
-    context.insert("balls".to_string(), true.to_template_value());
+    context.insert_global("posts", posts);
 
     #[cfg(debug_assertions)]
     let hotreload = true;
     #[cfg(not(debug_assertions))]
     let hotreload = false;
-    context.insert("hotreload".to_string(), hotreload.to_template_value());
+    context.insert_global("hotreload", hotreload.to_template_value());
+
+    context
 }
 
 fn comptime() {
@@ -106,15 +104,20 @@ fn comptime() {
 
     //  === Assets ===
 
-    out.push_str("fn load_embedded_assets() -> Result<AssetTrie, io::Error>{\n");
-    out.push_str("\tlet mut assets = AssetTrie::new();\n");
+    out.push_str("fn load_embedded_assets() -> Result<Trie<Asset>, io::Error>{\n");
+    out.push_str("\tlet mut assets = Trie::new();\n");
 
     out.push_str("\tlet paths = vec![\n");
     for asset_path in asset_paths {
         let global_path = format!("{cwd}/{}", asset_path.to_string_lossy());
-
+        let str_path = asset_path
+            .strip_prefix(ASSETS_PATH)
+            .expect("Failed to strip prefix")
+            .to_string_lossy()
+            .into_owned();
         let content_str = match asset_path.extension().and_then(|s| s.to_str()) {
             Some("png") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
+            Some("ico") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
             Some("md") => &format!("AssetData::Html(MarkdownParser::html(MarkdownParser::parse(include_str!({global_path:?}))))"),
             Some("html") => &format!("AssetData::Html(include_str!({global_path:?}))"),
             Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}))"),
@@ -123,7 +126,7 @@ fn comptime() {
             _ => &format!("AssetData::Unknown(include_str!({global_path:?}))"),
         };
 
-        out.push_str(&format!("\t\t(PathBuf::from({asset_path:?}),{content_str}),\n"));
+        out.push_str(&format!("\t\t(\"/{str_path}\".to_string(),{content_str}),\n"));
     }
     out.push_str("\t];\n");
 
@@ -139,8 +142,7 @@ fn comptime() {
 
     let template_paths = walk_dir(TEMPLATES_PATH);
 
-    out.push_str("type EmbeddedTemplates = (HashMap<String, Template>, HashMap<String, TemplateValue>);\n");
-    out.push_str("fn load_embedded_templates() -> Result<EmbeddedTemplates,TemplateError> {\n");
+    out.push_str("fn load_embedded_templates() -> Result<HashMap<String, Template>,TemplateError> {\n");
     out.push_str("\tlet mut templates = HashMap::new();\n");
 
     out.push_str("\tlet paths = vec![\n");
@@ -163,7 +165,7 @@ fn comptime() {
     out.push_str("\t\ttemplates.insert(key.to_string(),template);\n");
     out.push_str("\t}\n");
 
-    out.push_str("\tOk((templates, HashMap::new()))\n");
+    out.push_str("\tOk(templates)\n");
     out.push_str("}\n");
 
     fs::write(&file_path, out).unwrap();
@@ -418,7 +420,7 @@ enum TemplateParseErrorMsg {
 #[derive(Debug)]
 struct TemplateRenderError {
     typ: TemplateRenderErrorMsg,
-    path: String,
+    pos: TemplatePositionData,
 }
 
 #[derive(Debug)]
@@ -483,8 +485,8 @@ impl TemplateParseError {
 }
 
 impl TemplateRenderError {
-    fn new(typ: TemplateRenderErrorMsg, path: String) -> Self {
-        Self { typ, path }
+    fn new(typ: TemplateRenderErrorMsg, pos: TemplatePositionData) -> Self {
+        Self { typ, pos }
     }
 }
 
@@ -594,6 +596,17 @@ impl TemplateParser {
                 metadata.end_pos.column += 1;
             }
         }
+
+        if start_block < input_len {
+            let text = input[start_block..].to_string();
+
+            if !text.is_empty() {
+                lexed.push(TemplateToken {
+                    kind: TemplateTokenKind::Text(text),
+                    metadata: metadata.clone(),
+                });
+            }
+        }
         lexed
     }
 
@@ -637,6 +650,7 @@ impl TemplateParser {
                 metadata.end_pos.column += tok_size;
                 if newline {
                     metadata.start_pos.line += 1;
+                    metadata.end_pos.column = 0;
                 }
 
                 if start_ident != end_ident {
@@ -898,14 +912,8 @@ impl TemplateParser {
 }
 
 #[derive(Debug)]
-enum TemplateState {
-    Parsed(Vec<TemplateNode>),
-    Cached(String),
-}
-
-#[derive(Debug)]
 struct Template {
-    state: TemplateState,
+    template: Vec<TemplateNode>,
     required_variables: Vec<String>,
     origin_file: String,
     last_modified: SystemTime,
@@ -944,7 +952,7 @@ impl Template {
         let parsed = TemplateParser::lex(&template_str, &path_string).parse()?;
         let required_variables = Self::get_required_vars(&parsed);
 
-        template.state = TemplateState::Parsed(parsed);
+        template.template = parsed;
         template.required_variables = required_variables;
         template.last_modified = SystemTime::now();
 
@@ -960,42 +968,30 @@ impl Template {
         let required_variables = Self::get_required_vars(&parsed);
 
         Ok(Template {
-            state: TemplateState::Parsed(parsed),
+            template: parsed,
             required_variables,
             origin_file: path_string,
             last_modified: SystemTime::now(),
         })
     }
 
-    fn render(&mut self, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
-        match &self.state {
-            TemplateState::Parsed(template_nodes) => {
-                println!("Parsed template");
-                let res = Self::render_helper(&template_nodes, &context)?;
-                if self.required_variables.len() == 0 {
-                    //TODO add more heuristics
-                    self.state = TemplateState::Cached(res.clone());
-                    println!("Cached template");
-                }
-                Ok(res)
-            }
-            TemplateState::Cached(template) => Ok(template.to_string()),
-        }
+    fn render(&self, context: &mut Context) -> Result<String, TemplateError> {
+        Self::render_helper(&self.template, context)
     }
 
-    fn render_helper(nodes: &Vec<TemplateNode>, context: &HashMap<String, TemplateValue>) -> Result<String, TemplateError> {
+    fn render_helper(nodes: &Vec<TemplateNode>, context: &mut Context) -> Result<String, TemplateError> {
         use TemplateNodeData::*;
         let mut res = String::new();
         for node in nodes {
             match &node.data {
                 Text(text) => res.push_str(text),
                 Variable(ident_fields) => {
-                    if let TemplateValue::Text(text) = Self::resolve_var(ident_fields, context, node.pos.file.as_str())? {
+                    if let TemplateValue::Text(text) = Self::resolve_var(ident_fields, context, &node.pos)? {
                         res.push_str(text);
                     } else {
                         return Err(TemplateRenderError::new(
                             TemplateRenderErrorMsg::NodeNotOfExpectedType(ident_fields.concat(), TemplateNodeKind::Text),
-                            node.pos.file.to_string(),
+                            node.pos.clone(),
                         ))?;
                     }
                 }
@@ -1004,7 +1000,7 @@ impl Template {
                     then_branch,
                     else_branch,
                 } => {
-                    if let TemplateValue::Bool(cond) = *Self::resolve_var(condition, context, node.pos.file.as_str())? {
+                    if let TemplateValue::Bool(cond) = *Self::resolve_var(condition, context, &node.pos)? {
                         let cond_str = if cond {
                             Self::render_helper(then_branch, context)?
                         } else {
@@ -1014,23 +1010,24 @@ impl Template {
                     } else {
                         return Err(TemplateRenderError::new(
                             TemplateRenderErrorMsg::VariableNotOfExpectedType(condition.concat(), TemplateValueKind::Bool),
-                            node.pos.file.to_string(),
+                            node.pos.clone(),
                         ))?;
                     }
                 }
                 For { iter_bind, iter_src, body } => {
-                    if let TemplateValue::List(iter) = Self::resolve_var(iter_src, context, node.pos.file.as_str())? {
+                    if let TemplateValue::List(iter) = Self::resolve_var(iter_src, context, &node.pos)?.clone() {
                         let mut for_res = String::new();
                         for it in iter {
-                            let mut local_context = context.clone(); // TODO use stack frames
-                            local_context.insert(iter_bind.to_string(), it.clone());
-                            for_res.push_str(&Self::render_helper(body, &local_context)?);
+                            context.push();
+                            context.insert_local(iter_bind, it.clone());
+                            for_res.push_str(&Self::render_helper(body, context)?);
+                            context.pop();
                         }
                         res.push_str(&for_res);
                     } else {
                         return Err(TemplateRenderError::new(
                             TemplateRenderErrorMsg::VariableNotOfExpectedType(iter_src.concat(), TemplateValueKind::List),
-                            node.pos.file.to_string(),
+                            node.pos.clone(),
                         ))?;
                     }
                 }
@@ -1039,14 +1036,10 @@ impl Template {
         Ok(res)
     }
 
-    fn resolve_var<'a>(
-        ident_fields: &[String],
-        context: &'a HashMap<String, TemplateValue>,
-        path: &str,
-    ) -> Result<&'a TemplateValue, TemplateRenderError> {
-        let mut current = context.get(&ident_fields[0]).ok_or(TemplateRenderError::new(
+    fn resolve_var<'a>(ident_fields: &[String], context: &'a Context, pos: &TemplatePositionData) -> Result<&'a TemplateValue, TemplateRenderError> {
+        let mut current = context.lookup(&ident_fields[0]).ok_or(TemplateRenderError::new(
             TemplateRenderErrorMsg::VariableNotFound(ident_fields[0].to_string()),
-            path.to_string(),
+            pos.clone(),
         ))?;
 
         let mut idx = 1;
@@ -1059,13 +1052,13 @@ impl Template {
                     } else {
                         return Err(TemplateRenderError::new(
                             TemplateRenderErrorMsg::FieldNotFoundOnVariable(ident_fields[1..idx].concat(), field.to_string()),
-                            path.to_string(),
+                            pos.clone(),
                         ));
                     }
                 }
                 _ => Err(TemplateRenderError::new(
                     TemplateRenderErrorMsg::VariableNotOfExpectedType(field.to_string(), TemplateValueKind::List),
-                    path.to_string(),
+                    pos.clone(),
                 ))?,
             };
 
@@ -1090,80 +1083,150 @@ impl Template {
 //
 
 // === Routing ===
+#[derive(Debug)]
+struct Context {
+    global_context: HashMap<String, TemplateValue>,
+    local_context: Vec<HashMap<String, TemplateValue>>,
+}
+
+impl Context {
+    fn new() -> Self {
+        Context {
+            global_context: HashMap::new(),
+            local_context: vec![HashMap::new()],
+        }
+    }
+
+    fn push(&mut self) {
+        self.local_context.push(HashMap::new());
+    }
+
+    fn pop(&mut self) {
+        if self.local_context.len() > 1 {
+            self.local_context.pop();
+        } else {
+            self.local_context = vec![HashMap::new()]
+        }
+    }
+
+    fn insert_local(&mut self, key: &str, value: TemplateValue) {
+        self.local_context.first_mut().expect("invariant").insert(key.to_owned(), value);
+    }
+    fn insert_global(&mut self, key: &str, value: TemplateValue) {
+        self.global_context.insert(key.to_owned(), value);
+    }
+
+    fn lookup(&self, key: &str) -> Option<&TemplateValue> {
+        // println!("{key}");
+        // println!("{:#?}", self.global_context);
+        // println!("{:#?}", self.local_context);
+
+        if let Some(val) = self.global_context.get(key) {
+            Some(val)
+        } else {
+            for context in &self.local_context {
+                if let Some(val) = context.get(key) {
+                    return Some(val);
+                }
+            }
+            None
+        }
+    }
+
+    fn lookup_mut(&mut self, key: &str) -> Option<&mut TemplateValue> {
+        if let Some(val) = self.global_context.get_mut(key) {
+            Some(val)
+        } else {
+            for context in &mut self.local_context {
+                if let Some(val) = context.get_mut(key) {
+                    return Some(val);
+                }
+            }
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DynamicRoute {
+    base_url: String,
+    page_list_name: String,
+    page_var_name: String,
+    template_path: String,
+    cached_page: Option<String>,
+    page_context_var: TemplateValue,
+}
+
+#[derive(Debug)]
+struct StaticRoute {
+    path: String,
+    cached_page: Option<String>,
+}
+
+impl StaticRoute {
+    fn new(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            cached_page: None,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Router {
     content: Content,
+    context: Context,
 
-    routes: HashMap<String, String>,
+    static_routes: HashMap<String, StaticRoute>,
+    dynamic_routes: HashMap<String, DynamicRoute>,
+
     fallback: Option<String>,
 }
 
 impl Router {
-    fn new(content: Content) -> Self {
+    fn new(content: Content, context: Context) -> Self {
         Router {
             content,
-            routes: HashMap::new(),
+            context,
+            static_routes: HashMap::new(),
+            dynamic_routes: HashMap::new(),
             fallback: None,
         }
     }
 
     fn route_static_page(mut self, path: &str, template: &str) -> Self {
-        self.routes.insert(path.into(), template.to_string());
+        self.static_routes.insert(path.into(), StaticRoute::new(template));
         self
     }
 
-    fn route_dynamic_pages(mut self, path: &str, base_template: &str, list_name: &str) -> Result<Self, TemplateError> {
+    fn route_dynamic_pages(mut self, path: &str, base_template_path: &str, list_name: &str) -> Result<Self, TemplateError> {
         let (base_path, key) = path.rsplit_once(':').expect("expected path to contain ':'");
 
         let template_value = self
-            .content
-            .templates_context
-            .get(list_name)
-            .expect(&format!("Failed to find var {} in context", list_name));
+            .context
+            .lookup(list_name)
+            .unwrap_or_else(|| panic!("Failed to find var {} in context", list_name))
+            .clone();
 
-        let mut generated = Vec::new();
+        let TemplateValue::List(page_list) = template_value else {
+            todo!("dynamic page source must be a list");
+        };
 
-        match template_value {
-            // TemplateValue::Object(kv) =>{
-            //   for
-            // }
-            TemplateValue::List(page_list) => {
-                let base_template = self.content.templates.get_mut(base_template).expect("not found");
+        for page in page_list {
+            if let TemplateValue::DynPageObject { slug, object } = page {
+                let url = format!("{base_path}{slug}");
 
-                for page in page_list {
-                    if let TemplateValue::DynPageObject { slug, object } = page {
-                        let mut context = self.content.templates_context.clone(); // TODO explore if can do this without clone
+                let dyn_route = DynamicRoute {
+                    base_url: base_path.to_owned(),
+                    page_list_name: list_name.to_owned(),
+                    page_var_name: key.to_owned(),
+                    template_path: base_template_path.to_owned(),
+                    page_context_var: TemplateValue::Object(object),
+                    cached_page: None,
+                };
 
-                        context.insert(key.to_owned(), TemplateValue::Object(object.clone()));
-                        // println!("{:?}", key);
-                        // println!("{:?}", context.keys());
-                        let page = base_template.render(&context)?;
-
-                        let url = format!("{base_path}{slug}");
-                        let asset_url = format!("/generated{url}.html");
-
-                        let template = Template {
-                            state: TemplateState::Cached(page),
-                            required_variables: vec![],
-                            origin_file: "generated".to_owned(),
-                            last_modified: SystemTime::now(),
-                        };
-
-                        generated.push((url, asset_url, template));
-                    } else {
-                        // println!("{template_value:?}");
-                        todo!("error");
-                    }
-                }
+                self.dynamic_routes.insert(url, dyn_route);
             }
-            _ => todo!(),
-        }
-
-        // Dont outside of loop because of mut checking
-        for (url, asset_url, template) in generated {
-            self.content.templates.insert(asset_url.clone(), template);
-            self.routes.insert(url, asset_url);
         }
 
         Ok(self)
@@ -1174,30 +1237,46 @@ impl Router {
         self
     }
 
-    fn serve_asset(&self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
-        match self.content.assets.get(&PathBuf::from(header.path)) {
-            Some(asset) => Ok(asset.data),
-            None => Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned())),
-        }
-    }
-
     fn serve_page(&mut self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         // println!("{:#?}", self.templates);
         // println!("{:#?}", self.routes.keys());
         // println!("{:#?}", self.content.templates.keys());
         // println!("{:?}", header.path);
-        if let Some(route) = self.routes.get(&header.path)
-            && let Some(template) = self.content.templates.get_mut(route)
-        {
-            println!("Serving page: {:?}", route);
-            Ok(AssetData::Html(template.render(&self.content.templates_context)?))
-        } else if let Some(fallback) = &self.fallback
-            && let Some(fallback_template) = self.content.templates.get_mut(fallback)
-        {
-            println!("Path {} not found, serving fallback {fallback}", header.path);
-            Ok(AssetData::Html(fallback_template.render(&self.content.templates_context)?))
-        } else {
-            Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned()))
+
+        match self.static_routes.get(&header.path) {
+            Some(route) if let Some(cached) = &route.cached_page => {
+                println!("Serving cached page {}", header.path);
+
+                Ok(AssetData::Html(cached.to_string()))
+            }
+            Some(route) if let Some(template) = self.content.templates.get(&route.path) => {
+                println!("Serving page {}", header.path);
+                let page = template.render(&mut self.context)?;
+                Ok(AssetData::Html(page))
+            }
+            _ => match self.dynamic_routes.get(&header.path) {
+                Some(dyn_route) if let Some(cached) = &dyn_route.cached_page => {
+                    println!("Serving cached dynamic page {}", header.path);
+
+                    Ok(AssetData::Html(cached.to_string()))
+                }
+                Some(dyn_route) if let Some(template) = self.content.templates.get(&dyn_route.template_path) => {
+                    println!("Serving dynamic page {}", header.path);
+                    self.context.push();
+                    self.context.insert_local(&dyn_route.page_var_name, dyn_route.page_context_var.clone());
+
+                    let page = template.render(&mut self.context)?;
+                    self.context.pop();
+                    Ok(AssetData::Html(page))
+                }
+                None if let Some(fallback) = &self.fallback
+                    && let Some(fallback_template) = self.content.templates.get_mut(fallback) =>
+                {
+                    println!("Path {} not found, serving fallback {fallback}", header.path);
+                    Ok(AssetData::Html(fallback_template.render(&mut self.context)?))
+                }
+                _ => Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned())),
+            },
         }
     }
 
@@ -1406,10 +1485,19 @@ impl HttpServer {
 
         let mut it = 0;
 
-        println!("Routes:");
-        for (route, page) in &router.routes {
-            println!(" {route}\t\t->\t{page}");
+        println!("Static Routes:");
+        for (route, page) in &router.static_routes {
+            println!(" {route}\t\t->\t{}", page.path);
         }
+        println!("Dynamic Routes:");
+        for (route, page) in &router.dynamic_routes {
+            println!(" {route}\t\t->\t{}", page.template_path);
+        }
+        println!("Assets");
+        for (route, asset) in &router.content.assets.collect_kv_mut() {
+            println!(" {route:?}\t\t->\t{}", asset.data.typ());
+        }
+
         println!(" Fallback\t->\t{:?}", router.fallback);
 
         'main: loop {
@@ -1423,7 +1511,6 @@ impl HttpServer {
             }
 
             if let Ok((mut stream, peer_addr)) = listener.accept() {
-                println!("[{peer_addr}] Connected");
                 stream.set_nonblocking(true).expect("Failed to change blocking of stream");
 
                 let n = loop {
@@ -1458,12 +1545,13 @@ impl HttpServer {
                         is_ws = true;
                     }
                     path => {
-                        let res = if path.starts_with("/assets") {
-                            router.serve_asset(header, body)
-                        } else if path.starts_with("/api") {
+                        let res = if path.starts_with("/api") {
                             router.serve_api(header, body)
                         } else {
-                            router.serve_page(header, body)
+                            match router.content.assets.get(&header.path) {
+                                Some(asset) => Ok(asset.data),
+                                None => router.serve_page(header, body),
+                            }
                         };
 
                         let bytes = match res {
@@ -1491,6 +1579,7 @@ impl HttpServer {
             {
                 if check_fs_timer.elapsed() > Duration::from_millis(100) {
                     check_fs_timer = Instant::now();
+
                     router.content.check_update();
                 }
 
@@ -1534,7 +1623,8 @@ enum AssetTyp {
     Js = 4,
     Png = 5,
     Md = 6,
-    Unknown = 7,
+    Ico = 7,
+    Unknown = 8,
 }
 
 impl AssetTyp {
@@ -1550,6 +1640,7 @@ impl AssetTyp {
             Some("js") => AssetTyp::Js,
             Some("png") => AssetTyp::Png,
             Some("md") => AssetTyp::Md,
+            Some("ico") => AssetTyp::Ico,
             _ => AssetTyp::Unknown,
         }
     }
@@ -1579,6 +1670,7 @@ enum AssetData {
     Css(String),
     Js(String),
     Png(Vec<u8>),
+    Ico(Vec<u8>),
     Md(String),
     Unknown(String),
     Empty,
@@ -1588,13 +1680,14 @@ impl AssetData {
     fn len(&self) -> usize {
         match self {
             AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::Md(s) | AssetData::Unknown(s) => s.len(),
-            AssetData::Png(bytes) => bytes.len(),
+            AssetData::Png(bytes) | AssetData::Ico(bytes) => bytes.len(),
             AssetData::Empty => 0,
         }
     }
     fn read_asset(path: &Path) -> Result<AssetData, io::Error> {
         let content = match path.extension().and_then(|s| s.to_str()) {
             Some("png") => AssetData::Png(fs::read(path)?),
+            Some("ico") => AssetData::Ico(fs::read(path)?),
             Some("md") => {
                 let markdown = fs::read_to_string(path)?;
                 let html = MarkdownParser::html(MarkdownParser::parse(&markdown));
@@ -1616,6 +1709,7 @@ impl AssetData {
             AssetData::Css(_) => "text/css",
             AssetData::Js(_) => "text/javascript",
             AssetData::Png(_) => "image/png",
+            AssetData::Ico(_) => "image/ico",
             AssetData::Md(_) => "text/plain",
             AssetData::Unknown(_) => "text/plain",
             AssetData::Empty => "",
@@ -1625,6 +1719,7 @@ impl AssetData {
     fn from_asset_type(buffer: &[u8], content_typ: &AssetTyp) -> AssetData {
         match content_typ {
             AssetTyp::Png => AssetData::Png(buffer.to_vec()),
+            AssetTyp::Ico => AssetData::Ico(buffer.to_vec()),
             AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).to_string()),
@@ -1636,28 +1731,17 @@ impl AssetData {
 
     fn as_bytes(&self) -> &[u8] {
         match self {
-            AssetData::Png(b) => b,
+            AssetData::Png(b) | AssetData::Ico(b) => b,
             AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::Md(s) | AssetData::Unknown(s) => s.as_bytes(),
             AssetData::Empty => &[],
         }
     }
 }
 
-// Err(e) => {
-//   println!("{e}");
-//   continue;
-// }
-
-#[derive(Default, Debug)]
-struct TrieNode {
-    asset: Option<Asset>,
-    children: HashMap<String, TrieNode>,
-}
 #[derive(Debug)]
 struct Content {
-    assets: AssetTrie,
+    assets: Trie<Asset>,
     templates: HashMap<String, Template>,
-    templates_context: HashMap<String, TemplateValue>,
     reload: bool,
 }
 
@@ -1666,29 +1750,25 @@ impl Content {
         #[cfg(generated)]
         let mut assets = load_embedded_assets()?;
         #[cfg(generated)]
-        let (templates, templates_context) = load_embedded_templates()?;
+        let templates = load_embedded_templates()?;
 
         #[cfg(not(generated))]
         // Stub to make the compiler happy
-        let mut assets = AssetTrie::new();
+        let mut assets = Trie::new();
         #[cfg(not(generated))]
         let templates = HashMap::new();
-        #[cfg(not(generated))]
-        let templates_context = HashMap::new();
 
         let generated = Self::compile_generated_assets(&mut assets); // TODO
         // assets
-        println!("Loaded ");
         Ok(Self {
             assets,
             templates,
-            templates_context,
             reload: false,
         })
     }
 
-    fn compile_generated_assets(assets: &mut AssetTrie) -> AssetTrie {
-        let mut generated_assets = AssetTrie::new();
+    fn compile_generated_assets(assets: &mut Trie<Asset>) -> Trie<Asset> {
+        let mut generated_assets = Trie::new();
 
         for (path, asset) in assets.collect_kv_mut() {
             match &asset.data {
@@ -1696,7 +1776,7 @@ impl Content {
                     let html = MarkdownParser::html(MarkdownParser::parse(content));
                     asset.internal = true;
                     generated_assets.insert(
-                        path,
+                        path.to_string_lossy().into_owned(),
                         Asset {
                             last_modified: SystemTime::now(),
                             data: AssetData::Html(html),
@@ -1723,56 +1803,51 @@ impl Content {
 
     fn update_templates(&mut self) -> Result<(), TemplateError> {
         let paths = walk_dir(TEMPLATES_PATH);
+        let mut is_new = true;
+        // println!("{:?}", self.templates.keys());
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
-            let path_str = path.strip_prefix(TEMPLATES_PATH)?.to_string_lossy().to_string();
+            let path_str = path.to_string_lossy().to_string();
+            let key_path = path_str.strip_prefix(TEMPLATES_PATH).expect("invariant");
 
-            // Update normal template
-            match self.templates.get_mut(&path_str) {
-                Some(template) => {
+            for (key, template) in self.templates.iter_mut() {
+                // println!("{} {} {:?}",key, path_str, template.origin_file);
+                if template.origin_file == path_str {
+                    is_new = false;
                     if template.last_modified < last_modified {
                         Template::update_from_path(template, path)?;
                         self.reload = true;
                         println!(
-                            "Updated template {:?}, last edited {} minutes ago",
-                            path,
-                            last_modified.elapsed().unwrap().as_secs() / 60
+                            "Updated template {:?}, for page: {key:?}",
+                            path_str,
+                            // last_modified.elapsed().unwrap().as_secs() / 60
                         );
                     }
                 }
-                None => {
-                    let template = Template::from_path(path)?;
-                    println!("Added template {path_str:?}");
-                    self.templates.insert(path_str.clone(), template);
-                }
             }
-            let mut path_segment = path
-              .strip_prefix(TEMPLATES_PATH)?
-              .to_path_buf();
-        
-            path_segment.set_extension("");
-            let path_segment = path_segment.strip_prefix("pages").unwrap_or(path_segment.as_path());
 
-            let path_segment = path_segment
-              .to_string_lossy()
-              .to_string();
-
-            let prefix = format!("/generated/{path_segment}");
-
-
-            // Update dynamic templates
-            println!("path_str: {:?}", &prefix);
+            if is_new {
+                let template = Template::from_path(path)?;
+                println!("Added template {path_str:?}");
+                self.templates.insert(path_str.clone(), template);
+            }
         }
         Ok(())
     }
 
     fn update_assets(&mut self) -> Result<(), TemplateError> {
-        let paths = walk_dir(ASSETS_PATH);
+        let mut paths = walk_dir(ASSETS_PATH);
 
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
+            let key_path = format!(
+                "/{}",
+                path.strip_prefix(ASSETS_PATH)
+                    .expect("Failed to strip prefix")
+                    .to_string_lossy()
+            );
 
-            match self.assets.get_ref_mut(path) {
+            match self.assets.get_ref_mut(&key_path) {
                 Some(existing_asset) if last_modified > existing_asset.last_modified => {
                     existing_asset.data = AssetData::read_asset(path)?;
                     existing_asset.last_modified = last_modified;
@@ -1788,7 +1863,7 @@ impl Content {
                 None => {
                     let asset = AssetData::read_asset(path)?;
                     self.assets.insert(
-                        path.clone(),
+                        key_path.clone(),
                         Asset {
                             last_modified,
                             data: asset,
@@ -1796,11 +1871,20 @@ impl Content {
                         },
                     );
                     self.reload = true;
-                    println!("Added file {:?}", path);
+                    println!("Added file {:?}", key_path);
                 }
             }
         }
-        if self.assets.remove_other_than_except_generated(paths) {
+        let str_paths = paths
+            .iter()
+            .map(|p| {
+                format!(
+                    "/{}",
+                    p.strip_prefix(ASSETS_PATH).expect("Failed to strip prefix").to_string_lossy()
+                )
+            })
+            .collect(); // Todo unfuck
+        if self.assets.remove_other_than_except_generated(str_paths) {
             self.reload = true;
         }
         Ok(())
@@ -1836,24 +1920,42 @@ fn walk_dir<P: AsRef<Path> + Debug>(rootdir: P) -> Vec<PathBuf> {
     asset_paths
 }
 
-#[derive(Default, Debug)]
-struct AssetTrie {
-    root: TrieNode,
-    paths: HashSet<PathBuf>,
+#[derive(Debug)]
+struct TrieNode<T> {
+    asset: Option<T>,
+    children: HashMap<String, TrieNode<T>>,
 }
 
-impl AssetTrie {
+impl<T> Default for TrieNode<T> {
+    fn default() -> Self {
+        Self {
+            asset: None,
+            children: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct Trie<T> {
+    root: TrieNode<T>,
+    paths: HashSet<String>,
+}
+
+impl<T> Trie<T>
+where
+    T: Clone,
+{
     fn new() -> Self {
-        AssetTrie {
+        Trie {
             root: TrieNode::default(),
             paths: HashSet::new(),
         }
     }
 
-    fn insert(&mut self, path: PathBuf, asset: Asset) {
+    fn insert(&mut self, path: String, asset: T) {
         let mut current_node = &mut self.root;
 
-        for component in path.components() {
+        for component in PathBuf::from(path.clone()).components() {
             let key = component.as_os_str().to_string_lossy().to_string();
             current_node = current_node.children.entry(key).or_default();
         }
@@ -1861,43 +1963,44 @@ impl AssetTrie {
         self.paths.insert(path);
     }
 
-    fn get_ref_mut(&mut self, path: &Path) -> Option<&mut Asset> {
+    fn get_ref_mut(&mut self, path: &String) -> Option<&mut T> {
         let mut current_node = &mut self.root;
 
-        for component in path.components() {
+        for component in PathBuf::from(path).components() {
             let key = component.as_os_str().to_string_lossy().to_string();
             match current_node.children.get_mut(&key) {
                 Some(node) => current_node = node,
-                None => break,
+                None => return None,
             }
         }
 
         current_node.asset.as_mut()
     }
 
-    fn get(&self, path: &Path) -> Option<Asset> {
+    fn get(&self, path: &String) -> Option<T> {
         let mut current_node = &self.root;
 
-        for component in path.components() {
+        for component in PathBuf::from(path).components() {
             let key = component.as_os_str().to_string_lossy().to_string();
             match current_node.children.get(&key) {
                 Some(node) => current_node = node,
-                None => break,
+                None => return None,
             }
         }
 
         current_node.asset.clone()
     }
 
-    fn get_partial(&self, path: &Path) -> Vec<&Asset> {
+    // gets everything from path downwards
+    fn get_partial(&self, path: &String) -> Vec<&T> {
         let mut current_node = &self.root;
 
-        for component in path.components() {
+        for component in PathBuf::from(path).components() {
             let key = component.as_os_str().to_string_lossy();
 
             match current_node.children.get(key.as_ref()) {
                 Some(node) => current_node = node,
-                None => break,
+                None => return vec![],
             }
         }
 
@@ -1913,7 +2016,7 @@ impl AssetTrie {
         result
     }
     // TODO less dirty
-    fn collect_kv_mut(&mut self) -> Vec<(PathBuf, &mut Asset)> {
+    fn collect_kv_mut(&mut self) -> Vec<(PathBuf, &mut T)> {
         let mut result = Vec::new();
 
         Self::dfs(&mut self.root, &mut PathBuf::new(), &mut result);
@@ -1921,7 +2024,7 @@ impl AssetTrie {
         result
     }
 
-    fn dfs<'a>(node: &'a mut TrieNode, path: &mut PathBuf, result: &mut Vec<(PathBuf, &'a mut Asset)>) {
+    fn dfs<'a>(node: &'a mut TrieNode<T>, path: &mut PathBuf, result: &mut Vec<(PathBuf, &'a mut T)>) {
         if let Some(asset) = node.asset.as_mut() {
             result.push((path.clone(), asset));
         }
@@ -1933,10 +2036,10 @@ impl AssetTrie {
         }
     }
 
-    fn contains(&self, path: &Path) -> bool {
+    fn contains(&self, path: &String) -> bool {
         let mut current_node = &self.root;
 
-        for component in path.components() {
+        for component in PathBuf::from(path).components() {
             let key = component.as_os_str().to_string_lossy().to_string();
             match current_node.children.get(&key) {
                 Some(node) => current_node = node,
@@ -1947,10 +2050,10 @@ impl AssetTrie {
         current_node.asset.is_some()
     }
 
-    fn remove(&mut self, path: &Path) -> bool {
+    fn remove(&mut self, path: &String) -> bool {
         let mut current_node = &mut self.root;
 
-        for component in path.components() {
+        for component in PathBuf::from(path).components() {
             let key = component.as_os_str().to_string_lossy().to_string();
             if let Some(node) = current_node.children.get_mut(&key) {
                 current_node = node;
@@ -1964,15 +2067,15 @@ impl AssetTrie {
         // TODO remove the emtpy data nodes left behind
         true
     }
-    fn remove_other_than_except_generated(&mut self, current_paths: Vec<PathBuf>) -> bool {
-        let current_paths_set: HashSet<PathBuf> = current_paths.into_iter().collect();
+    fn remove_other_than_except_generated(&mut self, current_paths: Vec<String>) -> bool {
+        let current_paths_set: HashSet<String> = current_paths.into_iter().collect();
 
-        let paths_to_delete: Vec<PathBuf> = self.paths.difference(&current_paths_set).cloned().collect();
+        let paths_to_delete: Vec<String> = self.paths.difference(&current_paths_set).cloned().collect();
 
         let mut changed = false;
 
         for path in &paths_to_delete {
-            if path.to_string_lossy().starts_with("/generated") {
+            if path.starts_with("/generated") {
                 continue;
             };
             println!("Removed file {:?}", path);

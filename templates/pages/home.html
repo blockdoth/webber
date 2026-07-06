@@ -1,4 +1,5 @@
 <head>
+
   {{if hotreload}}
   <script>
     const ws = new WebSocket("ws://127.0.0.1:4000/ws");
@@ -10,25 +11,7 @@
     }
     </script>
   {{endIf}}  
+
 </head>
 
-titleee
-
-{{if balls }}
-<h1>has balls</h1>
-{{else}}   
-<h1>no balls</h1>
-{{endElse}}  
-
-{{variable}}
-
-<h1>Loop:</h1>
-{{for post in posts.posts}}
-
-{{if post.display }}
-<h1>condition in for loop</h1>
-{{endIf}}  
-
-<p>{{post.title}}</p>
-<p>{{post.intro}}</p>
-{{endFor}}
+<h1>homses</h1>

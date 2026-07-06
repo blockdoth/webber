@@ -1,5 +1,22 @@
+<head>
+
+  {{if hotreload}}
+  <script>
+    const ws = new WebSocket("ws://127.0.0.1:4000/ws");
+    ws.onopen = () => console.log("Websocket connected!");
+    ws.onmessage = (event) => {
+      if ( event.data == "reload" ) {
+        window.location.reload();
+      };
+    }
+    </script>
+  {{endIf}}  
+
+</head>
+
 <h1>All posts</h1>
 
 <h2>{{post.title}}</h2>
 <p>{{post.intro}}</p>
-testsadasd
+
+asdas
