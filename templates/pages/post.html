@@ -1,9 +1,22 @@
 {{extends "layout.html"}}
 
-{{block body}}
-<h1>All posts</h1>
 
-<h2>{{post.title}}</h2>
-<p>{{post.intro}}</p>
+{{block css}}
+<style>
+  .post {
+    padding: 20px;
+    
+  }
+
+</style>
+{{endBlock}}
+
+{{block body}}
+<div class="post">
+  <h2>{{post.title}}</h2>
+  <p>{{post.intro}}</p>
+
+
+</div>
 
 {{endBlock}}

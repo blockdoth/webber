@@ -1,12 +1,35 @@
 {{extends "layout.html"}}
 
+
+{{block css}}
+<style>
+  .post_entry {
+    border: 1px solid white;
+
+    padding: 10px;
+    margin: 20px;
+  }  
+  .post_intro {
+    font-style: italic;
+    color: gray;
+  }
+
+</style>
+{{endBlock}}
+
+
 {{block body}}
 
 {{for post in posts}}
+<div class="post_entry">
 
+  <a href="/posts/{{post.slug}}">{{post.title}}</a>
+  <div class="post_intro">
+    {{post.intro}}
 
-<a href="/posts/{{post.slug}}">{{post.title}}</a>
-<p>{{post.intro}}</p>
+  </div>
+</div>
+
 
 {{endFor}}
 

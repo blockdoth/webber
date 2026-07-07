@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use std::vec::IntoIter;
@@ -33,13 +34,14 @@ fn main() -> Result<(), TemplateError> {
         let content = Content::load_embedded()?;
 
         println!("Static/Generated asset count: {:?}/{:?}", content.assets.len(), content.templates.len());
-        let context = initial_context();
+        let context = Context::load_intial();
 
         let router = Router::new(content, context)
             .route_static_hidden("/layout", "layout.html")
-            .route_static_page("/home", "pages/home.html")
-            .route_static_page("/about", "pages/about.html")
+            .route_static_hidden("/home", "pages/home.html")
             .route_static_page("/posts", "pages/posts.html")
+            .route_static_page("/about", "pages/about.html")
+            .route_static_page("/qoutes", "pages/quotes.html")
             .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
             .fallback("/home");
 
@@ -51,33 +53,43 @@ fn main() -> Result<(), TemplateError> {
     Ok(())
 }
 
-fn initial_context() -> Context {
-    let posts = vec![
-        Post {
-            slug: "title-1".to_string(),
-            title: "title 1".to_string(),
-            intro: "intro 1".to_string(),
-            display: false,
-        },
-        Post {
-            slug: "title-2".to_string(),
-            title: "title 2".to_string(),
-            intro: "intro 2".to_string(),
-            display: true,
-        },
-    ];
+impl Context {
+    fn load_intial() -> Context {
+        let posts = vec![
+            Post {
+                slug: "title-1".to_string(),
+                title: "title 1".to_string(),
+                intro: "intro 1".to_string(),
+                display: false,
+            },
+            Post {
+                slug: "title-2".to_string(),
+                title: "title 2".to_string(),
+                intro: "intro 2".to_string(),
+                display: true,
+            },
+        ];
 
-    let mut context = Context::new();
+        let mut context = Context::new();
 
-    context.insert_global("posts", posts.to_template_value());
+        context.insert_global("posts", posts.to_template_value());
+        context.insert_global("copyright_start", TemplateValue::Text("2026".to_string()));
+        context.insert_global("copyright_end", TemplateValue::Text("2026".to_string())); // TODO make dynamic
 
-    #[cfg(debug_assertions)]
-    let hotreload = true;
-    #[cfg(not(debug_assertions))]
-    let hotreload = false;
-    context.insert_global("hotreload", hotreload.to_template_value());
+        #[cfg(generated)]
+        {
+            context.insert_global("git_hash_short", TemplateValue::Text(GIT_HASH_SHORT.to_string()));
+            context.insert_global("git_hash_long", TemplateValue::Text(GIT_HASH_LONG.to_string()));
+        }
 
-    context
+        #[cfg(debug_assertions)]
+        let hotreload = true;
+        #[cfg(not(debug_assertions))]
+        let hotreload = false;
+        context.insert_global("hotreload", hotreload.to_template_value());
+
+        context
+    }
 }
 
 fn comptime() {
@@ -109,6 +121,7 @@ fn comptime() {
         let content_str = match asset_path.extension().and_then(|s| s.to_str()) {
             Some("png") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
             Some("ico") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
+            Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
             Some("md") => &format!("AssetData::Html(MarkdownParser::html(MarkdownParser::parse(include_str!({global_path:?}))))"),
             Some("html") => &format!("AssetData::Html(include_str!({global_path:?}))"),
             Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
@@ -159,8 +172,33 @@ fn comptime() {
     out.push_str("\tOk(templates)\n");
     out.push_str("}\n");
 
+    let (short, long) = get_commit_hash();
+
+    out.push_str(&format!("const GIT_HASH_SHORT:&str = {short:?};\n"));
+    out.push_str(&format!("const GIT_HASH_LONG:&str = {long:?};\n"));
+
     fs::write(&file_path, out).unwrap();
     println!("cargo:warning=End of build script");
+}
+
+fn get_commit_hash() -> (String, String) {
+    let short = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .expect("unable to get git hash");
+
+    let long = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .expect("unable to get git hash");
+
+    (short, long)
 }
 
 // === Templating ===
@@ -1080,6 +1118,7 @@ impl Template {
         let (extends, new_template) = TemplateParser::lex(&template_str, &path_string).parse()?;
         let required_variables = Self::get_required_vars(&new_template);
 
+        template.blocks = Self::get_blocks(&new_template);;
         template.template = new_template;
         template.parent = extends;
         template.required_variables = required_variables;
@@ -1095,17 +1134,7 @@ impl Template {
         //     print!("{}", i.data);
         // }
         let required_variables = Self::get_required_vars(&template_nodes);
-        let blocks = template_nodes
-            .iter()
-            .filter_map(|node| {
-                if let TemplateNodeData::Block { ident, body } = &node.data {
-                    Some((ident.clone(), body.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
+        let blocks = Self::get_blocks(&template_nodes);
         Ok(Template {
             template: template_nodes,
             parent: extends,
@@ -1230,6 +1259,18 @@ impl Template {
             .filter_map(|node| {
                 if let TemplateNodeData::Variable(fields) = &node.data {
                     Some(fields.join("."))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn get_blocks(ast: &[TemplateNode]) -> HashMap<String, Vec<TemplateNode>> {
+        ast.iter()
+            .filter_map(|node| {
+                if let TemplateNodeData::Block { ident, body } = &node.data {
+                    Some((ident.clone(), body.clone()))
                 } else {
                     None
                 }
@@ -1398,7 +1439,6 @@ impl Router {
         let route = StaticRoute::new(template, false);
         self.static_routes.insert(path.into(), route.clone());
         let name = path.split("/").last().expect("valid path");
-
 
         let obj = TemplateValue::Object(hash_map! {
           "url".to_string() => TemplateValue::Text(path.to_string()),
@@ -1610,7 +1650,7 @@ impl HttpServer {
         {
             let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
             let websocket_accept = base64(&sha1(format!("{}{magic_string}", sec_websocket_key.trim())));
-            println!("Succeeded");
+            // println!("Succeeded");
             format!(
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
             )
@@ -1650,8 +1690,13 @@ impl HttpServer {
 
         let body = content.as_bytes();
 
+        let cache_control = match content {
+            AssetData::Png(_) | AssetData::Ico(_) | AssetData::Css(_) | AssetData::Js(_) => "Cache-Control: public, max-age=3600\r\n",
+            _ => "",
+        };
+
         let mut res = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{cache_control}Connection: close\r\n\r\n",
             content.typ(),
             body.len()
         )
@@ -1785,7 +1830,7 @@ impl HttpServer {
                 match header.path.as_str() {
                     #[cfg(debug_assertions)]
                     "/ws" => {
-                        print!("[{peer_addr:?}] Upgrading websocket ... ");
+                        // print!("[{peer_addr:?}] Upgrading websocket ... ");
                         let response = HttpServer::upgrade_websocket(header);
                         stream.write_all(&response).expect("Failed to write to stream");
                         stream.flush().expect("Failed to flush stream");
@@ -1824,7 +1869,7 @@ impl HttpServer {
                     if is_ws {
                         // thread::sleep(Duration::from_secs(2));
                         active_streams.push(stream);
-                        println!("Active connections {}", active_streams.len());
+                        // println!("Active connections {}", active_streams.len());
                     }
                 }
             }
@@ -1854,7 +1899,7 @@ impl HttpServer {
                             // println!("[{peer_addr:?}] Connection still alive");
                             true
                         } else {
-                            println!("Closing connection");
+                            // println!("Closing connection");
                             let _ = stream.shutdown(std::net::Shutdown::Both);
 
                             false
@@ -1871,14 +1916,15 @@ impl HttpServer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AssetTyp {
-    Text = 1,
-    Html = 2,
-    Css = 3,
-    Js = 4,
-    Png = 5,
-    Md = 6,
-    Ico = 7,
-    Unknown = 8,
+    Text,
+    Html,
+    Css,
+    Js,
+    Png,
+    Md,
+    Ico,
+    Woff2,
+    Unknown,
 }
 
 impl AssetTyp {
@@ -1895,6 +1941,7 @@ impl AssetTyp {
             Some("png") => AssetTyp::Png,
             Some("md") => AssetTyp::Md,
             Some("ico") => AssetTyp::Ico,
+            Some("woff2") => AssetTyp::Woff2,
             _ => AssetTyp::Unknown,
         }
     }
@@ -1926,6 +1973,7 @@ enum AssetData {
     Png(Vec<u8>),
     Ico(Vec<u8>),
     Md(String),
+    Woff2(Vec<u8>),
     Unknown(String),
     Empty,
 }
@@ -1934,7 +1982,7 @@ impl AssetData {
     fn len(&self) -> usize {
         match self {
             AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::Md(s) | AssetData::Unknown(s) => s.len(),
-            AssetData::Png(bytes) | AssetData::Ico(bytes) => bytes.len(),
+            AssetData::Png(bytes) | AssetData::Ico(bytes) | AssetData::Woff2(bytes) => bytes.len(),
             AssetData::Empty => 0,
         }
     }
@@ -1965,6 +2013,7 @@ impl AssetData {
             AssetData::Png(_) => "image/png",
             AssetData::Ico(_) => "image/ico",
             AssetData::Md(_) => "text/plain",
+            AssetData::Woff2(_) => "font/woff2",
             AssetData::Unknown(_) => "text/plain",
             AssetData::Empty => "",
         }
@@ -1974,6 +2023,7 @@ impl AssetData {
         match content_typ {
             AssetTyp::Png => AssetData::Png(buffer.to_vec()),
             AssetTyp::Ico => AssetData::Ico(buffer.to_vec()),
+            AssetTyp::Woff2 => AssetData::Woff2(buffer.to_vec()),
             AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).to_string()),
@@ -1985,7 +2035,7 @@ impl AssetData {
 
     fn as_bytes(&self) -> &[u8] {
         match self {
-            AssetData::Png(b) | AssetData::Ico(b) => b,
+            AssetData::Png(b) | AssetData::Ico(b) | AssetData::Woff2(b) => b,
             AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::Md(s) | AssetData::Unknown(s) => s.as_bytes(),
             AssetData::Empty => &[],
         }
@@ -2071,6 +2121,7 @@ impl Content {
                     if template.last_modified < last_modified {
                         Template::update_from_path(template, path)?;
                         self.reload = true;
+
                         println!(
                             "Updated template {:?}, for page: {key:?}",
                             path_str,

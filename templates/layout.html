@@ -11,14 +11,144 @@
     }
     </script>
   {{endIf}}  
+    <!-- global css -->
+    <style>
 
+      @font-face {
+        font-family: 'JetBrains Mono';
+        src: url('/fonts/JetBrainsMono-Regular.woff2') format('woff2');
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        font-family: 'JetBrains Mono', monospace;
+      }
+
+      html {
+        height: 100%;
+      }
+
+
+      body {
+        background-color: black;
+        font-family: Arial, sans-serif;
+        color: white;
+        height: 100%;    
+      }
+      
+      .container {
+        min-height: 100%;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+      }
+
+      h1 {
+        text-align: center;
+      }
+
+      p {
+        font-size: 20px;
+      }
+
+      .logo {
+
+        height: 100%;
+      }
+      .logo_placeholder {
+        height: 2rem;
+      }      
+
+      .nav {
+        border-color: white;
+        border-bottom: 2px solid white;
+        font-size: 24px;
+        background-color: black;
+        display: flex;
+         
+        gap: 1.5rem;       
+        align-items: bottom;         
+      }
+      
+      .nav_button {
+        color: white;
+        text-decoration:none;
+        align-items: center;      
+        padding-inline:10px;   
+      }
+      
+      .nav_button:hover {
+        color: black;
+        background-color: white;
+      }     
+      
+      .logo_container {
+        display: inline-flex;
+        /* align-items: center; */
+        /* gap: 0.5rem; */
+        text-decoration: none;
+        color: inherit;     
+      }
+
+    
+
+      .content {
+
+      }
+
+      .footer {
+        font-size: 12px;
+        color: gray;
+        text-align: center;
+      }
+
+
+    </style>
+    <!-- local css -->
+    {{block css}} 
+      
+    {{endBlock}}
 </head>
 
 <body>
-    {{for page in pages-static}}
-      <a href="{{page.url}}">{{page.name}}</a>
-    {{endFor}}
+    <div class="container">
     
-    {{block title}} <h1>default</h1> {{endBlock}}
-    {{block body}} <h1>default</h1> {{endBlock}}
+      <div class="nav">
+
+        <a href="/home" class="logo_container">
+          <div class = "logo_placeholder">
+            <img 
+              src="/images/image.png" 
+              class="logo"
+              decoding="async"
+              fetchpriority="low"              
+              >
+          </div>
+          
+          <div class="nav_button">
+            blockdoth
+          </div>
+
+        </a>
+
+        {{for page in pages-static}}
+
+
+        <a href="{{page.url}}" class="nav_button" >{{page.name}}</a>
+        {{endFor}}
+      </div>
+
+      <div class="content">
+        {{block body}} {{endBlock}}
+      </div>
+
+      <div class="footer">
+        <hr>
+        <p>
+          Copyright {{copyright_start}}-{{copyright_end}} 
+          blockdoth
+          Served by <a href="https://github.com/blockdoth/webber/">webber</a> version: <a href="https://github.com/blockdoth/webber/commit/{{git_hash_long}}">{{git_hash_short}}</a>
+        </p>
+      </div>
+    </div>
 </body>
