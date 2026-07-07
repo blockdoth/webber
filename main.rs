@@ -2,6 +2,7 @@
 #![feature(if_let_guard)]
 #![allow(unused, unused_mut)]
 
+use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -542,7 +543,6 @@ impl TemplateParser {
     fn lex(input_str: &str, path_string: &str) -> Self {
         let lexed = Self::lex_template(input_str, path_string);
 
-
         // println!("File: {}", path_string);
         // for i in &lexed {
         //     println!("\t{:?}", i.kind);
@@ -721,11 +721,11 @@ impl TemplateParser {
                 if start_ident != end_ident {
                     let ident = input[start_ident..end_ident].trim().to_string();
                     if !ident.is_empty() {
-                      lexed.push(TemplateToken {
-                          kind: Identifier(ident),
-                          metadata: metadata.clone(),
-                      });
-                  }
+                        lexed.push(TemplateToken {
+                            kind: Identifier(ident),
+                            metadata: metadata.clone(),
+                        });
+                    }
                 }
                 lexed.push(TemplateToken {
                     kind: tok,
@@ -740,11 +740,11 @@ impl TemplateParser {
             let ident = input[start_ident..].trim().to_string();
 
             if !ident.is_empty() {
-              lexed.push(TemplateToken {
-                  kind: Identifier(ident),
-                  metadata: metadata.clone(),
-              });
-          }
+                lexed.push(TemplateToken {
+                    kind: Identifier(ident),
+                    metadata: metadata.clone(),
+                });
+            }
         }
         lexed
     }
@@ -1316,6 +1316,45 @@ impl Context {
 }
 
 #[derive(Debug)]
+struct Stats {
+    start_time: SystemTime,
+    request_stats: HashMap<String, RequestStats>,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            start_time: SystemTime::now(),
+            request_stats: HashMap::new(),
+        }
+    }
+    fn add_hit(&mut self, key: &str, request_duration: Duration) {
+        let current = self.request_stats.entry(key.to_string()).or_insert_with(RequestStats::new);
+
+        current.count += 1;
+        current.total_time += request_duration;
+    }
+}
+
+#[derive(Debug)]
+struct RequestStats {
+    count: u32,
+    total_time: Duration,
+}
+
+impl RequestStats {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            total_time: Duration::ZERO,
+        }
+    }
+    fn avg(&self) -> Duration {
+        self.total_time / self.count
+    }
+}
+
+#[derive(Debug)]
 struct DynamicRoute {
     base_url: String,
     page_list_name: String,
@@ -1344,7 +1383,7 @@ impl StaticRoute {
 struct Router {
     content: Content,
     context: Context,
-
+    stats: Stats,
     static_routes: HashMap<String, StaticRoute>,
     dynamic_routes: HashMap<String, DynamicRoute>,
 
@@ -1359,6 +1398,7 @@ impl Router {
             static_routes: HashMap::new(),
             dynamic_routes: HashMap::new(),
             fallback: None,
+            stats: Stats::new()
         }
     }
 
@@ -1405,7 +1445,7 @@ impl Router {
         self
     }
 
-    fn serve_page(&mut self, header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_page(&mut self, header: &HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         // println!("{:#?}", self.templates);
         // println!("{:#?}", self.routes.keys());
         // println!("{:#?}", self.content.templates.keys());
@@ -1418,7 +1458,7 @@ impl Router {
                 Ok(AssetData::Html(cached.to_string()))
             }
             Some(route) => {
-                println!("Serving page {}", header.path);
+                // println!("Serving page {}", header.path);
                 let page = Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
                 Ok(AssetData::Html(page))
             }
@@ -1438,10 +1478,9 @@ impl Router {
                     Ok(AssetData::Html(page))
                 }
 
-                None if let Some(fallback) = &self.fallback =>
-                {
+                None if let Some(fallback) = &self.fallback => {
                     println!("Path {} not found, redirecting to {fallback}", header.path);
-                    
+
                     Err(HttpServerError::Redirect(fallback.to_string()))
                 }
                 _ => Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned())),
@@ -1469,7 +1508,7 @@ impl Router {
         }
     }
 
-    fn serve_api(&self, _header: HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_api(&self, _header: &HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
         Err(HttpServerError::Todo)
     }
 }
@@ -1560,7 +1599,7 @@ impl HttpServer {
             println!("Failed");
             Self::build_response(
                 HttpResponseCode::BadRequest,
-                AssetData::Text("Invalid websocket upgrade request".to_owned()),
+                &AssetData::Text("Invalid websocket upgrade request".to_owned()),
             )
         }
     }
@@ -1585,13 +1624,13 @@ impl HttpServer {
         }
     }
 
-    fn build_response(code: HttpResponseCode, content: AssetData) -> Vec<u8> {
+    fn build_response(code: HttpResponseCode, content: &AssetData) -> Vec<u8> {
         let status = code.to_string();
 
         let body = content.as_bytes();
 
         let mut res = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             content.typ(),
             body.len()
         )
@@ -1710,18 +1749,18 @@ impl HttpServer {
                         _ => continue,
                     };
                 };
-
+                let start_timer = Instant::now();
                 let (header, body) = HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
 
-                println!(
-                    "[{peer_addr}] Received {:?} request for {:?} of length {}",
-                    header.typ,
-                    header.path,
-                    body.len()
-                );
+                // println!(
+                //     "[{peer_addr}] Received {:?} request for {:?} of length {}",
+                //     header.typ,
+                //     header.path,
+                //     body.len()
+                // );
 
                 let mut is_ws = false;
-
+                
                 match header.path.as_str() {
                     #[cfg(debug_assertions)]
                     "/ws" => {
@@ -1732,26 +1771,31 @@ impl HttpServer {
                         is_ws = true;
                     }
                     path => {
-                        let res = if path.starts_with("/api") {
-                            router.serve_api(header, body)
+                        let res: Result<Cow<'_, AssetData>, HttpServerError> = if path.starts_with("/api") {
+                            router.serve_api(&header, body).map(Cow::Owned)
                         } else {
-                            match router.content.assets.get(&header.path) {
-                                Some(asset) => Ok(asset.data),
-                                None => router.serve_page(header, body),
+                            match router.content.assets.get_ref(&header.path) {
+                                Some(asset) => Ok(Cow::Borrowed(&asset.data)),
+                                None => router.serve_page(&header, body).map(Cow::Owned),
                             }
                         };
 
                         let bytes = match res {
-                            Ok(content) => Self::build_response(HttpResponseCode::Ok, content),
+                            Ok(content) => Self::build_response(HttpResponseCode::Ok, &content),
                             Err(HttpServerError::Redirect(redirect_path)) => {
-                              Self::build_response(HttpResponseCode::RedirectOther(redirect_path), AssetData::Empty)
-                            },
+                                Self::build_response(HttpResponseCode::RedirectOther(redirect_path), &AssetData::Empty)
+                            }
                             Err(err) => {
                                 println!("Server error {err:#?}");
-                                Self::build_response(HttpResponseCode::InternalServer, AssetData::Empty)
+                                Self::build_response(HttpResponseCode::InternalServer, &AssetData::Empty)
                             }
                         };
                         stream.write_all(&bytes).expect("Failed to write to stream");
+                        let end_timer = Instant::now();
+                        let duration = end_timer - start_timer;
+                        router.stats.add_hit(&path, duration);
+                        // println!("served request in {duration:?}")
+
                     }
                 };
 
@@ -2157,7 +2201,7 @@ where
         current_node.asset.as_mut()
     }
 
-    fn get(&self, path: &String) -> Option<T> {
+    fn get_ref(&self, path: &String) -> Option<&T> {
         let mut current_node = &self.root;
 
         for component in PathBuf::from(path).components() {
@@ -2168,7 +2212,7 @@ where
             }
         }
 
-        current_node.asset.clone()
+        current_node.asset.as_ref()
     }
 
     // gets everything from path downwards

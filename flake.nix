@@ -34,6 +34,7 @@
               typst
               nodejs
               
+              wrk # for benchmarking
             ];
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
           };
