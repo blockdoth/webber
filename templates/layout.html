@@ -11,15 +11,13 @@
     }
     </script>
   {{endIf}}  
-  {{block script}} {{endBlock}}
 
 </head>
 
 <body>
-    <a href="/home">home</a>
-    <a href="/posts">posts</a>
-    <a href="/about">posts</a>
-    <a href="/projects">posts</a>
+    {{for page in pages-static}}
+      <a href="{{page.url}}">{{page.name}}</a>
+    {{endFor}}
     
     {{block title}} <h1>default</h1> {{endBlock}}
     {{block body}} <h1>default</h1> {{endBlock}}

@@ -1,7 +1,7 @@
 #![feature(tcp_linger)]
 #![feature(if_let_guard)]
+#![feature(hash_map_macro)]
 #![allow(unused, unused_mut)]
-
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
@@ -31,12 +31,12 @@ fn main() -> Result<(), TemplateError> {
         println!("Running normally");
 
         let content = Content::load_embedded()?;
-        let context = initial_context();
 
         println!("Static/Generated asset count: {:?}/{:?}", content.assets.len(), content.templates.len());
+        let context = initial_context();
 
         let router = Router::new(content, context)
-            .route_static_page("/layout", "layout.html")
+            .route_static_hidden("/layout", "layout.html")
             .route_static_page("/home", "pages/home.html")
             .route_static_page("/about", "pages/about.html")
             .route_static_page("/posts", "pages/posts.html")
@@ -52,36 +52,24 @@ fn main() -> Result<(), TemplateError> {
 }
 
 fn initial_context() -> Context {
-    let posts = TemplateValue::List(
-        [
-            Post {
-                title: "title 1".to_string(),
-                intro: "intro 1".to_string(),
-                display: false,
-            },
-            Post {
-                title: "title 2".to_string(),
-                intro: "intro 2".to_string(),
-                display: true,
-            },
-        ]
-        .iter()
-        .map(|post| {
-            if let TemplateValue::Object(obj) = post.to_template_value() {
-                TemplateValue::DynPageObject {
-                    slug: post.title.replace(" ", "-"),
-                    object: obj,
-                }
-            } else {
-                todo!()
-            }
-        })
-        .collect(),
-    );
+    let posts = vec![
+        Post {
+            slug: "title-1".to_string(),
+            title: "title 1".to_string(),
+            intro: "intro 1".to_string(),
+            display: false,
+        },
+        Post {
+            slug: "title-2".to_string(),
+            title: "title 2".to_string(),
+            intro: "intro 2".to_string(),
+            display: true,
+        },
+    ];
 
     let mut context = Context::new();
 
-    context.insert_global("posts", posts);
+    context.insert_global("posts", posts.to_template_value());
 
     #[cfg(debug_assertions)]
     let hotreload = true;
@@ -183,7 +171,6 @@ enum TemplateValue {
     Bool(bool),
     List(Vec<TemplateValue>),
     Object(HashMap<String, TemplateValue>),
-    DynPageObject { slug: String, object: HashMap<String, TemplateValue> },
 }
 
 #[derive(Clone, Debug)]
@@ -192,7 +179,6 @@ enum TemplateValueKind {
     Bool,
     List,
     Object,
-    DynPageObject,
 }
 
 impl TemplateValue {
@@ -202,7 +188,6 @@ impl TemplateValue {
             TemplateValue::Bool(_) => TemplateValueKind::Bool,
             TemplateValue::List(_) => TemplateValueKind::List,
             TemplateValue::Object(_) => TemplateValueKind::Object,
-            TemplateValue::DynPageObject { .. } => TemplateValueKind::DynPageObject,
         }
     }
 }
@@ -252,13 +237,14 @@ struct BallContainer {
 }
 
 struct Post {
+    slug: String,
     title: String,
     intro: String,
     display: bool,
 }
 
 impl_to_template_value!(BallContainer, { is_empty });
-impl_to_template_value!(Post, { title, intro, display});
+impl_to_template_value!(Post, { title, intro, display, slug});
 
 #[derive(Debug, Clone)]
 struct TemplateNode {
@@ -1205,16 +1191,20 @@ impl Template {
     }
 
     fn resolve_var<'a>(ident_fields: &[String], context: &'a Context, pos: &TemplatePositionData) -> Result<&'a TemplateValue, TemplateRenderError> {
-        let mut current = context.lookup(&ident_fields[0]).ok_or(TemplateRenderError::new(
-            TemplateRenderErrorMsg::VariableNotFound(ident_fields[0].to_string()),
-            pos.clone(),
-        ))?;
+        let mut current = if let Some(current) = context.lookup(&ident_fields[0]) {
+            current
+        } else {
+            return Err(TemplateRenderError::new(
+                TemplateRenderErrorMsg::VariableNotFound(ident_fields[0].to_string()),
+                pos.clone(),
+            ));
+        };
 
         let mut idx = 1;
         for field in &ident_fields[1..] {
             // println!("Field: {field}\n{current:#?}");
             current = match current {
-                TemplateValue::Object(map) | TemplateValue::DynPageObject { object: map, .. } => {
+                TemplateValue::Object(map) => {
                     if let Some(obj) = map.get(field.as_str()) {
                         obj
                     } else {
@@ -1364,17 +1354,19 @@ struct DynamicRoute {
     page_context_var: TemplateValue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StaticRoute {
     path: String,
     cached_page: Option<String>,
+    hidden: bool,
 }
 
 impl StaticRoute {
-    fn new(path: &str) -> Self {
+    fn new(path: &str, hidden: bool) -> Self {
         Self {
             path: path.to_owned(),
             cached_page: None,
+            hidden,
         }
     }
 }
@@ -1398,12 +1390,39 @@ impl Router {
             static_routes: HashMap::new(),
             dynamic_routes: HashMap::new(),
             fallback: None,
-            stats: Stats::new()
+            stats: Stats::new(),
         }
     }
 
     fn route_static_page(mut self, path: &str, template: &str) -> Self {
-        self.static_routes.insert(path.into(), StaticRoute::new(template));
+        let route = StaticRoute::new(template, false);
+        self.static_routes.insert(path.into(), route.clone());
+        let name = path.split("/").last().expect("valid path");
+
+
+        let obj = TemplateValue::Object(hash_map! {
+          "url".to_string() => TemplateValue::Text(path.to_string()),
+          "hidden".to_string() => TemplateValue::Bool(route.hidden),
+          "name".to_string() => TemplateValue::Text(name.to_string()),
+        });
+
+        if let Some(pages) = self.context.lookup_mut("pages-static") {
+            if let TemplateValue::List(list) = pages {
+                list.push(obj);
+            } else {
+                panic!("overwrote \"pages-static\" with something")
+            }
+        } else {
+            let page_list = TemplateValue::List(vec![obj]);
+
+            self.context.insert_global("pages-static", page_list);
+        }
+
+        self
+    }
+
+    fn route_static_hidden(mut self, path: &str, template: &str) -> Self {
+        self.static_routes.insert(path.into(), StaticRoute::new(template, true));
         self
     }
 
@@ -1421,7 +1440,9 @@ impl Router {
         };
 
         for page in page_list {
-            if let TemplateValue::DynPageObject { slug, object } = page {
+            if let TemplateValue::Object(ref object) = page
+                && let Some(TemplateValue::Text(slug)) = object.get("slug")
+            {
                 let url = format!("{base_path}{slug}");
 
                 let dyn_route = DynamicRoute {
@@ -1429,7 +1450,7 @@ impl Router {
                     page_list_name: list_name.to_owned(),
                     page_var_name: key.to_owned(),
                     template_path: base_template_path.to_owned(),
-                    page_context_var: TemplateValue::Object(object),
+                    page_context_var: page,
                     cached_page: None,
                 };
 
@@ -1760,7 +1781,7 @@ impl HttpServer {
                 // );
 
                 let mut is_ws = false;
-                
+
                 match header.path.as_str() {
                     #[cfg(debug_assertions)]
                     "/ws" => {
@@ -1793,9 +1814,8 @@ impl HttpServer {
                         stream.write_all(&bytes).expect("Failed to write to stream");
                         let end_timer = Instant::now();
                         let duration = end_timer - start_timer;
-                        router.stats.add_hit(&path, duration);
+                        router.stats.add_hit(path, duration);
                         // println!("served request in {duration:?}")
-
                     }
                 };
 
