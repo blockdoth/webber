@@ -5,15 +5,22 @@
 <style>
   .post_entry {
     border: 1px solid white;
-
+    color: white;
     padding: 10px;
     margin: 20px;
+    display: flex;     
+    gap: 2;           
   }  
-  .post_intro {
+
+  .post_title {
+    color: white;
+  }
+  .post_date {
     font-style: italic;
     color: gray;
+    margin-left: auto;
+    padding-right: 10px;
   }
-
 </style>
 {{endBlock}}
 
@@ -23,11 +30,9 @@
 {{for post in posts}}
 <div class="post_entry">
 
-  <a href="/posts/{{post.slug}}">{{post.title}}</a>
-  <div class="post_intro">
-    {{post.intro}}
-
-  </div>
+  <a href="/posts/{{post.slug}}" class="post_title">{{post.title}}</a>
+  
+  <p class="post_date">{{post.published}}</p>
 </div>
 
 

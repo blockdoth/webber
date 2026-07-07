@@ -2,10 +2,12 @@
 #![feature(if_let_guard)]
 #![feature(hash_map_macro)]
 #![allow(unused, unused_mut)]
+use core::panic;
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::fs::Metadata;
 use std::hash::Hash;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
@@ -34,7 +36,9 @@ fn main() -> Result<(), TemplateError> {
         let content = Content::load_embedded()?;
 
         println!("Static/Generated asset count: {:?}/{:?}", content.assets.len(), content.templates.len());
-        let context = Context::load_intial();
+        let context = Context::load_intial(&content);
+
+        // println!("{context:#?}");
 
         let router = Router::new(content, context)
             .route_static_hidden("/layout", "layout.html")
@@ -54,25 +58,10 @@ fn main() -> Result<(), TemplateError> {
 }
 
 impl Context {
-    fn load_intial() -> Context {
-        let posts = vec![
-            Post {
-                slug: "title-1".to_string(),
-                title: "title 1".to_string(),
-                intro: "intro 1".to_string(),
-                display: false,
-            },
-            Post {
-                slug: "title-2".to_string(),
-                title: "title 2".to_string(),
-                intro: "intro 2".to_string(),
-                display: true,
-            },
-        ];
-
+    fn load_intial(content: &Content) -> Context {
         let mut context = Context::new();
 
-        context.insert_global("posts", posts.to_template_value());
+        context.update_posts(&content);
         context.insert_global("copyright_start", TemplateValue::Text("2026".to_string()));
         context.insert_global("copyright_end", TemplateValue::Text("2026".to_string())); // TODO make dynamic
 
@@ -122,7 +111,7 @@ fn comptime() {
             Some("png") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
             Some("ico") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
             Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
-            Some("md") => &format!("AssetData::Html(MarkdownParser::html(MarkdownParser::parse(include_str!({global_path:?}))))"),
+            Some("md") => &format!("AssetData::MdParsed(MarkdownParser::parse(include_str!({global_path:?})))"),
             Some("html") => &format!("AssetData::Html(include_str!({global_path:?}))"),
             Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
             Some("css") => &format!("AssetData::Css(include_str!({global_path:?}).to_string())"),
@@ -252,9 +241,39 @@ impl ToTemplateValue for bool {
     }
 }
 
+impl ToTemplateValue for SystemTime {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::Text(format!("{:?}", self.duration_since(SystemTime::UNIX_EPOCH)))
+    }
+}
+
 impl<T: ToTemplateValue> ToTemplateValue for Vec<T> {
     fn to_template_value(&self) -> TemplateValue {
         TemplateValue::List(self.iter().map(|item| item.to_template_value()).collect())
+    }
+}
+impl ToTemplateValue for AssetData {
+    fn to_template_value(&self) -> TemplateValue {
+        match self {
+            AssetData::Png(b) | AssetData::Ico(b) | AssetData::Woff2(b) => todo!("Cant embed binary assets yet"),
+            AssetData::Empty => todo!("not sure what to do with this"),
+            AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::MdRaw(s) | AssetData::Unknown(s) => {
+                TemplateValue::Text(s.to_string())
+            }
+            AssetData::MdParsed(ParsedMarkdown { html, metadata }) => {
+                let mut obj = HashMap::new();
+
+                obj.insert("content".to_string(), TemplateValue::Text(html.to_string()));
+
+                obj.insert("title".to_string(), TemplateValue::Text(metadata.title.to_string()));
+                obj.insert("slug".to_string(), TemplateValue::Text(metadata.slug.to_string()));
+                obj.insert("published".to_string(), TemplateValue::Text(metadata.published.to_string()));
+                obj.insert("draft".to_string(), TemplateValue::Bool(metadata.draft));
+                obj.insert("tags".to_string(), metadata.tags.to_template_value());
+
+                TemplateValue::Object(obj)
+            }
+        }
     }
 }
 
@@ -283,6 +302,7 @@ struct Post {
 
 impl_to_template_value!(BallContainer, { is_empty });
 impl_to_template_value!(Post, { title, intro, display, slug});
+impl_to_template_value!(Asset, { last_modified, data, internal});
 
 #[derive(Debug, Clone)]
 struct TemplateNode {
@@ -1118,7 +1138,7 @@ impl Template {
         let (extends, new_template) = TemplateParser::lex(&template_str, &path_string).parse()?;
         let required_variables = Self::get_required_vars(&new_template);
 
-        template.blocks = Self::get_blocks(&new_template);;
+        template.blocks = Self::get_blocks(&new_template);
         template.template = new_template;
         template.parent = extends;
         template.required_variables = required_variables;
@@ -1344,6 +1364,30 @@ impl Context {
             None
         }
     }
+
+    fn update_posts(&mut self, content: &Content) {
+        let posts: Vec<AssetData> = content.assets.get_partial("/posts/").into_iter().cloned().map(|p| p.data).collect();
+
+        let post_values = posts.to_template_value();
+
+        let mut posts_by_slug = HashMap::new();
+
+        if let TemplateValue::List(list) = &post_values {
+            for post in list {
+                if let TemplateValue::Object(object) = post {
+                    if let Some(TemplateValue::Text(slug)) = object.get("slug") {
+                        posts_by_slug.insert(slug.clone(), post.clone());
+                    }
+                }
+            }
+        }
+
+        self.global_context.insert("posts".to_string(), post_values);
+
+        self.global_context
+            .insert("posts_by_slug".to_string(), TemplateValue::Object(posts_by_slug));
+        // println!("Updated context {:#?}", self.global_context);
+    }
 }
 
 #[derive(Debug)]
@@ -1392,7 +1436,7 @@ struct DynamicRoute {
     page_var_name: String,
     template_path: String,
     cached_page: Option<String>,
-    page_context_var: TemplateValue,
+    slug: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1490,7 +1534,7 @@ impl Router {
                     page_list_name: list_name.to_owned(),
                     page_var_name: key.to_owned(),
                     template_path: base_template_path.to_owned(),
-                    page_context_var: page,
+                    slug: slug.to_string(),
                     cached_page: None,
                 };
 
@@ -1531,9 +1575,19 @@ impl Router {
                 }
                 Some(dyn_route) => {
                     println!("Serving dynamic page {}", header.path);
-                    self.context.push();
-                    self.context.insert_local(&dyn_route.page_var_name, dyn_route.page_context_var.clone());
 
+                    let page_context_var = if let Some(TemplateValue::Object(posts_by_slug)) = self.context.lookup("posts_by_slug")
+                        && let Some(template_value) = posts_by_slug.get(&dyn_route.slug).cloned()
+                    {
+                        template_value
+                    } else {
+                        todo!("slug not found");
+                    };
+
+                    self.context.push();
+                    self.context.insert_local(&dyn_route.page_var_name, page_context_var);
+
+                    // println!("Context {:#?}", self.context);
                     let page = Self::render_template(&self.content.templates, &mut self.context, &dyn_route.template_path)?;
                     self.context.pop();
                     Ok(AssetData::Html(page))
@@ -1841,8 +1895,8 @@ impl HttpServer {
                             router.serve_api(&header, body).map(Cow::Owned)
                         } else {
                             match router.content.assets.get_ref(&header.path) {
-                                Some(asset) => Ok(Cow::Borrowed(&asset.data)),
-                                None => router.serve_page(&header, body).map(Cow::Owned),
+                                Some(asset) if !asset.internal => Ok(Cow::Borrowed(&asset.data)),
+                                _ => router.serve_page(&header, body).map(Cow::Owned),
                             }
                         };
 
@@ -1876,13 +1930,21 @@ impl HttpServer {
 
             #[cfg(debug_assertions)]
             {
-                if check_fs_timer.elapsed() > Duration::from_millis(100) {
+                let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
                     check_fs_timer = Instant::now();
 
-                    router.content.check_update();
-                }
+                    match router.content.check_update(&mut router.context) {
+                        Ok(reload) => reload,
+                        Err(err) => {
+                            println!("Error while reloading: {err}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
 
-                if router.content.reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
+                if reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
                     check_alive_timer = Instant::now();
                     active_streams.retain(|mut stream| {
                         let connection_is_alive = match stream.read(&mut [0]) {
@@ -1892,7 +1954,7 @@ impl HttpServer {
                         };
 
                         if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
-                            if router.content.reload {
+                            if reload {
                                 let _ = HttpServer::send_ws_message(stream, "reload");
                                 println!("[{peer_addr:?}] Reloaded");
                             }
@@ -1905,9 +1967,6 @@ impl HttpServer {
                             false
                         }
                     });
-                    if router.content.reload {
-                        router.content.reload = false;
-                    }
                 }
             }
         }
@@ -1921,7 +1980,8 @@ enum AssetTyp {
     Css,
     Js,
     Png,
-    Md,
+    MdRaw,
+    MdParsed,
     Ico,
     Woff2,
     Unknown,
@@ -1930,7 +1990,7 @@ enum AssetTyp {
 impl AssetTyp {
     fn is_text(&self) -> bool {
         use AssetTyp::*;
-        matches!(self, Text | Html | Css | Js | Md)
+        matches!(self, Text | Html | Css | Js | MdRaw)
     }
     fn from_path(path: &Path) -> AssetTyp {
         match path.extension().and_then(|s| s.to_str()) {
@@ -1939,7 +1999,7 @@ impl AssetTyp {
             Some("css") => AssetTyp::Css,
             Some("js") => AssetTyp::Js,
             Some("png") => AssetTyp::Png,
-            Some("md") => AssetTyp::Md,
+            Some("md") => AssetTyp::MdRaw,
             Some("ico") => AssetTyp::Ico,
             Some("woff2") => AssetTyp::Woff2,
             _ => AssetTyp::Unknown,
@@ -1972,7 +2032,8 @@ enum AssetData {
     Js(String),
     Png(Vec<u8>),
     Ico(Vec<u8>),
-    Md(String),
+    MdRaw(String),
+    MdParsed(ParsedMarkdown),
     Woff2(Vec<u8>),
     Unknown(String),
     Empty,
@@ -1981,7 +2042,13 @@ enum AssetData {
 impl AssetData {
     fn len(&self) -> usize {
         match self {
-            AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::Md(s) | AssetData::Unknown(s) => s.len(),
+            AssetData::Text(s)
+            | AssetData::Html(s)
+            | AssetData::Css(s)
+            | AssetData::Js(s)
+            | AssetData::MdRaw(s)
+            | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
+            | AssetData::Unknown(s) => s.len(),
             AssetData::Png(bytes) | AssetData::Ico(bytes) | AssetData::Woff2(bytes) => bytes.len(),
             AssetData::Empty => 0,
         }
@@ -1992,8 +2059,8 @@ impl AssetData {
             Some("ico") => AssetData::Ico(fs::read(path)?),
             Some("md") => {
                 let markdown = fs::read_to_string(path)?;
-                let html = MarkdownParser::html(MarkdownParser::parse(&markdown));
-                AssetData::Html(html)
+                let parsed = MarkdownParser::parse(&markdown);
+                AssetData::MdParsed(parsed)
             }
             Some("html") => AssetData::Html(fs::read_to_string(path)?),
             Some("txt") => AssetData::Text(fs::read_to_string(path)?),
@@ -2012,7 +2079,8 @@ impl AssetData {
             AssetData::Js(_) => "text/javascript",
             AssetData::Png(_) => "image/png",
             AssetData::Ico(_) => "image/ico",
-            AssetData::Md(_) => "text/plain",
+            AssetData::MdRaw(_) => "text/plain",
+            AssetData::MdParsed(_) => "text/html",
             AssetData::Woff2(_) => "font/woff2",
             AssetData::Unknown(_) => "text/plain",
             AssetData::Empty => "",
@@ -2027,16 +2095,23 @@ impl AssetData {
             AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).to_string()),
-            AssetTyp::Md => AssetData::Md(String::from_utf8_lossy(buffer).to_string()),
+            AssetTyp::MdRaw => AssetData::MdRaw(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Text => AssetData::Text(String::from_utf8_lossy(buffer).to_string()),
             AssetTyp::Unknown => AssetData::Unknown(String::from_utf8_lossy(buffer).to_string()),
+            AssetTyp::MdParsed => todo!(),
         }
     }
 
     fn as_bytes(&self) -> &[u8] {
         match self {
             AssetData::Png(b) | AssetData::Ico(b) | AssetData::Woff2(b) => b,
-            AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::Md(s) | AssetData::Unknown(s) => s.as_bytes(),
+            AssetData::Text(s)
+            | AssetData::Html(s)
+            | AssetData::Css(s)
+            | AssetData::Js(s)
+            | AssetData::MdRaw(s)
+            | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
+            | AssetData::Unknown(s) => s.as_bytes(),
             AssetData::Empty => &[],
         }
     }
@@ -2046,7 +2121,6 @@ impl AssetData {
 struct Content {
     assets: Trie<Asset>,
     templates: HashMap<String, Template>,
-    reload: bool,
 }
 
 impl Content {
@@ -2061,54 +2135,32 @@ impl Content {
         let mut assets = Trie::new();
         #[cfg(not(generated))]
         let templates = HashMap::new();
-
-        let generated = Self::compile_generated_assets(&mut assets); // TODO
         // assets
-        Ok(Self {
-            assets,
-            templates,
-            reload: false,
-        })
+        Ok(Self { assets, templates })
     }
 
-    fn compile_generated_assets(assets: &mut Trie<Asset>) -> Trie<Asset> {
-        let mut generated_assets = Trie::new();
-
-        for (path, asset) in assets.collect_kv_mut() {
-            match &asset.data {
-                AssetData::Md(content) => {
-                    let html = MarkdownParser::html(MarkdownParser::parse(content));
-                    asset.internal = true;
-                    generated_assets.insert(
-                        path.to_string_lossy().into_owned(),
-                        Asset {
-                            last_modified: SystemTime::now(),
-                            data: AssetData::Html(html),
-                            internal: false,
-                        },
-                    );
+    fn check_update(&mut self, context: &mut Context) -> Result<bool, TemplateError> {
+        let assets_changed = match self.update_assets() {
+            Ok(assets_changed) => {
+                if assets_changed {
+                    context.update_posts(&self);
                 }
-                _ => continue,
+                assets_changed
             }
-        }
-        // println!("Compiled {} generated assets", generated_assets.len());
-        generated_assets
+            err => return err,
+        };
+        let templates_changed = match self.update_templates() {
+            Ok(templates_changed) => templates_changed,
+            err => return err,
+        };
+        Ok(templates_changed || assets_changed)
     }
 
-    fn check_update(&mut self) {
-        if let Err(err) = self.update_assets() {
-            println!("Error while updating assets: {err}")
-        }
-
-        if let Err(err) = self.update_templates() {
-            println!("Error while updating templates: {err}")
-        }
-    }
-
-    fn update_templates(&mut self) -> Result<(), TemplateError> {
+    fn update_templates(&mut self) -> Result<bool, TemplateError> {
         let paths = walk_dir(TEMPLATES_PATH);
         let mut is_new = true;
         // println!("{:?}", self.templates.keys());
+        let mut changed = false;
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
             let path_str = path.to_string_lossy().to_string();
@@ -2120,7 +2172,7 @@ impl Content {
                     is_new = false;
                     if template.last_modified < last_modified {
                         Template::update_from_path(template, path)?;
-                        self.reload = true;
+                        changed = true;
 
                         println!(
                             "Updated template {:?}, for page: {key:?}",
@@ -2135,13 +2187,15 @@ impl Content {
                 let template = Template::from_path(path)?;
                 println!("Added template {path_str:?}");
                 self.templates.insert(path_str.clone(), template);
+                changed = true;
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
-    fn update_assets(&mut self) -> Result<(), TemplateError> {
+    fn update_assets(&mut self) -> Result<bool, TemplateError> {
         let mut paths = walk_dir(ASSETS_PATH);
+        let mut changed = false;
 
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
@@ -2151,7 +2205,7 @@ impl Content {
                 Some(existing_asset) if last_modified > existing_asset.last_modified => {
                     existing_asset.data = AssetData::read_asset(path)?;
                     existing_asset.last_modified = last_modified;
-                    self.reload = true;
+                    changed = true;
 
                     println!(
                         "Updated file {:?}, edited {} minutes ago",
@@ -2170,7 +2224,8 @@ impl Content {
                             internal: false,
                         },
                     );
-                    self.reload = true;
+                    changed = true;
+
                     println!("Added file {:?}", key_path);
                 }
             }
@@ -2180,9 +2235,9 @@ impl Content {
             .map(|p| format!("/{}", p.strip_prefix(ASSETS_PATH).expect("Failed to strip prefix").to_string_lossy()))
             .collect(); // Todo unfuck
         if self.assets.remove_other_than_except_generated(str_paths) {
-            self.reload = true;
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 }
 
@@ -2287,7 +2342,7 @@ where
     }
 
     // gets everything from path downwards
-    fn get_partial(&self, path: &String) -> Vec<&T> {
+    fn get_partial(&self, path: &str) -> Vec<&T> {
         let mut current_node = &self.root;
 
         for component in PathBuf::from(path).components() {
@@ -2553,10 +2608,114 @@ enum BlockTyp {
     Table,
     Misc,
 }
+
+#[derive(Clone, Debug)]
+
+struct ParsedMarkdown {
+    html: String,
+    metadata: MarkdownMetadata,
+}
+
+#[derive(Clone, Debug)]
+struct MarkdownMetadata {
+    title: String,
+    slug: String,
+    published: String,
+    tags: Vec<String>,
+    draft: bool,
+}
+
+impl MarkdownMetadata {
+    fn parse_metadata(lines: Vec<&str>) -> MarkdownMetadata {
+        let mut title: Option<String> = None;
+        let mut slug: Option<String> = None;
+        let mut published: Option<String> = None;
+        let mut tags: Vec<String> = Vec::new();
+        let mut draft: bool = false;
+
+        for line in lines {
+            let line = line.trim();
+
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim();
+
+            // println!("{key}={value}");
+            match key {
+                "title" => title = Self::parse_string(value),
+                "slug" => slug = Self::parse_string(value),
+                "published" => published = Self::parse_date(value),
+                "tags" => tags = Self::parse_tags(value),
+                "draft" => match value {
+                    "true" => draft = true,
+                    "false" => draft = false,
+                    _ => continue,
+                },
+                _ => continue,
+            }
+        }
+
+        let title_str = title.unwrap_or("untitled".to_owned());
+        MarkdownMetadata {
+            slug: slug.unwrap_or(title_str.replace(" ", "-").to_lowercase()),
+            title: title_str,
+            published: published.unwrap_or("data unknown".to_owned()),
+            tags,
+            draft,
+        }
+    }
+
+    fn parse_string(value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+            Some(value[1..value.len() - 1].to_string())
+        } else {
+            None
+        }
+    }
+
+    fn parse_date(value: &str) -> Option<String> {
+        let value = value.trim();
+
+        if !value.is_empty() { Some(value.to_string()) } else { None }
+    }
+    fn parse_tags(value: &str) -> Vec<String> {
+        if !value.starts_with('[') || !value.ends_with(']') {
+            return vec![];
+        }
+
+        let inner = &value[1..value.len() - 1];
+
+        if inner.trim().is_empty() {
+            return vec![];
+        }
+
+        let mut tags = vec![];
+        for tag in inner.split(',') {
+            if let Some(tag) = Self::parse_string(tag.trim()) {
+                tags.push(tag);
+            } else {
+                return vec![];
+            }
+        }
+        tags
+    }
+}
+// title = "Title 1"
+// slug = "title-1"
+// published = 2026-07-07
+// updated = 2026-07-07
+// tags = ["test", "testos"]
+// draft = false
 struct MarkdownParser {}
 
 impl MarkdownParser {
-    fn parse(input: &str) -> MarkdownNode<'_> {
+    fn parse(input: &str) -> ParsedMarkdown {
         let mut active_block = vec![];
         let mut blocks: Vec<MarkDownBlock> = vec![];
 
@@ -2564,7 +2723,28 @@ impl MarkdownParser {
 
         let mut code_block_language = "";
 
-        for untrimmed_line in input.lines() {
+        let mut lines = input.lines().peekable();
+
+        let metadata = if let Some(first_line) = lines.peek()
+            && first_line.starts_with("::::")
+        {
+            lines.next().expect("invariant");
+
+            let mut metadata_lines = vec![];
+
+            while let Some(line) = lines.next() {
+                if line.starts_with("::::") {
+                    break;
+                }
+                metadata_lines.push(line);
+            }
+
+            MarkdownMetadata::parse_metadata(metadata_lines)
+        } else {
+            panic!("markdown must have metadata")
+        };
+
+        for untrimmed_line in lines {
             let line = untrimmed_line.trim_start();
 
             // match
@@ -2666,7 +2846,8 @@ impl MarkdownParser {
         //     println!("{:?}", i);
         // }
 
-        MarkdownNode::Document(blocks.into_iter().map(Self::parse_block).collect())
+        let html = Self::to_html(MarkdownNode::Document(blocks.into_iter().map(Self::parse_block).collect()));
+        ParsedMarkdown { html, metadata }
     }
 
     fn parse_block(block: MarkDownBlock) -> MarkdownNode {
@@ -2813,7 +2994,7 @@ impl MarkdownParser {
         *code_block_language = "";
     }
 
-    fn html(node: MarkdownNode) -> String {
+    fn to_html(node: MarkdownNode) -> String {
         let mut html = String::new();
         Self::html_helper(&node, &mut html);
         html
@@ -2912,7 +3093,6 @@ impl MarkdownParser {
             MarkdownNode::HorizontalLine => {
                 builder.push_str("<hr/>\n");
             }
-            MarkdownNode::Table => {}
             MarkdownNode::Link { text, url } => {
                 builder.push('(');
                 text.iter().for_each(|n| Self::html_helper(n, builder));
@@ -2922,6 +3102,7 @@ impl MarkdownParser {
                 builder.push_str(url);
                 builder.push(']');
             }
+            MarkdownNode::Table => todo!("tabble"),
         }
     }
 }
