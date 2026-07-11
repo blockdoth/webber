@@ -960,6 +960,7 @@ impl TemplateParser {
     fn parse_block(&mut self) -> Result<TemplateNode, TemplateError> {
         use TemplateTokenKind::*;
 
+        let start_block = self.consume(Block)?;
         let ident_node = self.parse_var()?;
 
         let ident = match ident_node.data {
@@ -979,12 +980,14 @@ impl TemplateParser {
         };
 
         let body = self.parse_until(&[EndBlock])?;
+        let end_block = self.consume(EndBlock)?;
+
         Ok(TemplateNode {
             data: TemplateNodeData::Block {
                 ident: ident.to_string(),
                 body,
             },
-            pos: ident_node.pos,
+            pos: start_block.metadata.merge(&end_block.metadata)?,
         })
     }
 
