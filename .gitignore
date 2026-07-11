@@ -4,3 +4,4 @@ result/
 target/
 state/
 node_modules
+Cargo.lock
