@@ -41,7 +41,11 @@ fn main() -> Result<(), TemplateError> {
 
         let content = Content::load_embedded()?;
 
-        println!("Static/Generated asset count: {:?}/{:?}", content.assets.len(), content.templates.len());
+        println!(
+            "Static/Generated asset count: {:?}/{:?}",
+            content.assets.len(),
+            content.templates.len()
+        );
         let context = Context::load_intial(&content);
 
         // println!("{context:#?}");
@@ -56,7 +60,8 @@ fn main() -> Result<(), TemplateError> {
             .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
             .fallback("/home");
 
-        let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
+        let listener: TcpListener =
+            TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
         println!("Started listening on socket http://{SOCKET_ADDR}");
 
         HttpServer::serve(listener, router);
@@ -74,8 +79,14 @@ impl Context {
 
         #[cfg(generated)]
         {
-            context.insert_global("git_hash_short", TemplateValue::Text(GIT_HASH_SHORT.to_string()));
-            context.insert_global("git_hash_long", TemplateValue::Text(GIT_HASH_LONG.to_string()));
+            context.insert_global(
+                "git_hash_short",
+                TemplateValue::Text(GIT_HASH_SHORT.to_string()),
+            );
+            context.insert_global(
+                "git_hash_long",
+                TemplateValue::Text(GIT_HASH_LONG.to_string()),
+            );
         }
 
         #[cfg(debug_assertions)]
@@ -118,7 +129,9 @@ fn comptime() {
             Some("png") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
             Some("ico") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
             Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
-            Some("md") => &format!("AssetData::MdParsed(MarkdownParser::parse(include_str!({global_path:?})))"),
+            Some("md") => &format!(
+                "AssetData::MdParsed(MarkdownParser::parse(include_str!({global_path:?})))"
+            ),
             Some("html") => &format!("AssetData::Html(include_str!({global_path:?}))"),
             Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
             Some("css") => &format!("AssetData::Css(include_str!({global_path:?}).to_string())"),
@@ -126,7 +139,9 @@ fn comptime() {
             _ => &format!("AssetData::Unknown(include_str!({global_path:?}))"),
         };
 
-        out.push_str(&format!("\t\t(\"/{str_path}\".to_string(),{content_str}),\n"));
+        out.push_str(&format!(
+            "\t\t(\"/{str_path}\".to_string(),{content_str}),\n"
+        ));
     }
     out.push_str("\t];\n");
 
@@ -142,25 +157,33 @@ fn comptime() {
 
     let template_paths = walk_dir(TEMPLATES_PATH);
 
-    out.push_str("fn load_embedded_templates() -> Result<HashMap<String, Template>,TemplateError> {\n");
+    out.push_str(
+        "fn load_embedded_templates() -> Result<HashMap<String, Template>,TemplateError> {\n",
+    );
     out.push_str("\tlet mut templates = HashMap::new();\n");
 
     out.push_str("\tlet paths = vec![\n");
     for template_path in template_paths {
         let path_key = template_path.to_string_lossy();
         let global_path = format!("{cwd}/{path_key}");
-        let stripped_key = path_key.strip_prefix(TEMPLATES_PATH).expect("Failed to find prefix");
+        let stripped_key = path_key
+            .strip_prefix(TEMPLATES_PATH)
+            .expect("Failed to find prefix");
 
         let content_str = match template_path.extension().and_then(|s| s.to_str()) {
             Some("html") => &format!("include_str!({global_path:?})"),
             _ => continue,
         };
-        out.push_str(&format!("\t\t({path_key:?},{stripped_key:?},{content_str}),\n"));
+        out.push_str(&format!(
+            "\t\t({path_key:?},{stripped_key:?},{content_str}),\n"
+        ));
     }
     out.push_str("\t];\n");
 
     out.push_str("\tfor (origin_file, key, template_str) in paths {\n");
-    out.push_str("\t\tlet template = Template::from_str(origin_file.to_string(), template_str)?;\n");
+    out.push_str(
+        "\t\tlet template = Template::from_str(origin_file.to_string(), template_str)?;\n",
+    );
 
     out.push_str("\t\ttemplates.insert(key.to_string(),template);\n");
     out.push_str("\t}\n");
@@ -262,19 +285,33 @@ impl<T: ToTemplateValue> ToTemplateValue for Vec<T> {
 impl ToTemplateValue for AssetData {
     fn to_template_value(&self) -> TemplateValue {
         match self {
-            AssetData::Png(b) | AssetData::Ico(b) | AssetData::Woff2(b) => todo!("Cant embed binary assets yet"),
-            AssetData::Empty => todo!("not sure what to do with this"),
-            AssetData::Text(s) | AssetData::Html(s) | AssetData::Css(s) | AssetData::Js(s) | AssetData::MdRaw(s) | AssetData::Unknown(s) => {
-                TemplateValue::Text(s.to_string())
+            AssetData::Png(b) | AssetData::Ico(b) | AssetData::Woff2(b) => {
+                todo!("Cant embed binary assets yet")
             }
+            AssetData::Empty => todo!("not sure what to do with this"),
+            AssetData::Text(s)
+            | AssetData::Html(s)
+            | AssetData::Css(s)
+            | AssetData::Js(s)
+            | AssetData::MdRaw(s)
+            | AssetData::Unknown(s) => TemplateValue::Text(s.to_string()),
             AssetData::MdParsed(ParsedMarkdown { html, metadata }) => {
                 let mut obj = HashMap::new();
 
                 obj.insert("content".to_string(), TemplateValue::Text(html.to_string()));
 
-                obj.insert("title".to_string(), TemplateValue::Text(metadata.title.to_string()));
-                obj.insert("slug".to_string(), TemplateValue::Text(metadata.slug.to_string()));
-                obj.insert("published".to_string(), TemplateValue::Text(metadata.published.to_string()));
+                obj.insert(
+                    "title".to_string(),
+                    TemplateValue::Text(metadata.title.to_string()),
+                );
+                obj.insert(
+                    "slug".to_string(),
+                    TemplateValue::Text(metadata.slug.to_string()),
+                );
+                obj.insert(
+                    "published".to_string(),
+                    TemplateValue::Text(metadata.published.to_string()),
+                );
                 obj.insert("draft".to_string(), TemplateValue::Bool(metadata.draft));
                 obj.insert("tags".to_string(), metadata.tags.to_template_value());
 
@@ -355,9 +392,17 @@ impl fmt::Display for TemplateNodeData {
                 then_branch,
                 else_branch,
             } => {
-                let then_branch_str = then_branch.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+                let then_branch_str = then_branch
+                    .iter()
+                    .map(|n| format!("{}", n.data))
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
-                let else_branch_str = else_branch.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+                let else_branch_str = else_branch
+                    .iter()
+                    .map(|n| format!("{}", n.data))
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
                 write!(
                     f,
@@ -367,13 +412,31 @@ impl fmt::Display for TemplateNodeData {
                     else_branch_str
                 )
             }
-            TemplateNodeData::For { iter_bind, iter_src, body } => {
-                let body_str = body.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+            TemplateNodeData::For {
+                iter_bind,
+                iter_src,
+                body,
+            } => {
+                let body_str = body
+                    .iter()
+                    .map(|n| format!("{}", n.data))
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
-                write!(f, "for {} in {} {{\n{}\n}}", iter_bind, iter_src.join("."), body_str)
+                write!(
+                    f,
+                    "for {} in {} {{\n{}\n}}",
+                    iter_bind,
+                    iter_src.join("."),
+                    body_str
+                )
             }
             TemplateNodeData::Block { ident, body } => {
-                let body_str = body.iter().map(|n| format!("{}", n.data)).collect::<Vec<_>>().join("\n");
+                let body_str = body
+                    .iter()
+                    .map(|n| format!("{}", n.data))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 write!(f, "block {ident} {{\n{body_str}\n}}")
             } // TemplateNodeData::Extends { path } => {
               //     write!(f, "extends \"{path}\"")
@@ -441,10 +504,12 @@ struct TemplateParseError {
 impl TemplatePositionData {
     fn merge(&self, other: &TemplatePositionData) -> Result<Self, TemplateParseError> {
         if self.file != other.file {
-            Err(TemplateParseError::no_info(TemplateParseErrorMsg::MergingSpansFromDifferentFiles(
-                self.file.to_string(),
-                other.file.to_string(),
-            )))
+            Err(TemplateParseError::no_info(
+                TemplateParseErrorMsg::MergingSpansFromDifferentFiles(
+                    self.file.to_string(),
+                    other.file.to_string(),
+                ),
+            ))
         } else {
             Ok(TemplatePositionData {
                 file: self.file.clone(),
@@ -505,25 +570,34 @@ impl fmt::Display for TemplateError {
 
 impl From<std::io::Error> for TemplateError {
     fn from(e: std::io::Error) -> Self {
-        TemplateError::Parse(TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))
+        TemplateError::Parse(TemplateParseError::no_info(
+            TemplateParseErrorMsg::GenericError(e.to_string()),
+        ))
     }
 }
 
 impl<T> From<std::sync::PoisonError<T>> for TemplateError {
     fn from(e: std::sync::PoisonError<T>) -> Self {
-        TemplateError::Parse(TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))
+        TemplateError::Parse(TemplateParseError::no_info(
+            TemplateParseErrorMsg::GenericError(e.to_string()),
+        ))
     }
 }
 
 impl From<StripPrefixError> for TemplateError {
     fn from(e: StripPrefixError) -> Self {
-        TemplateError::Parse(TemplateParseError::no_info(TemplateParseErrorMsg::GenericError(e.to_string())))
+        TemplateError::Parse(TemplateParseError::no_info(
+            TemplateParseErrorMsg::GenericError(e.to_string()),
+        ))
     }
 }
 
 impl TemplateParseError {
     fn new(typ: TemplateParseErrorMsg, pos: TemplatePositionData) -> Self {
-        Self { typ, pos: Some(pos) }
+        Self {
+            typ,
+            pos: Some(pos),
+        }
     }
     fn no_info(typ: TemplateParseErrorMsg) -> Self {
         Self { typ, pos: None }
@@ -793,9 +867,14 @@ impl TemplateParser {
             }
             None => {
                 if let Some(prev) = &self.prev {
-                    Err(TemplateParseError::new(TemplateParseErrorMsg::UnexpectedEOF, prev.metadata.clone()))?
+                    Err(TemplateParseError::new(
+                        TemplateParseErrorMsg::UnexpectedEOF,
+                        prev.metadata.clone(),
+                    ))?
                 } else {
-                    Err(TemplateParseError::no_info(TemplateParseErrorMsg::UnexpectedEOF))?
+                    Err(TemplateParseError::no_info(
+                        TemplateParseErrorMsg::UnexpectedEOF,
+                    ))?
                 }
             }
         }
@@ -805,7 +884,10 @@ impl TemplateParser {
         self.tokens.peek()
     }
 
-    fn consume(&mut self, expected_token_kind: TemplateTokenKind) -> Result<TemplateToken, TemplateError> {
+    fn consume(
+        &mut self,
+        expected_token_kind: TemplateTokenKind,
+    ) -> Result<TemplateToken, TemplateError> {
         match self.tokens.next() {
             Some(token) => {
                 if token.kind == expected_token_kind {
@@ -823,7 +905,10 @@ impl TemplateParser {
                 } else {
                     TemplatePositionData::default()
                 };
-                Err(TemplateParseError::new(TemplateParseErrorMsg::ExpectButEOF(expected_token_kind), pos))?
+                Err(TemplateParseError::new(
+                    TemplateParseErrorMsg::ExpectButEOF(expected_token_kind),
+                    pos,
+                ))?
             }
         }
     }
@@ -832,7 +917,10 @@ impl TemplateParser {
         Ok((self.parse_extends()?, self.parse_until(&[])?))
     }
 
-    fn parse_until(&mut self, stop: &[TemplateTokenKind]) -> Result<Vec<TemplateNode>, TemplateError> {
+    fn parse_until(
+        &mut self,
+        stop: &[TemplateTokenKind],
+    ) -> Result<Vec<TemplateNode>, TemplateError> {
         use TemplateTokenKind::*;
         let mut parsed = vec![];
 
@@ -887,7 +975,10 @@ impl TemplateParser {
                 match token.kind {
                     Path(path) => Ok(Some(path)),
                     other => Err(TemplateParseError::new(
-                        TemplateParseErrorMsg::UnexpectedToken(other, Identifier("<path>".to_string())),
+                        TemplateParseErrorMsg::UnexpectedToken(
+                            other,
+                            Identifier("<path>".to_string()),
+                        ),
                         token.metadata,
                     ))?,
                 }
@@ -907,7 +998,10 @@ impl TemplateParser {
             TemplateNodeData::Variable(path) => path,
             node => {
                 return Err(TemplateParseError::new(
-                    TemplateParseErrorMsg::UnexpectedTemplateValueType(TemplateNodeKind::Variable, node.kind()),
+                    TemplateParseErrorMsg::UnexpectedTemplateValueType(
+                        TemplateNodeKind::Variable,
+                        node.kind(),
+                    ),
                     cond_node.pos,
                 ))?;
             }
@@ -966,14 +1060,19 @@ impl TemplateParser {
         let ident = match ident_node.data {
             ref node @ TemplateNodeData::Variable(ref var) if var.len() > 1 => {
                 return Err(TemplateParseError::new(
-                    TemplateParseErrorMsg::GenericError(format!("blocks can only contain single level identifiers {node}")),
+                    TemplateParseErrorMsg::GenericError(format!(
+                        "blocks can only contain single level identifiers {node}"
+                    )),
                     ident_node.pos,
                 ))?;
             }
             TemplateNodeData::Variable(var) => var.first().expect("invariant").clone(),
             node => {
                 return Err(TemplateParseError::new(
-                    TemplateParseErrorMsg::UnexpectedTemplateValueType(TemplateNodeKind::Variable, node.kind()),
+                    TemplateParseErrorMsg::UnexpectedTemplateValueType(
+                        TemplateNodeKind::Variable,
+                        node.kind(),
+                    ),
                     ident_node.pos,
                 ))?;
             }
@@ -1011,7 +1110,10 @@ impl TemplateParser {
             TemplateNodeData::Variable(path) => path,
             node => {
                 return Err(TemplateParseError::new(
-                    TemplateParseErrorMsg::UnexpectedTemplateValueType(TemplateNodeKind::Variable, node.kind()),
+                    TemplateParseErrorMsg::UnexpectedTemplateValueType(
+                        TemplateNodeKind::Variable,
+                        node.kind(),
+                    ),
                     iter_node.pos,
                 ))?;
             }
@@ -1102,7 +1204,10 @@ impl Template {
         Self::from_str(path_string, &template_str)
     }
 
-    fn update_from_path<P: AsRef<Path> + Debug + Copy>(template: &mut Template, path: P) -> Result<(), TemplateError> {
+    fn update_from_path<P: AsRef<Path> + Debug + Copy>(
+        template: &mut Template,
+        path: P,
+    ) -> Result<(), TemplateError> {
         let path_string = path.as_ref().to_string_lossy().to_string();
 
         let template_str = match fs::read_to_string(path) {
@@ -1149,22 +1254,35 @@ impl Template {
         Self::render_helper(&self.template, context, &HashMap::new())
     }
 
-    fn render_with_blocks(&self, context: &mut Context, blocks: &HashMap<String, Vec<TemplateNode>>) -> Result<String, TemplateError> {
+    fn render_with_blocks(
+        &self,
+        context: &mut Context,
+        blocks: &HashMap<String, Vec<TemplateNode>>,
+    ) -> Result<String, TemplateError> {
         Self::render_helper(&self.template, context, blocks)
     }
 
-    fn render_helper(nodes: &Vec<TemplateNode>, context: &mut Context, blocks: &HashMap<String, Vec<TemplateNode>>) -> Result<String, TemplateError> {
+    fn render_helper(
+        nodes: &Vec<TemplateNode>,
+        context: &mut Context,
+        blocks: &HashMap<String, Vec<TemplateNode>>,
+    ) -> Result<String, TemplateError> {
         use TemplateNodeData::*;
         let mut res = String::new();
         for node in nodes {
             match &node.data {
                 Text(text) => res.push_str(text),
                 Variable(ident_fields) => {
-                    if let TemplateValue::Text(text) = Self::resolve_var(ident_fields, context, &node.pos)? {
+                    if let TemplateValue::Text(text) =
+                        Self::resolve_var(ident_fields, context, &node.pos)?
+                    {
                         res.push_str(text);
                     } else {
                         return Err(TemplateRenderError::new(
-                            TemplateRenderErrorMsg::NodeNotOfExpectedType(ident_fields.concat(), TemplateNodeKind::Text),
+                            TemplateRenderErrorMsg::NodeNotOfExpectedType(
+                                ident_fields.concat(),
+                                TemplateNodeKind::Text,
+                            ),
                             node.pos.clone(),
                         ))?;
                     }
@@ -1174,7 +1292,9 @@ impl Template {
                     then_branch,
                     else_branch,
                 } => {
-                    if let TemplateValue::Bool(cond) = *Self::resolve_var(condition, context, &node.pos)? {
+                    if let TemplateValue::Bool(cond) =
+                        *Self::resolve_var(condition, context, &node.pos)?
+                    {
                         let cond_str = if cond {
                             Self::render_helper(then_branch, context, blocks)?
                         } else {
@@ -1183,13 +1303,22 @@ impl Template {
                         res.push_str(&cond_str);
                     } else {
                         return Err(TemplateRenderError::new(
-                            TemplateRenderErrorMsg::VariableNotOfExpectedType(condition.concat(), TemplateValueKind::Bool),
+                            TemplateRenderErrorMsg::VariableNotOfExpectedType(
+                                condition.concat(),
+                                TemplateValueKind::Bool,
+                            ),
                             node.pos.clone(),
                         ))?;
                     }
                 }
-                For { iter_bind, iter_src, body } => {
-                    if let TemplateValue::List(iter) = Self::resolve_var(iter_src, context, &node.pos)?.clone() {
+                For {
+                    iter_bind,
+                    iter_src,
+                    body,
+                } => {
+                    if let TemplateValue::List(iter) =
+                        Self::resolve_var(iter_src, context, &node.pos)?.clone()
+                    {
                         let mut for_res = String::new();
                         for it in iter {
                             context.push();
@@ -1200,7 +1329,10 @@ impl Template {
                         res.push_str(&for_res);
                     } else {
                         return Err(TemplateRenderError::new(
-                            TemplateRenderErrorMsg::VariableNotOfExpectedType(iter_src.concat(), TemplateValueKind::List),
+                            TemplateRenderErrorMsg::VariableNotOfExpectedType(
+                                iter_src.concat(),
+                                TemplateValueKind::List,
+                            ),
                             node.pos.clone(),
                         ))?;
                     }
@@ -1219,7 +1351,11 @@ impl Template {
         Ok(res)
     }
 
-    fn resolve_var<'a>(ident_fields: &[String], context: &'a Context, pos: &TemplatePositionData) -> Result<&'a TemplateValue, TemplateRenderError> {
+    fn resolve_var<'a>(
+        ident_fields: &[String],
+        context: &'a Context,
+        pos: &TemplatePositionData,
+    ) -> Result<&'a TemplateValue, TemplateRenderError> {
         let mut current = if let Some(current) = context.lookup(&ident_fields[0]) {
             current
         } else {
@@ -1237,13 +1373,19 @@ impl Template {
                         obj
                     } else {
                         return Err(TemplateRenderError::new(
-                            TemplateRenderErrorMsg::FieldNotFoundOnVariable(ident_fields[1..idx].concat(), field.to_string()),
+                            TemplateRenderErrorMsg::FieldNotFoundOnVariable(
+                                ident_fields[1..idx].concat(),
+                                field.to_string(),
+                            ),
                             pos.clone(),
                         ));
                     }
                 }
                 _ => Err(TemplateRenderError::new(
-                    TemplateRenderErrorMsg::VariableNotOfExpectedType(field.to_string(), TemplateValueKind::List),
+                    TemplateRenderErrorMsg::VariableNotOfExpectedType(
+                        field.to_string(),
+                        TemplateValueKind::List,
+                    ),
                     pos.clone(),
                 ))?,
             };
@@ -1308,7 +1450,10 @@ impl Context {
     }
 
     fn insert_local(&mut self, key: &str, value: TemplateValue) {
-        self.local_context.last_mut().expect("invariant").insert(key.to_owned(), value);
+        self.local_context
+            .last_mut()
+            .expect("invariant")
+            .insert(key.to_owned(), value);
     }
     fn insert_global(&mut self, key: &str, value: TemplateValue) {
         self.global_context.insert(key.to_owned(), value);
@@ -1341,7 +1486,13 @@ impl Context {
     }
 
     fn update_posts(&mut self, content: &Content) {
-        let posts: Vec<AssetData> = content.assets.get_partial("/posts/").into_iter().cloned().map(|p| p.data).collect();
+        let posts: Vec<AssetData> = content
+            .assets
+            .get_partial("/posts/")
+            .into_iter()
+            .cloned()
+            .map(|p| p.data)
+            .collect();
 
         let post_values = posts.to_template_value();
 
@@ -1359,8 +1510,10 @@ impl Context {
 
         self.global_context.insert("posts".to_string(), post_values);
 
-        self.global_context
-            .insert("posts_by_slug".to_string(), TemplateValue::Object(posts_by_slug));
+        self.global_context.insert(
+            "posts_by_slug".to_string(),
+            TemplateValue::Object(posts_by_slug),
+        );
     }
 }
 
@@ -1378,7 +1531,10 @@ impl Stats {
         }
     }
     fn add_hit(&mut self, key: &str, request_duration: Duration) {
-        let current = self.request_stats.entry(key.to_string()).or_insert_with(RequestStats::new);
+        let current = self
+            .request_stats
+            .entry(key.to_string())
+            .or_insert_with(RequestStats::new);
 
         current.count += 1;
         current.total_time += request_duration;
@@ -1418,7 +1574,10 @@ impl ToTemplateValue for Stats {
             .collect();
 
         TemplateValue::Object(HashMap::from([
-            ("start_time".to_string(), self.start_time.to_template_value()),
+            (
+                "start_time".to_string(),
+                self.start_time.to_template_value(),
+            ),
             ("pages".to_string(), TemplateValue::List(pages)),
         ]))
     }
@@ -1519,11 +1678,17 @@ impl Router {
     }
 
     fn route_static_hidden(mut self, path: &str, template: &str) -> Self {
-        self.static_routes.insert(path.into(), StaticRoute::new(template, true));
+        self.static_routes
+            .insert(path.into(), StaticRoute::new(template, true));
         self
     }
 
-    fn route_dynamic_pages(mut self, path: &str, base_template_path: &str, list_name: &str) -> Result<Self, TemplateError> {
+    fn route_dynamic_pages(
+        mut self,
+        path: &str,
+        base_template_path: &str,
+        list_name: &str,
+    ) -> Result<Self, TemplateError> {
         let (base_path, key) = path.rsplit_once(':').expect("expected path to contain ':'");
 
         let template_value = self
@@ -1563,7 +1728,11 @@ impl Router {
         self
     }
 
-    fn serve_page(&mut self, header: &HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_page(
+        &mut self,
+        header: &HttpRequestHeader,
+        _body: AssetData,
+    ) -> Result<AssetData, HttpServerError> {
         match self.static_routes.get(&header.path) {
             Some(route) if let Some(cached) = &route.cached_page => {
                 println!("Serving cached page {}", header.path);
@@ -1574,10 +1743,12 @@ impl Router {
                 self.context.push();
 
                 if header.path == "/stats" {
-                    self.context.insert_local("stats", self.stats.to_template_value());
+                    self.context
+                        .insert_local("stats", self.stats.to_template_value());
                 }
 
-                let page = Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
+                let page =
+                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
                 self.context.pop();
                 Ok(AssetData::Html(page))
             }
@@ -1590,7 +1761,8 @@ impl Router {
                 Some(dyn_route) => {
                     println!("Serving dynamic page {}", header.path);
 
-                    let page_context_var = if let Some(TemplateValue::Object(posts_by_slug)) = self.context.lookup("posts_by_slug")
+                    let page_context_var = if let Some(TemplateValue::Object(posts_by_slug)) =
+                        self.context.lookup("posts_by_slug")
                         && let Some(template_value) = posts_by_slug.get(&dyn_route.slug).cloned()
                     {
                         template_value
@@ -1599,10 +1771,15 @@ impl Router {
                     };
 
                     self.context.push();
-                    self.context.insert_local(&dyn_route.page_var_name, page_context_var);
+                    self.context
+                        .insert_local(&dyn_route.page_var_name, page_context_var);
 
                     // println!("Context {:#?}", self.context);
-                    let page = Self::render_template(&self.content.templates, &mut self.context, &dyn_route.template_path)?;
+                    let page = Self::render_template(
+                        &self.content.templates,
+                        &mut self.context,
+                        &dyn_route.template_path,
+                    )?;
                     self.context.pop();
                     Ok(AssetData::Html(page))
                 }
@@ -1612,15 +1789,23 @@ impl Router {
 
                     Err(HttpServerError::Redirect(fallback.to_string()))
                 }
-                _ => Ok(AssetData::Text(HttpResponseCode::NotFound.to_string().to_owned())),
+                _ => Ok(AssetData::Text(
+                    HttpResponseCode::NotFound.to_string().to_owned(),
+                )),
             },
         }
     }
 
-    fn render_template(templates: &HashMap<String, Template>, context: &mut Context, path: &str) -> Result<String, TemplateError> {
+    fn render_template(
+        templates: &HashMap<String, Template>,
+        context: &mut Context,
+        path: &str,
+    ) -> Result<String, TemplateError> {
         let template = templates.get(path).expect("template not found");
         if let Some(parent_path) = &template.parent {
-            let parent = templates.get(parent_path).expect("Parent template not found: {parent_path}");
+            let parent = templates
+                .get(parent_path)
+                .expect("Parent template not found: {parent_path}");
             if parent.parent.is_some() {
                 return Err(TemplateParseError::only_file(
                     TemplateParseErrorMsg::GenericError(format!(
@@ -1636,7 +1821,11 @@ impl Router {
         }
     }
 
-    fn serve_api(&self, _header: &HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
+    fn serve_api(
+        &self,
+        _header: &HttpRequestHeader,
+        _body: AssetData,
+    ) -> Result<AssetData, HttpServerError> {
         Err(HttpServerError::Todo)
     }
 }
@@ -1681,7 +1870,9 @@ impl fmt::Display for HttpResponseCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HttpResponseCode::Ok => write!(f, "200 OK"),
-            HttpResponseCode::RedirectOther(redirect) => write!(f, "303 See Other\r\nLocation: {redirect}"),
+            HttpResponseCode::RedirectOther(redirect) => {
+                write!(f, "303 See Other\r\nLocation: {redirect}")
+            }
             HttpResponseCode::NotFound => write!(f, "404 Not Found"),
             HttpResponseCode::BadRequest => write!(f, "400 Bad Request"),
             HttpResponseCode::InternalServer => write!(f, "500 Internal Server Error"),
@@ -1715,7 +1906,8 @@ impl HttpServer {
             && let Some(_) = header.sec_websocket_version
         {
             let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-            let websocket_accept = base64(&sha1(format!("{}{magic_string}", sec_websocket_key.trim())));
+            let websocket_accept =
+                base64(&sha1(format!("{}{magic_string}", sec_websocket_key.trim())));
             format!(
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
             )
@@ -1741,12 +1933,16 @@ impl HttpServer {
 
     fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, AssetData), io::Error> {
         if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            let header = Self::parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string()).expect("Unable to parse header");
+            let header = Self::parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string())
+                .expect("Unable to parse header");
             let content = AssetData::from_asset_type(&buffer[pos + 4..], &header.content_typ);
 
             Ok((header, content))
         } else {
-            Err(io::Error::new(io::ErrorKind::InvalidData, "could not find header/body separator"))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "could not find header/body separator",
+            ))
         }
     }
 
@@ -1756,7 +1952,9 @@ impl HttpServer {
         let body = content.as_bytes();
 
         let cache_control = match content {
-            AssetData::Png(_) | AssetData::Ico(_) | AssetData::Css(_) | AssetData::Js(_) => "Cache-Control: public, max-age=3600\r\n",
+            AssetData::Png(_) | AssetData::Ico(_) | AssetData::Css(_) | AssetData::Js(_) => {
+                "Cache-Control: public, max-age=3600\r\n"
+            }
             _ => "",
         };
 
@@ -1781,14 +1979,20 @@ impl HttpServer {
         let request_type = match first_line_words.next() {
             Some("GET") => HttpRequestType::GET,
             invalid => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid request type {invalid:?}")));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid request type {invalid:?}"),
+                ));
             }
         };
 
         let path = if let Some(path) = first_line_words.next() {
             Self::clean_path(path)
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request path"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid request path",
+            ));
         };
 
         let mut origin = None;
@@ -1868,13 +2072,19 @@ impl HttpServer {
             it += 1;
 
             if active_streams.is_empty() {
-                listener.set_nonblocking(false).expect("Unable to set socket to nonblocking mode");
+                listener
+                    .set_nonblocking(false)
+                    .expect("Unable to set socket to nonblocking mode");
             } else {
-                listener.set_nonblocking(true).expect("Unable to set socket to nonblocking mode");
+                listener
+                    .set_nonblocking(true)
+                    .expect("Unable to set socket to nonblocking mode");
             }
 
             if let Ok((mut stream, peer_addr)) = listener.accept() {
-                stream.set_nonblocking(true).expect("Failed to change blocking of stream");
+                stream
+                    .set_nonblocking(true)
+                    .expect("Failed to change blocking of stream");
 
                 let n = loop {
                     match stream.read(&mut buffer) {
@@ -1887,7 +2097,8 @@ impl HttpServer {
                     };
                 };
                 let start_timer = Instant::now();
-                let (header, body) = HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
+                let (header, body) =
+                    HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
 
                 // println!(
                 //     "[{peer_addr}] Received {:?} request for {:?} of length {}",
@@ -1903,12 +2114,16 @@ impl HttpServer {
                     "/ws" => {
                         // print!("[{peer_addr:?}] Upgrading websocket ... ");
                         let response = HttpServer::upgrade_websocket(header);
-                        stream.write_all(&response).expect("Failed to write to stream");
+                        stream
+                            .write_all(&response)
+                            .expect("Failed to write to stream");
                         stream.flush().expect("Failed to flush stream");
                         is_ws = true;
                     }
                     path => {
-                        let res: Result<Cow<'_, AssetData>, HttpServerError> = if path.starts_with("/api") {
+                        let res: Result<Cow<'_, AssetData>, HttpServerError> = if path
+                            .starts_with("/api")
+                        {
                             router.serve_api(&header, body).map(Cow::Owned)
                         } else {
                             match router.content.assets.get_ref(&header.path) {
@@ -1919,12 +2134,16 @@ impl HttpServer {
 
                         let bytes = match res {
                             Ok(content) => Self::build_response(HttpResponseCode::Ok, &content),
-                            Err(HttpServerError::Redirect(redirect_path)) => {
-                                Self::build_response(HttpResponseCode::RedirectOther(redirect_path), &AssetData::Empty)
-                            }
+                            Err(HttpServerError::Redirect(redirect_path)) => Self::build_response(
+                                HttpResponseCode::RedirectOther(redirect_path),
+                                &AssetData::Empty,
+                            ),
                             Err(err) => {
                                 println!("Server error {err:#?}");
-                                Self::build_response(HttpResponseCode::InternalServer, &AssetData::Empty)
+                                Self::build_response(
+                                    HttpResponseCode::InternalServer,
+                                    &AssetData::Empty,
+                                )
                             }
                         };
                         stream.write_all(&bytes).expect("Failed to write to stream");
@@ -2208,7 +2427,12 @@ impl Content {
 
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
-            let key_path = format!("/{}", path.strip_prefix(ASSETS_PATH).expect("Failed to strip prefix").to_string_lossy());
+            let key_path = format!(
+                "/{}",
+                path.strip_prefix(ASSETS_PATH)
+                    .expect("Failed to strip prefix")
+                    .to_string_lossy()
+            );
 
             match self.assets.get_ref_mut(&key_path) {
                 Some(existing_asset) if last_modified > existing_asset.last_modified => {
@@ -2241,7 +2465,14 @@ impl Content {
         }
         let str_paths = paths
             .iter()
-            .map(|p| format!("/{}", p.strip_prefix(ASSETS_PATH).expect("Failed to strip prefix").to_string_lossy()))
+            .map(|p| {
+                format!(
+                    "/{}",
+                    p.strip_prefix(ASSETS_PATH)
+                        .expect("Failed to strip prefix")
+                        .to_string_lossy()
+                )
+            })
             .collect(); // Todo unfuck
         if self.assets.remove_other_than_except_generated(str_paths) {
             changed = true;
@@ -2383,7 +2614,11 @@ where
         result
     }
 
-    fn dfs<'a>(node: &'a mut TrieNode<T>, path: &mut PathBuf, result: &mut Vec<(PathBuf, &'a mut T)>) {
+    fn dfs<'a>(
+        node: &'a mut TrieNode<T>,
+        path: &mut PathBuf,
+        result: &mut Vec<(PathBuf, &'a mut T)>,
+    ) {
         if let Some(asset) = node.asset.as_mut() {
             result.push((path.clone(), asset));
         }
@@ -2429,7 +2664,8 @@ where
     fn remove_other_than_except_generated(&mut self, current_paths: Vec<String>) -> bool {
         let current_paths_set: HashSet<String> = current_paths.into_iter().collect();
 
-        let paths_to_delete: Vec<String> = self.paths.difference(&current_paths_set).cloned().collect();
+        let paths_to_delete: Vec<String> =
+            self.paths.difference(&current_paths_set).cloned().collect();
 
         let mut changed = false;
 
@@ -2451,9 +2687,10 @@ where
 }
 
 const BASE64_CONVERSION: [char; 64] = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c',
-    'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5',
-    '6', '7', '8', '9', '+', '/',
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
+    'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
+    'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4',
+    '5', '6', '7', '8', '9', '+', '/',
 ];
 
 fn base64(bytes: &[u8]) -> String {
@@ -2521,8 +2758,10 @@ fn sha1(input: String) -> [u8; 20] {
     for chunk in bytes.chunks_exact(64) {
         // Chunks of 512 bits
         for i in 0..16 {
-            words[i] =
-                ((chunk[4 * i] as u32) << 24) | ((chunk[4 * i + 1] as u32) << 16) | ((chunk[4 * i + 2] as u32) << 8) | (chunk[4 * i + 3] as u32);
+            words[i] = ((chunk[4 * i] as u32) << 24)
+                | ((chunk[4 * i + 1] as u32) << 16)
+                | ((chunk[4 * i + 2] as u32) << 8)
+                | (chunk[4 * i + 3] as u32);
         }
         for i in 16..80 {
             // w[i] = (w[i-3] xor w[i-8] xor w[i-14] xor w[i-16]) leftrotate 1
@@ -2546,7 +2785,12 @@ fn sha1(input: String) -> [u8; 20] {
                 (b ^ c ^ d, 0xCA62C1D6)
             };
 
-            let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*word);
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
 
             e = d;
             d = c;
@@ -2590,7 +2834,10 @@ impl MarkdownMetadata {
     fn parse_metadata(input: &str) -> (Self, &str) {
         let mut cursor: usize = 0;
 
-        let first_line_end = input[cursor..].find('\n').map(|i| cursor + i).unwrap_or(input.len());
+        let first_line_end = input[cursor..]
+            .find('\n')
+            .map(|i| cursor + i)
+            .unwrap_or(input.len());
 
         let first_line = &input[cursor..first_line_end];
 
@@ -2607,23 +2854,36 @@ impl MarkdownMetadata {
         let mut metadata_lines = vec![];
 
         loop {
-            let line_end = input[cursor..].find('\n').map(|i| cursor + i).unwrap_or(input.len());
+            let line_end = input[cursor..]
+                .find('\n')
+                .map(|i| cursor + i)
+                .unwrap_or(input.len());
 
             let line = &input[cursor..line_end];
 
             if line.starts_with("::::") {
-                cursor = if line_end < input.len() { line_end + 1 } else { line_end };
+                cursor = if line_end < input.len() {
+                    line_end + 1
+                } else {
+                    line_end
+                };
 
                 break;
             }
             metadata_lines.push(line);
             if line_end == input.len() {
-                return (MarkdownMetadata::parse_metadata_content(metadata_lines), input);
+                return (
+                    MarkdownMetadata::parse_metadata_content(metadata_lines),
+                    input,
+                );
             }
 
             cursor = line_end + 1;
         }
-        (MarkdownMetadata::parse_metadata_content(metadata_lines), &input[cursor..])
+        (
+            MarkdownMetadata::parse_metadata_content(metadata_lines),
+            &input[cursor..],
+        )
     }
 
     fn parse_metadata_content(lines: Vec<&str>) -> MarkdownMetadata {
@@ -2681,7 +2941,11 @@ impl MarkdownMetadata {
     fn parse_date(value: &str) -> Option<String> {
         let value = value.trim();
 
-        if !value.is_empty() { Some(value.to_string()) } else { None }
+        if !value.is_empty() {
+            Some(value.to_string())
+        } else {
+            None
+        }
     }
     fn parse_tags(value: &str) -> Vec<String> {
         if !value.starts_with('[') || !value.ends_with(']') {
@@ -2712,8 +2976,14 @@ enum MarkdownNode<'a> {
 
     // Block
     Paragraph(Vec<MarkdownNode<'a>>),
-    Heading { level: usize, children: Vec<MarkdownNode<'a>> },
-    CodeBlock { language: Option<&'a str>, content: Vec<&'a str> },
+    Heading {
+        level: usize,
+        children: Vec<MarkdownNode<'a>>,
+    },
+    CodeBlock {
+        language: Option<&'a str>,
+        content: Vec<&'a str>,
+    },
     OrderedList(Vec<MarkdownNode<'a>>),
     UnorderedList(Vec<MarkdownNode<'a>>),
     BlockQuote(Vec<MarkdownNode<'a>>),
@@ -2728,8 +2998,14 @@ enum MarkdownNode<'a> {
     Bold(Vec<MarkdownNode<'a>>),
     StrikeThrough(Vec<MarkdownNode<'a>>),
     InlineCode(&'a str),
-    Link { text: Vec<MarkdownNode<'a>>, url: &'a str },
-    Image { alt: &'a str, path: &'a str },
+    Link {
+        text: Vec<MarkdownNode<'a>>,
+        url: &'a str,
+    },
+    Image {
+        alt: &'a str,
+        path: &'a str,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2868,7 +3144,10 @@ impl Span {
         self.end - self.start
     }
     fn from_single(idx: usize) -> Self {
-        Self { start: idx, end: idx + 1 }
+        Self {
+            start: idx,
+            end: idx + 1,
+        }
     }
     fn from_double(start: usize, end: usize) -> Self {
         Self { start, end }
@@ -2902,9 +3181,15 @@ impl<'a> MarkdownListLine<'a> {
             rest => (0, rest),
         };
         let (list_marker, content) = match rest {
-            [Dash(span), Whitespace(_), content @ ..] if span.len() == 1 => (ListMarker::Dash, content),
-            [Asterisk(span), Whitespace(_), content @ ..] if span.len() == 1 => (ListMarker::Asterisk, content),
-            [Plus(span), Whitespace(_), content @ ..] if span.len() == 1 => (ListMarker::Plus, content),
+            [Dash(span), Whitespace(_), content @ ..] if span.len() == 1 => {
+                (ListMarker::Dash, content)
+            }
+            [Asterisk(span), Whitespace(_), content @ ..] if span.len() == 1 => {
+                (ListMarker::Asterisk, content)
+            }
+            [Plus(span), Whitespace(_), content @ ..] if span.len() == 1 => {
+                (ListMarker::Plus, content)
+            }
             [TextRaw(text), Whitespace(_), content @ ..]
                 if text
                     .to_str(input)
@@ -2965,7 +3250,10 @@ impl MarkdownParser {
                         ' ' => Some((Whitespace(Span::from_double(i, i + repeated)), repeated)),
                         '_' => Some((Underscore(Span::from_double(i, i + repeated)), repeated)),
                         '+' => Some((Plus(Span::from_double(i, i + repeated)), repeated)),
-                        '>' => Some((BlockQuoteMarker(Span::from_double(i, i + repeated)), repeated)),
+                        '>' => Some((
+                            BlockQuoteMarker(Span::from_double(i, i + repeated)),
+                            repeated,
+                        )),
                         '`' => Some((Backtick(Span::from_double(i, i + repeated)), repeated)),
                         '*' => Some((Asterisk(Span::from_double(i, i + repeated)), repeated)),
                         '~' => Some((Tilde(Span::from_double(i, i + repeated)), repeated)),
@@ -2977,7 +3265,10 @@ impl MarkdownParser {
 
             if let Some((token, repeated_non_text)) = token {
                 if text_len > 0 {
-                    tokens.push(TextRaw(Span::from_double(start_text_idx, start_text_idx + text_len)));
+                    tokens.push(TextRaw(Span::from_double(
+                        start_text_idx,
+                        start_text_idx + text_len,
+                    )));
                     start_text_idx += text_len;
                     text_len = 0;
                 }
@@ -2990,7 +3281,10 @@ impl MarkdownParser {
         }
 
         if text_len != 0 {
-            tokens.push(TextRaw(Span::from_double(start_text_idx, start_text_idx + text_len)));
+            tokens.push(TextRaw(Span::from_double(
+                start_text_idx,
+                start_text_idx + text_len,
+            )));
         }
 
         tokens
@@ -3008,7 +3302,10 @@ impl MarkdownParser {
         count
     }
 
-    fn parse_blocks<'tok: 'src, 'src>(tokens: &'tok [MarkdownToken], input: &'src str) -> Vec<MarkdownBlock<'src>> {
+    fn parse_blocks<'tok: 'src, 'src>(
+        tokens: &'tok [MarkdownToken],
+        input: &'src str,
+    ) -> Vec<MarkdownBlock<'src>> {
         use MarkdownBlock::*;
         use MarkdownToken::*;
 
@@ -3024,7 +3321,10 @@ impl MarkdownParser {
                 }
                 HeadingMarker(span) if span.len() <= 6 => {
                     let (content, rest) = Self::until_tok(rest, MarkdownTokenTyp::NewLine, false);
-                    blocks.push(Heading { level: span.len(), content });
+                    blocks.push(Heading {
+                        level: span.len(),
+                        content,
+                    });
                     rest
                 }
                 BlockQuoteMarker(_) if let Some((content, after)) = Self::parse_quote(tokens) => {
@@ -3043,7 +3343,8 @@ impl MarkdownParser {
                     after
                 }
                 _ => {
-                    let (content, after) = Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false);
+                    let (content, after) =
+                        Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false);
 
                     blocks.push(Paragraph { content });
                     after
@@ -3053,7 +3354,10 @@ impl MarkdownParser {
         blocks
     }
 
-    fn parse_codeblock<'a>(tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
+    fn parse_codeblock<'a>(
+        tokens: &'a [MarkdownToken],
+        input: &'a str,
+    ) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
         use MarkdownBlock::*;
         use MarkdownToken::*;
 
@@ -3076,7 +3380,10 @@ impl MarkdownParser {
         }
     }
 
-    fn parse_list<'a>(mut tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
+    fn parse_list<'a>(
+        mut tokens: &'a [MarkdownToken],
+        input: &'a str,
+    ) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
         let mut content = vec![];
         let mut marker = None;
 
@@ -3104,12 +3411,16 @@ impl MarkdownParser {
 
         match marker {
             Some(ListMarker::Numbered) => Some((MarkdownBlock::OrderedList { content }, tokens)),
-            Some(ListMarker::Dash | ListMarker::Asterisk | ListMarker::Plus) => Some((MarkdownBlock::UnorderedList { content }, tokens)),
+            Some(ListMarker::Dash | ListMarker::Asterisk | ListMarker::Plus) => {
+                Some((MarkdownBlock::UnorderedList { content }, tokens))
+            }
             None => None,
         }
     }
 
-    fn parse_quote<'a>(mut tokens: &'a [MarkdownToken]) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
+    fn parse_quote<'a>(
+        mut tokens: &'a [MarkdownToken],
+    ) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
         use MarkdownBlock::*;
         use MarkdownToken::*;
 
@@ -3118,7 +3429,10 @@ impl MarkdownParser {
         while !tokens.is_empty() {
             let (line, rest) = Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false);
             match line {
-                [BlockQuoteMarker(span), Whitespace(_), quote_content @ ..] | [BlockQuoteMarker(span), quote_content @ ..] if span.len() > 0 => {
+                [BlockQuoteMarker(span), Whitespace(_), quote_content @ ..]
+                | [BlockQuoteMarker(span), quote_content @ ..]
+                    if span.len() > 0 =>
+                {
                     content.push(quote_content);
                     tokens = rest;
                 }
@@ -3133,7 +3447,11 @@ impl MarkdownParser {
         }
     }
 
-    fn until_tok(tokens: &[MarkdownToken], until: MarkdownTokenTyp, include_split: bool) -> (&[MarkdownToken], &[MarkdownToken]) {
+    fn until_tok(
+        tokens: &[MarkdownToken],
+        until: MarkdownTokenTyp,
+        include_split: bool,
+    ) -> (&[MarkdownToken], &[MarkdownToken]) {
         let split = if let Some(pos) = tokens.iter().position(|token| token.typ() == until) {
             pos
         } else {
@@ -3189,7 +3507,9 @@ impl MarkdownParser {
                     });
                 }
                 MarkdownBlock::Paragraph { content } => {
-                    nodes.push(MarkdownNode::Paragraph(Self::parse_inline_helper(content, input)));
+                    nodes.push(MarkdownNode::Paragraph(Self::parse_inline_helper(
+                        content, input,
+                    )));
                 }
                 MarkdownBlock::OrderedList { content } => {
                     let lines = content
@@ -3229,14 +3549,20 @@ impl MarkdownParser {
         MarkdownNode::Document(nodes)
     }
 
-    fn parse_inline_helper<'a>(mut tokens: &'a [MarkdownToken], input: &'a str) -> Vec<MarkdownNode<'a>> {
+    fn parse_inline_helper<'a>(
+        mut tokens: &'a [MarkdownToken],
+        input: &'a str,
+    ) -> Vec<MarkdownNode<'a>> {
         use MarkdownNode::*;
         use MarkdownToken::*;
         let mut nodes = vec![];
         while !tokens.is_empty() {
             match &tokens {
                 [Backtick(open), rest @ ..] if open.len() == 1 => {
-                    if let Some(close_index) = rest.iter().position(|token| matches!(token, Backtick(span) if span.len() == 1)) {
+                    if let Some(close_index) = rest
+                        .iter()
+                        .position(|token| matches!(token, Backtick(span) if span.len() == 1))
+                    {
                         let Backtick(close) = &rest[close_index] else {
                             unreachable!();
                         };
@@ -3249,13 +3575,17 @@ impl MarkdownParser {
                         tokens = rest;
                     }
                 }
-                [Underscore(open), rest @ ..] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
-                    let close_index = tokens
-                        .iter()
-                        .enumerate()
-                        .position(|(idx, token)| matches!(token, Underscore(_)) && Self::delimiter_can_close(tokens, idx));
+                [Underscore(open), rest @ ..]
+                    if open.len() == 1 && Self::delimiter_can_open(tokens) =>
+                {
+                    let close_index = tokens.iter().enumerate().position(|(idx, token)| {
+                        matches!(token, Underscore(_)) && Self::delimiter_can_close(tokens, idx)
+                    });
                     if let Some(close_index) = close_index {
-                        nodes.push(Italic(Self::parse_inline_helper(&tokens[1..close_index], input)));
+                        nodes.push(Italic(Self::parse_inline_helper(
+                            &tokens[1..close_index],
+                            input,
+                        )));
 
                         tokens = &tokens[close_index + 1..];
                     } else {
@@ -3263,13 +3593,17 @@ impl MarkdownParser {
                         tokens = &tokens[1..];
                     }
                 }
-                [Asterisk(open), rest @ ..] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
-                    let close_index = tokens
-                        .iter()
-                        .enumerate()
-                        .position(|(idx, token)| matches!(token, Asterisk(_)) && Self::delimiter_can_close(tokens, idx));
+                [Asterisk(open), rest @ ..]
+                    if open.len() == 1 && Self::delimiter_can_open(tokens) =>
+                {
+                    let close_index = tokens.iter().enumerate().position(|(idx, token)| {
+                        matches!(token, Asterisk(_)) && Self::delimiter_can_close(tokens, idx)
+                    });
                     if let Some(close_index) = close_index {
-                        nodes.push(Bold(Self::parse_inline_helper(&tokens[1..close_index], input)));
+                        nodes.push(Bold(Self::parse_inline_helper(
+                            &tokens[1..close_index],
+                            input,
+                        )));
 
                         tokens = &tokens[close_index + 1..];
                     } else {
@@ -3278,12 +3612,14 @@ impl MarkdownParser {
                     }
                 }
                 [Tilde(open), rest @ ..] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
-                    let close_index = tokens
-                        .iter()
-                        .enumerate()
-                        .position(|(idx, token)| matches!(token, Tilde(_)) && Self::delimiter_can_close(tokens, idx));
+                    let close_index = tokens.iter().enumerate().position(|(idx, token)| {
+                        matches!(token, Tilde(_)) && Self::delimiter_can_close(tokens, idx)
+                    });
                     if let Some(close_index) = close_index {
-                        nodes.push(StrikeThrough(Self::parse_inline_helper(&tokens[1..close_index], input)));
+                        nodes.push(StrikeThrough(Self::parse_inline_helper(
+                            &tokens[1..close_index],
+                            input,
+                        )));
 
                         tokens = &tokens[close_index + 1..];
                     } else {
@@ -3309,7 +3645,11 @@ impl MarkdownParser {
                         tokens = after_open;
                     }
                 }
-                [first @ Exclamation { .. }, second @ BracketOpen { .. }, after_open @ ..] => {
+                [
+                    first @ Exclamation { .. },
+                    second @ BracketOpen { .. },
+                    after_open @ ..,
+                ] => {
                     if let Some((node, rest)) = Self::try_parse_image(after_open, input) {
                         nodes.push(node);
                         tokens = rest;
@@ -3349,11 +3689,16 @@ impl MarkdownParser {
         nodes
     }
 
-    fn try_parse_link<'a>(tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownNode<'a>, &'a [MarkdownToken])> {
+    fn try_parse_link<'a>(
+        tokens: &'a [MarkdownToken],
+        input: &'a str,
+    ) -> Option<(MarkdownNode<'a>, &'a [MarkdownToken])> {
         use MarkdownNode::*;
         use MarkdownToken::*;
 
-        let close_bracket = tokens.iter().position(|token| matches!(token, BracketClose { .. }))?;
+        let close_bracket = tokens
+            .iter()
+            .position(|token| matches!(token, BracketClose { .. }))?;
 
         let text_tokens = &tokens[..close_bracket];
         let after_bracket = &tokens[close_bracket + 1..];
@@ -3370,11 +3715,16 @@ impl MarkdownParser {
             rest,
         ))
     }
-    fn try_parse_image<'a>(tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownNode<'a>, &'a [MarkdownToken])> {
+    fn try_parse_image<'a>(
+        tokens: &'a [MarkdownToken],
+        input: &'a str,
+    ) -> Option<(MarkdownNode<'a>, &'a [MarkdownToken])> {
         use MarkdownNode::*;
         use MarkdownToken::*;
 
-        let close_bracket = tokens.iter().position(|token| matches!(token, BracketClose { .. }))?;
+        let close_bracket = tokens
+            .iter()
+            .position(|token| matches!(token, BracketClose { .. }))?;
 
         let text_tokens = &tokens[..close_bracket];
         let after_bracket = &tokens[close_bracket + 1..];
@@ -3398,20 +3748,31 @@ impl MarkdownParser {
     fn is_inline_special(token: &MarkdownToken) -> bool {
         matches!(
             token,
-            MarkdownToken::BracketOpen { .. } | MarkdownToken::Backtick(_) | MarkdownToken::Underscore(_) | MarkdownToken::Asterisk(_)
+            MarkdownToken::BracketOpen { .. }
+                | MarkdownToken::Backtick(_)
+                | MarkdownToken::Underscore(_)
+                | MarkdownToken::Asterisk(_)
         )
     }
     fn delimiter_can_open(tokens: &[MarkdownToken]) -> bool {
-        tokens
-            .first()
-            .is_some_and(|token| !matches!(token, MarkdownToken::Whitespace(_) | MarkdownToken::NewLine(_)))
+        tokens.first().is_some_and(|token| {
+            !matches!(
+                token,
+                MarkdownToken::Whitespace(_) | MarkdownToken::NewLine(_)
+            )
+        })
     }
 
     fn delimiter_can_close(tokens: &[MarkdownToken], index: usize) -> bool {
         index
             .checked_sub(1)
             .and_then(|index| tokens.get(index))
-            .is_some_and(|token| !matches!(token, MarkdownToken::Whitespace(_) | MarkdownToken::NewLine(_)))
+            .is_some_and(|token| {
+                !matches!(
+                    token,
+                    MarkdownToken::Whitespace(_) | MarkdownToken::NewLine(_)
+                )
+            })
     }
 
     fn to_html(node: MarkdownNode) -> String {
