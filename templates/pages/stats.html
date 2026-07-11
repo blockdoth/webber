@@ -1,0 +1,47 @@
+{{extends "layout.html"}}
+
+{{block css}}
+<style>
+  .stat_entry {
+    border: 1px solid white;
+    color: white;
+    padding: 10px;
+    margin: 20px;
+    display: flex;     
+    gap: 2;           
+  }  
+
+  .url {
+    font-style: italic;
+    color: gray;
+
+  }  
+  .hits {
+
+  }
+  .stats {
+    margin-left: auto;
+    padding-right: 10px;
+  }
+</style>
+{{endBlock}}
+
+{{block body}}
+
+{{for page in stats.pages}}
+
+<div class="stat_entry">
+  <p class="url">{{page.path}}</p>
+  
+  <div class="stats">
+    <p>Total hits:&nbsp{{page.count}}</p>
+    <p>Avg time:&nbsp&nbsp&nbsp{{page.avg}}</p>
+
+  </div>
+
+</div>
+
+
+{{endFor}}
+
+{{endBlock}}

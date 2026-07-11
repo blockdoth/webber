@@ -5,7 +5,7 @@
 <style>
   .post {
     padding: 20px;
-    
+    margin: 2rem;
   }
 
 </style>
@@ -13,9 +13,7 @@
 
 {{block body}}
 <div class="post">
-  <h2>{{post.title}}</h2>
-  <p>{{post.published}}</p>
-  <p>{{post.content}}</p>
+  {{post.content}}
 
 
 </div>

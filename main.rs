@@ -1,19 +1,21 @@
 #![feature(tcp_linger)]
 #![feature(if_let_guard)]
 #![feature(hash_map_macro)]
-#![allow(unused, unused_mut)]
+#![feature(slice_split_once)]
+#![allow(unused)]
+// #![allow(unused_mut)]
+
 use core::panic;
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::fs::Metadata;
-use std::hash::Hash;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
 use std::process::Command;
+use std::str::CharIndices;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use std::vec::IntoIter;
@@ -31,6 +33,10 @@ fn main() -> Result<(), TemplateError> {
         println!("cargo:warning=Running in build script");
         comptime();
     } else {
+        // let file = fs::read_to_string("./assets/posts/test.md").unwrap();
+
+        // let html = MarkdownParser::parse(&file);
+
         println!("Running normally");
 
         let content = Content::load_embedded()?;
@@ -46,6 +52,7 @@ fn main() -> Result<(), TemplateError> {
             .route_static_page("/posts", "pages/posts.html")
             .route_static_page("/about", "pages/about.html")
             .route_static_page("/qoutes", "pages/quotes.html")
+            .route_static_page("/stats", "pages/stats.html")
             .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
             .fallback("/home");
 
@@ -61,7 +68,7 @@ impl Context {
     fn load_intial(content: &Content) -> Context {
         let mut context = Context::new();
 
-        context.update_posts(&content);
+        context.update_posts(content);
         context.insert_global("copyright_start", TemplateValue::Text("2026".to_string()));
         context.insert_global("copyright_end", TemplateValue::Text("2026".to_string())); // TODO make dynamic
 
@@ -288,21 +295,6 @@ macro_rules! impl_to_template_value {
         }
     };
 }
-
-struct BallContainer {
-    is_empty: bool,
-}
-
-struct Post {
-    slug: String,
-    title: String,
-    intro: String,
-    display: bool,
-}
-
-impl_to_template_value!(BallContainer, { is_empty });
-impl_to_template_value!(Post, { title, intro, display, slug});
-impl_to_template_value!(Asset, { last_modified, data, internal});
 
 #[derive(Debug, Clone)]
 struct TemplateNode {
@@ -851,27 +843,21 @@ impl TemplateParser {
             match &next_token.kind {
                 If => {
                     parsed.push(self.parse_if()?);
-                    // println!("Parsed if");
                 }
                 Identifier(_) => {
                     parsed.push(self.parse_var()?);
-                    // println!("Parsed identifier");
                 }
                 For => {
                     parsed.push(self.parse_for()?);
-                    // println!("Parsed for");
                 }
                 Block => {
                     parsed.push(self.parse_block()?);
-                    // println!("Parsed for");
                 }
                 Extends => {
                     return Err(TemplateParseError::new(
                         TemplateParseErrorMsg::ExtendsNotFirstLine,
                         next_token.metadata.clone(),
                     ))?;
-
-                    // println!("Parsed for");
                 }
                 Text(text) => {
                     parsed.push(TemplateNode {
@@ -926,11 +912,9 @@ impl TemplateParser {
                 ))?;
             }
         };
-        // println!("{:?}", condition);
-        // self.show_next_n_tokens(3);
+
         let then_branch = self.parse_until(&[Else, EndIf])?;
-        // println!("{:?}", then_branch);
-        // Self::show_next_n_tokens(tokens, 3);
+
         match self.next_token()?.kind {
             Else => {
                 // Self::show_next_n_tokens(tokens, 3);
@@ -975,8 +959,6 @@ impl TemplateParser {
 
     fn parse_block(&mut self) -> Result<TemplateNode, TemplateError> {
         use TemplateTokenKind::*;
-
-        let start_block = self.consume(Block)?;
 
         let ident_node = self.parse_var()?;
 
@@ -1088,11 +1070,6 @@ impl TemplateParser {
         }
         println!();
     }
-}
-
-struct ParsedTemplate {
-    extends: Option<String>,
-    template: Vec<TemplateNode>,
 }
 
 #[derive(Debug)]
@@ -1251,7 +1228,6 @@ impl Template {
 
         let mut idx = 1;
         for field in &ident_fields[1..] {
-            // println!("Field: {field}\n{current:#?}");
             current = match current {
                 TemplateValue::Object(map) => {
                     if let Some(obj) = map.get(field.as_str()) {
@@ -1336,10 +1312,6 @@ impl Context {
     }
 
     fn lookup(&self, key: &str) -> Option<&TemplateValue> {
-        // println!("{key}");
-        // println!("{:#?}", self.global_context);
-        // println!("{:#?}", self.local_context);
-
         if let Some(val) = self.global_context.get(key) {
             Some(val)
         } else {
@@ -1374,10 +1346,10 @@ impl Context {
 
         if let TemplateValue::List(list) = &post_values {
             for post in list {
-                if let TemplateValue::Object(object) = post {
-                    if let Some(TemplateValue::Text(slug)) = object.get("slug") {
-                        posts_by_slug.insert(slug.clone(), post.clone());
-                    }
+                if let TemplateValue::Object(object) = post
+                    && let Some(TemplateValue::Text(slug)) = object.get("slug")
+                {
+                    posts_by_slug.insert(slug.clone(), post.clone());
                 }
             }
         }
@@ -1386,7 +1358,6 @@ impl Context {
 
         self.global_context
             .insert("posts_by_slug".to_string(), TemplateValue::Object(posts_by_slug));
-        // println!("Updated context {:#?}", self.global_context);
     }
 }
 
@@ -1411,6 +1382,45 @@ impl Stats {
     }
 }
 
+impl ToTemplateValue for Duration {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::Text(format!("{:.2?}", self))
+    }
+}
+
+// impl ToTemplateValue for RequestStats {
+//   fn to_template_value(&self) -> TemplateValue {
+//       TemplateValue::Object(hash_map! {
+//         "count".to_string() => TemplateValue::Text(format!("{}",  self.count)),
+//         "total_time".to_string() => self.total_time.to_template_value(),
+//         "avg".to_string() => self.avg().to_template_value()
+//       }
+//       )
+//   }
+// }
+
+impl ToTemplateValue for Stats {
+    fn to_template_value(&self) -> TemplateValue {
+        let pages = self
+            .request_stats
+            .iter()
+            .map(|(path, stats)| {
+                TemplateValue::Object(hash_map! {
+                  "path".to_string() => TemplateValue::Text(path.to_string()),
+                  "count".to_string() => TemplateValue::Text(format!("{}",  stats.count)),
+                  "total_time".to_string() => stats.total_time.to_template_value(),
+                  "avg".to_string() => stats.avg().to_template_value()
+                })
+            })
+            .collect();
+
+        TemplateValue::Object(HashMap::from([
+            ("start_time".to_string(), self.start_time.to_template_value()),
+            ("pages".to_string(), TemplateValue::List(pages)),
+        ]))
+    }
+}
+
 #[derive(Debug)]
 struct RequestStats {
     count: u32,
@@ -1431,8 +1441,8 @@ impl RequestStats {
 
 #[derive(Debug)]
 struct DynamicRoute {
-    base_url: String,
-    page_list_name: String,
+    _base_url: String,
+    _page_list_name: String,
     page_var_name: String,
     template_path: String,
     cached_page: Option<String>,
@@ -1530,8 +1540,8 @@ impl Router {
                 let url = format!("{base_path}{slug}");
 
                 let dyn_route = DynamicRoute {
-                    base_url: base_path.to_owned(),
-                    page_list_name: list_name.to_owned(),
+                    _base_url: base_path.to_owned(),
+                    _page_list_name: list_name.to_owned(),
                     page_var_name: key.to_owned(),
                     template_path: base_template_path.to_owned(),
                     slug: slug.to_string(),
@@ -1551,11 +1561,6 @@ impl Router {
     }
 
     fn serve_page(&mut self, header: &HttpRequestHeader, _body: AssetData) -> Result<AssetData, HttpServerError> {
-        // println!("{:#?}", self.templates);
-        // println!("{:#?}", self.routes.keys());
-        // println!("{:#?}", self.content.templates.keys());
-        // println!("{:?}", header.path);
-
         match self.static_routes.get(&header.path) {
             Some(route) if let Some(cached) = &route.cached_page => {
                 println!("Serving cached page {}", header.path);
@@ -1563,8 +1568,14 @@ impl Router {
                 Ok(AssetData::Html(cached.to_string()))
             }
             Some(route) => {
-                // println!("Serving page {}", header.path);
+                self.context.push();
+
+                if header.path == "/stats" {
+                    self.context.insert_local("stats", self.stats.to_template_value());
+                }
+
                 let page = Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
+                self.context.pop();
                 Ok(AssetData::Html(page))
             }
             _ => match self.dynamic_routes.get(&header.path) {
@@ -1605,7 +1616,6 @@ impl Router {
 
     fn render_template(templates: &HashMap<String, Template>, context: &mut Context, path: &str) -> Result<String, TemplateError> {
         let template = templates.get(path).expect("template not found");
-        // println!("{template:#?}");
         if let Some(parent_path) = &template.parent {
             let parent = templates.get(parent_path).expect("Parent template not found: {parent_path}");
             if parent.parent.is_some() {
@@ -1664,18 +1674,17 @@ enum HttpResponseCode {
     InternalServer,
 }
 
-impl HttpResponseCode {
-    pub fn to_string(&self) -> String {
+impl fmt::Display for HttpResponseCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HttpResponseCode::Ok => "200 OK".to_string(),
-            HttpResponseCode::RedirectOther(redirect) => format!("303 See Other\r\nLocation: {redirect}"),
-            HttpResponseCode::NotFound => "404 Not Found".to_string(),
-            HttpResponseCode::BadRequest => "400 Bad Request".to_string(),
-            HttpResponseCode::InternalServer => "500 Internal Server Error".to_string(),
+            HttpResponseCode::Ok => write!(f, "200 OK"),
+            HttpResponseCode::RedirectOther(redirect) => write!(f, "303 See Other\r\nLocation: {redirect}"),
+            HttpResponseCode::NotFound => write!(f, "404 Not Found"),
+            HttpResponseCode::BadRequest => write!(f, "400 Bad Request"),
+            HttpResponseCode::InternalServer => write!(f, "500 Internal Server Error"),
         }
     }
 }
-
 #[derive(Debug)]
 struct HttpRequestHeader {
     typ: HttpRequestType,
@@ -1704,7 +1713,6 @@ impl HttpServer {
         {
             let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
             let websocket_accept = base64(&sha1(format!("{}{magic_string}", sec_websocket_key.trim())));
-            // println!("Succeeded");
             format!(
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
             )
@@ -1775,7 +1783,7 @@ impl HttpServer {
         };
 
         let path = if let Some(path) = first_line_words.next() {
-            path
+            Self::clean_path(path)
         } else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request path"));
         };
@@ -1821,6 +1829,12 @@ impl HttpServer {
             upgrade,
             content_typ,
         })
+    }
+
+    fn clean_path(path: &str) -> &str {
+        let end = path.find(['?', '#', '%']).unwrap_or(path.len());
+
+        &path[..end]
     }
 
     fn serve(listener: TcpListener, mut router: Router) {
@@ -1921,7 +1935,6 @@ impl HttpServer {
                 #[cfg(debug_assertions)]
                 {
                     if is_ws {
-                        // thread::sleep(Duration::from_secs(2));
                         active_streams.push(stream);
                         // println!("Active connections {}", active_streams.len());
                     }
@@ -2073,16 +2086,16 @@ impl AssetData {
 
     fn typ(&self) -> &str {
         match self {
-            AssetData::Text(_) => "text/plain",
-            AssetData::Html(_) => "text/html",
+            AssetData::Text(_) => "text/plain; charset=utf-8",
+            AssetData::Html(_) => "text/html; charset=utf-8",
             AssetData::Css(_) => "text/css",
             AssetData::Js(_) => "text/javascript",
             AssetData::Png(_) => "image/png",
             AssetData::Ico(_) => "image/ico",
-            AssetData::MdRaw(_) => "text/plain",
-            AssetData::MdParsed(_) => "text/html",
+            AssetData::MdRaw(_) => "text/plain; charset=utf-8",
+            AssetData::MdParsed(_) => "text/html; charset=utf-8",
             AssetData::Woff2(_) => "font/woff2",
-            AssetData::Unknown(_) => "text/plain",
+            AssetData::Unknown(_) => "text/plain; charset=utf-8",
             AssetData::Empty => "",
         }
     }
@@ -2132,7 +2145,7 @@ impl Content {
 
         #[cfg(not(generated))]
         // Stub to make the compiler happy
-        let mut assets = Trie::new();
+        let assets = Trie::new();
         #[cfg(not(generated))]
         let templates = HashMap::new();
         // assets
@@ -2143,7 +2156,7 @@ impl Content {
         let assets_changed = match self.update_assets() {
             Ok(assets_changed) => {
                 if assets_changed {
-                    context.update_posts(&self);
+                    context.update_posts(self);
                 }
                 assets_changed
             }
@@ -2159,26 +2172,19 @@ impl Content {
     fn update_templates(&mut self) -> Result<bool, TemplateError> {
         let paths = walk_dir(TEMPLATES_PATH);
         let mut is_new = true;
-        // println!("{:?}", self.templates.keys());
         let mut changed = false;
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
             let path_str = path.to_string_lossy().to_string();
-            let key_path = path_str.strip_prefix(TEMPLATES_PATH).expect("invariant");
 
             for (key, template) in self.templates.iter_mut() {
-                // println!("{} {} {:?}",key, path_str, template.origin_file);
                 if template.origin_file == path_str {
                     is_new = false;
                     if template.last_modified < last_modified {
                         Template::update_from_path(template, path)?;
                         changed = true;
 
-                        println!(
-                            "Updated template {:?}, for page: {key:?}",
-                            path_str,
-                            // last_modified.elapsed().unwrap().as_secs() / 60
-                        );
+                        println!("Updated template {:?}, for page: {key:?}", path_str,);
                     }
                 }
             }
@@ -2194,7 +2200,7 @@ impl Content {
     }
 
     fn update_assets(&mut self) -> Result<bool, TemplateError> {
-        let mut paths = walk_dir(ASSETS_PATH);
+        let paths = walk_dir(ASSETS_PATH);
         let mut changed = false;
 
         for path in &paths {
@@ -2561,54 +2567,6 @@ fn sha1(input: String) -> [u8; 20] {
     digest
 }
 
-#[derive(Debug)]
-enum MarkdownNode<'a> {
-    Document(Vec<MarkdownNode<'a>>),
-
-    // Block
-    Paragraph(Vec<MarkdownNode<'a>>),
-    Heading { level: u8, children: Vec<MarkdownNode<'a>> },
-    CodeBlock { language: Option<&'a str>, content: Vec<&'a str> },
-    OrderedList(Vec<MarkdownNode<'a>>),
-    UnorderedList(Vec<MarkdownNode<'a>>),
-    ListItem(Vec<MarkdownNode<'a>>),
-    BlockQuote(Vec<MarkdownNode<'a>>),
-    HorizontalLine,
-    Table,
-
-    // Inline
-    Text(&'a str),
-    Italic(Vec<MarkdownNode<'a>>),
-    Bold(Vec<MarkdownNode<'a>>),
-    InlineCode(&'a str),
-    Link { text: Vec<MarkdownNode<'a>>, url: &'a str },
-}
-
-#[derive(Debug, Clone)]
-enum MarkDownBlock<'a> {
-    Heading { level: u8, content: &'a str },
-    Paragraph { content: Vec<&'a str> },
-    OrderedList { content: Vec<&'a str> },
-    UnorderedList { content: Vec<&'a str> },
-    BlockQuote { content: Vec<&'a str> },
-    Table { content: Vec<&'a str> },
-    CodeBlock { language: &'a str, content: Vec<&'a str> },
-    BreakLine,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum BlockTyp {
-    Paragraph,
-    OrderedList,
-    UnorderedList,
-    BlockQuote,
-    CodeBlockLine,
-    CodeBlockBlock,
-    HorizontalLine,
-    Table,
-    Misc,
-}
-
 #[derive(Clone, Debug)]
 
 struct ParsedMarkdown {
@@ -2626,7 +2584,46 @@ struct MarkdownMetadata {
 }
 
 impl MarkdownMetadata {
-    fn parse_metadata(lines: Vec<&str>) -> MarkdownMetadata {
+    fn parse_metadata(input: &str) -> (Self, &str) {
+        let mut cursor: usize = 0;
+
+        let first_line_end = input[cursor..].find('\n').map(|i| cursor + i).unwrap_or(input.len());
+
+        let first_line = &input[cursor..first_line_end];
+
+        if !first_line.starts_with("::::") {
+            panic!("markdown must have metadata");
+        }
+
+        cursor = if first_line_end < input.len() {
+            first_line_end + 1
+        } else {
+            first_line_end
+        };
+
+        let mut metadata_lines = vec![];
+
+        loop {
+            let line_end = input[cursor..].find('\n').map(|i| cursor + i).unwrap_or(input.len());
+
+            let line = &input[cursor..line_end];
+
+            if line.starts_with("::::") {
+                cursor = if line_end < input.len() { line_end + 1 } else { line_end };
+
+                break;
+            }
+            metadata_lines.push(line);
+            if line_end == input.len() {
+                return (MarkdownMetadata::parse_metadata_content(metadata_lines), input);
+            }
+
+            cursor = line_end + 1;
+        }
+        (MarkdownMetadata::parse_metadata_content(metadata_lines), &input[cursor..])
+    }
+
+    fn parse_metadata_content(lines: Vec<&str>) -> MarkdownMetadata {
         let mut title: Option<String> = None;
         let mut slug: Option<String> = None;
         let mut published: Option<String> = None;
@@ -2645,7 +2642,6 @@ impl MarkdownMetadata {
             let key = key.trim();
             let value = value.trim();
 
-            // println!("{key}={value}");
             match key {
                 "title" => title = Self::parse_string(value),
                 "slug" => slug = Self::parse_string(value),
@@ -2706,292 +2702,713 @@ impl MarkdownMetadata {
         tags
     }
 }
-// title = "Title 1"
-// slug = "title-1"
-// published = 2026-07-07
-// updated = 2026-07-07
-// tags = ["test", "testos"]
-// draft = false
+
+#[derive(Debug)]
+enum MarkdownNode<'a> {
+    Document(Vec<MarkdownNode<'a>>),
+
+    // Block
+    Paragraph(Vec<MarkdownNode<'a>>),
+    Heading { level: usize, children: Vec<MarkdownNode<'a>> },
+    CodeBlock { language: Option<&'a str>, content: Vec<&'a str> },
+    OrderedList(Vec<MarkdownNode<'a>>),
+    UnorderedList(Vec<MarkdownNode<'a>>),
+    BlockQuote(Vec<MarkdownNode<'a>>),
+    ListItem(Vec<MarkdownNode<'a>>),
+    HorizontalLine,
+    _Table,
+    BreakLine,
+
+    // Inline
+    Text(&'a str),
+    Italic(Vec<MarkdownNode<'a>>),
+    Bold(Vec<MarkdownNode<'a>>),
+    StrikeThrough(Vec<MarkdownNode<'a>>),
+    InlineCode(&'a str),
+    Link { text: Vec<MarkdownNode<'a>>, url: &'a str },
+    Image { alt: &'a str, path: &'a str },
+}
+
+#[derive(Debug, Clone)]
+enum MarkdownBlock<'a> {
+    Heading {
+        level: usize,
+        content: &'a [MarkdownToken],
+    },
+    Paragraph {
+        content: &'a [MarkdownToken],
+    },
+    OrderedList {
+        content: Vec<&'a [MarkdownToken]>,
+    },
+    UnorderedList {
+        content: Vec<&'a [MarkdownToken]>,
+    },
+    BlockQuote {
+        content: Vec<&'a [MarkdownToken]>,
+    },
+    _Table {
+        content: Vec<&'a [MarkdownToken]>,
+    },
+    CodeBlock {
+        language: Option<&'a str>,
+        content: &'a [MarkdownToken],
+    },
+    _BreakLine,
+    HorizontalLine,
+}
+
+#[derive(Debug, Clone)]
+enum MarkdownToken {
+    NewLine(Span),
+    BracketOpen(Span),
+    BracketClose(Span),
+    ParenOpen(Span),
+    ParenClose(Span),
+
+    HeadingMarker(Span),    // #, ##, ### ...
+    BlockQuoteMarker(Span), // > or >> maybe
+    Whitespace(Span),
+    Asterisk(Span),
+    Tilde(Span),
+    Underscore(Span),
+    Backtick(Span),
+    Dash(Span),
+    Plus(Span),
+    Exclamation(Span),
+
+    TextRaw(Span),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum MarkdownTokenTyp {
+    NewLine,
+    BracketOpen,
+    BracketClose,
+    ParenOpen,
+    ParenClose,
+
+    HeadingMarker(usize),    // #, ##, ### ...
+    BlockQuoteMarker(usize), // > or >> maybe
+    Whitespace(usize),
+    Asterisk(usize),
+    Underscore(usize),
+    Backtick(usize),
+    Dash(usize),
+    Plus(usize),
+    Tilde(usize),
+    Exclamation(usize),
+
+    TextRaw,
+}
+
+impl MarkdownToken {
+    fn typ(&self) -> MarkdownTokenTyp {
+        match self {
+            MarkdownToken::NewLine(_) => MarkdownTokenTyp::NewLine,
+            MarkdownToken::BracketOpen(_) => MarkdownTokenTyp::BracketOpen,
+            MarkdownToken::BracketClose(_) => MarkdownTokenTyp::BracketClose,
+            MarkdownToken::ParenOpen(_) => MarkdownTokenTyp::ParenOpen,
+            MarkdownToken::ParenClose(_) => MarkdownTokenTyp::ParenClose,
+            MarkdownToken::HeadingMarker(span) => MarkdownTokenTyp::HeadingMarker(span.len()),
+            MarkdownToken::BlockQuoteMarker(span) => MarkdownTokenTyp::BlockQuoteMarker(span.len()),
+            MarkdownToken::Whitespace(span) => MarkdownTokenTyp::Whitespace(span.len()),
+            MarkdownToken::Asterisk(span) => MarkdownTokenTyp::Asterisk(span.len()),
+            MarkdownToken::Underscore(span) => MarkdownTokenTyp::Underscore(span.len()),
+            MarkdownToken::Backtick(span) => MarkdownTokenTyp::Backtick(span.len()),
+            MarkdownToken::Dash(span) => MarkdownTokenTyp::Dash(span.len()),
+            MarkdownToken::Tilde(span) => MarkdownTokenTyp::Tilde(span.len()),
+            MarkdownToken::Plus(span) => MarkdownTokenTyp::Plus(span.len()),
+            MarkdownToken::Exclamation(span) => MarkdownTokenTyp::Exclamation(span.len()),
+            MarkdownToken::TextRaw(_) => MarkdownTokenTyp::TextRaw,
+        }
+    }
+
+    fn span(&self) -> &Span {
+        match self {
+            MarkdownToken::NewLine(span)
+            | MarkdownToken::BracketOpen(span)
+            | MarkdownToken::BracketClose(span)
+            | MarkdownToken::ParenOpen(span)
+            | MarkdownToken::ParenClose(span)
+            | MarkdownToken::HeadingMarker(span)
+            | MarkdownToken::BlockQuoteMarker(span)
+            | MarkdownToken::Whitespace(span)
+            | MarkdownToken::Asterisk(span)
+            | MarkdownToken::Underscore(span)
+            | MarkdownToken::Backtick(span)
+            | MarkdownToken::Dash(span)
+            | MarkdownToken::Tilde(span)
+            | MarkdownToken::Plus(span)
+            | MarkdownToken::Exclamation(span)
+            | MarkdownToken::TextRaw(span) => span,
+        }
+    }
+
+    fn start(&self) -> usize {
+        self.span().start
+    }
+
+    fn end(&self) -> usize {
+        self.span().end
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
+impl Span {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+    fn from_single(idx: usize) -> Self {
+        Self { start: idx, end: idx + 1 }
+    }
+    fn from_double(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    fn to_str<'a>(&self, input: &'a str) -> &'a str {
+        &input[self.start..self.end]
+    }
+}
+
+struct MarkdownListLine<'a> {
+    _indent: usize,
+    content: &'a [MarkdownToken],
+    list_marker: ListMarker,
+}
+
+#[derive(PartialEq, Eq, Debug, Copy, Clone)]
+enum ListMarker {
+    Numbered,
+    Dash,
+    Asterisk,
+    Plus,
+}
+
+impl<'a> MarkdownListLine<'a> {
+    fn parse_line(tokens: &'a [MarkdownToken], input: &str) -> Option<MarkdownListLine<'a>> {
+        use MarkdownToken::*;
+
+        let (indent, rest) = match tokens {
+            [Whitespace(span), rest @ ..] => (span.len(), rest),
+            rest => (0, rest),
+        };
+        let (list_marker, content) = match rest {
+            [Dash(span), Whitespace(_), content @ ..] if span.len() == 1 => (ListMarker::Dash, content),
+            [Asterisk(span), Whitespace(_), content @ ..] if span.len() == 1 => (ListMarker::Asterisk, content),
+            [Plus(span), Whitespace(_), content @ ..] if span.len() == 1 => (ListMarker::Plus, content),
+            [TextRaw(text), Whitespace(_), content @ ..]
+                if text
+                    .to_str(input)
+                    .strip_suffix('.')
+                    .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) =>
+            {
+                (ListMarker::Numbered, content)
+            }
+            _ => return None,
+        };
+
+        Some(MarkdownListLine {
+            _indent: indent,
+            content,
+            list_marker,
+        })
+    }
+}
 struct MarkdownParser {}
 
 impl MarkdownParser {
     fn parse(input: &str) -> ParsedMarkdown {
-        let mut active_block = vec![];
-        let mut blocks: Vec<MarkDownBlock> = vec![];
+        let (metadata, markdown_input) = MarkdownMetadata::parse_metadata(input);
 
-        let mut current_block_typ: BlockTyp = BlockTyp::Misc;
+        let lex = Self::lex(markdown_input);
+        // println!("{lex:#?}");
 
-        let mut code_block_language = "";
-
-        let mut lines = input.lines().peekable();
-
-        let metadata = if let Some(first_line) = lines.peek()
-            && first_line.starts_with("::::")
-        {
-            lines.next().expect("invariant");
-
-            let mut metadata_lines = vec![];
-
-            while let Some(line) = lines.next() {
-                if line.starts_with("::::") {
-                    break;
-                }
-                metadata_lines.push(line);
-            }
-
-            MarkdownMetadata::parse_metadata(metadata_lines)
-        } else {
-            panic!("markdown must have metadata")
-        };
-
-        for untrimmed_line in lines {
-            let line = untrimmed_line.trim_start();
-
-            // match
-            if line.is_empty() {
-                Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                current_block_typ = BlockTyp::Misc;
-            } else {
-                match line.chars().next().expect("string empty") {
-                    _ if line.starts_with("---") | line.starts_with("___") | line.starts_with("***") => {
-                        if current_block_typ != BlockTyp::Misc {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                        }
-                        current_block_typ = BlockTyp::HorizontalLine;
-                    }
-                    '-' | '*' => {
-                        if current_block_typ != BlockTyp::UnorderedList {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                        }
-                        current_block_typ = BlockTyp::UnorderedList;
-                        let line = line[1..].trim();
-                        active_block.push(line);
-                    }
-                    a if a.is_numeric() && line.split(' ').next().expect("empty").ends_with('.') => {
-                        if current_block_typ != BlockTyp::OrderedList {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                        }
-                        current_block_typ = BlockTyp::OrderedList;
-                        let line = line.split(' ').nth(1).expect("empty").trim();
-                        active_block.push(line);
-                    }
-                    '>' => {
-                        if current_block_typ != BlockTyp::BlockQuote {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                        }
-                        current_block_typ = BlockTyp::BlockQuote;
-                        if line.len() > 2 {
-                            let line = line[2..].trim();
-                            active_block.push(line);
-                        } else {
-                            active_block.push("");
-                        }
-                    }
-                    '|' => {
-                        if current_block_typ != BlockTyp::Table {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                        }
-                        current_block_typ = BlockTyp::Table;
-                        active_block.push(line);
-                    }
-
-                    '#' => {
-                        if current_block_typ != BlockTyp::Misc {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                        }
-                        current_block_typ = BlockTyp::Misc;
-
-                        let level = line.chars().take_while(|&c| c == '#').count();
-                        let content = line[level..].trim();
-
-                        blocks.push(MarkDownBlock::Heading { level: level as u8, content });
-                    }
-
-                    _ if line.starts_with("```") => {
-                        if current_block_typ == BlockTyp::CodeBlockBlock {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                            current_block_typ = BlockTyp::Misc;
-                        } else {
-                            current_block_typ = BlockTyp::CodeBlockBlock;
-                            if let Some(item) = &line.split(' ').next()
-                                && let Some(lang) = item.strip_prefix("```")
-                            {
-                                code_block_language = lang
-                            }
-                        }
-                    }
-                    _ if (untrimmed_line.starts_with("  ") | untrimmed_line.starts_with("    ")) && current_block_typ != BlockTyp::CodeBlockBlock => {
-                        if current_block_typ != BlockTyp::Misc {
-                            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-                        } else {
-                            current_block_typ = BlockTyp::CodeBlockLine;
-                            let line = if untrimmed_line.starts_with("  ") { line } else { &line[5..] };
-                            active_block.push(line);
-                        }
-                    }
-                    _ => {
-                        if current_block_typ != BlockTyp::CodeBlockBlock {
-                            current_block_typ = BlockTyp::Paragraph;
-                        }
-                        active_block.push(line);
-                    }
-                }
-            }
-        }
-        if current_block_typ != BlockTyp::CodeBlockBlock {
-            Self::end_block(&mut current_block_typ, &mut active_block, &mut blocks, &mut code_block_language);
-        }
-
-        // for i in blocks.clone() {
-        //     println!("{:?}", i);
-        // }
-
-        let html = Self::to_html(MarkdownNode::Document(blocks.into_iter().map(Self::parse_block).collect()));
+        let blocks = Self::parse_blocks(&lex, markdown_input);
+        // println!("{blocks:#?}");
+        let ast = Self::parse_block_content(&blocks, markdown_input);
+        // println!("{ast:#?}");
+        let html = Self::to_html(ast);
         ParsedMarkdown { html, metadata }
     }
 
-    fn parse_block(block: MarkDownBlock) -> MarkdownNode {
-        match block {
-            MarkDownBlock::Heading { level, content } => MarkdownNode::Heading {
-                level,
-                children: Self::parse_inline(content),
-            },
-            MarkDownBlock::Paragraph { content } => MarkdownNode::Paragraph(content.iter().flat_map(|line| Self::parse_inline(line)).collect()),
-            MarkDownBlock::OrderedList { content } => {
-                MarkdownNode::OrderedList(content.iter().map(|item| MarkdownNode::ListItem(Self::parse_inline(item))).collect())
+    fn lex(input: &str) -> Vec<MarkdownToken> {
+        use MarkdownToken::*;
+
+        let mut tokens = vec![];
+        let mut chars = input.char_indices().peekable();
+
+        let mut start_text_idx = 0;
+        let mut text_len = 0;
+        while let Some((i, c)) = chars.next() {
+            let token = match c {
+                '\n' => Some((NewLine(Span::from_single(i)), 1)),
+                '[' => Some((BracketOpen(Span::from_single(i)), 1)),
+                ']' => Some((BracketClose(Span::from_single(i)), 1)),
+                '(' => Some((ParenOpen(Span::from_single(i)), 1)),
+                ')' => Some((ParenClose(Span::from_single(i)), 1)),
+                '!' => Some((Exclamation(Span::from_single(i)), 1)),
+
+                c if ['#', '-', ' ', '_', '+', '>', '`', '*', '~'].contains(&c) => {
+                    let repeated = Self::count_repeated(&mut chars, c);
+                    match c {
+                        '#' => Some((HeadingMarker(Span::from_double(i, i + repeated)), repeated)),
+                        '-' => Some((Dash(Span::from_double(i, i + repeated)), repeated)),
+                        ' ' => Some((Whitespace(Span::from_double(i, i + repeated)), repeated)),
+                        '_' => Some((Underscore(Span::from_double(i, i + repeated)), repeated)),
+                        '+' => Some((Plus(Span::from_double(i, i + repeated)), repeated)),
+                        '>' => Some((BlockQuoteMarker(Span::from_double(i, i + repeated)), repeated)),
+                        '`' => Some((Backtick(Span::from_double(i, i + repeated)), repeated)),
+                        '*' => Some((Asterisk(Span::from_double(i, i + repeated)), repeated)),
+                        '~' => Some((Tilde(Span::from_double(i, i + repeated)), repeated)),
+                        _ => panic!("invariant"),
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some((token, repeated_non_text)) = token {
+                if text_len > 0 {
+                    tokens.push(TextRaw(Span::from_double(start_text_idx, start_text_idx + text_len)));
+                    start_text_idx += text_len;
+                    text_len = 0;
+                }
+
+                start_text_idx += repeated_non_text;
+                tokens.push(token);
+            } else {
+                text_len += 1;
             }
-            MarkDownBlock::UnorderedList { content } => {
-                MarkdownNode::UnorderedList(content.iter().map(|item| MarkdownNode::ListItem(Self::parse_inline(item))).collect())
+        }
+
+        if text_len != 0 {
+            tokens.push(TextRaw(Span::from_double(start_text_idx, start_text_idx + text_len)));
+        }
+
+        tokens
+    }
+
+    fn count_repeated(chars: &mut Peekable<CharIndices<'_>>, expected: char) -> usize {
+        let mut count = 1;
+        while let Some((_, c)) = chars.peek() {
+            if *c != expected {
+                break;
             }
-            MarkDownBlock::BlockQuote { content } => MarkdownNode::BlockQuote(content.iter().flat_map(|item| Self::parse_inline(item)).collect()),
-            MarkDownBlock::Table { content } => MarkdownNode::Table,
-            MarkDownBlock::CodeBlock { language, content } => MarkdownNode::CodeBlock {
-                language: if language.is_empty() { None } else { Some(language) },
-                content,
-            },
-            MarkDownBlock::BreakLine => MarkdownNode::HorizontalLine,
+            chars.next();
+            count += 1;
+        }
+        count
+    }
+
+    fn parse_blocks<'tok: 'src, 'src>(tokens: &'tok [MarkdownToken], input: &'src str) -> Vec<MarkdownBlock<'src>> {
+        use MarkdownBlock::*;
+        use MarkdownToken::*;
+
+        let mut blocks = vec![];
+        let mut tokens = tokens;
+
+        while let [first, rest @ ..] = tokens {
+            tokens = match first {
+                NewLine(_) => rest,
+                Dash(span) if span.len() >= 3 => {
+                    blocks.push(HorizontalLine);
+                    rest
+                }
+                HeadingMarker(span) if span.len() <= 6 => {
+                    let (content, rest) = Self::until_tok(rest, MarkdownTokenTyp::NewLine, false);
+                    blocks.push(Heading { level: span.len(), content });
+                    rest
+                }
+                BlockQuoteMarker(_) if let Some((content, after)) = Self::parse_quote(tokens) => {
+                    blocks.push(content);
+                    after
+                }
+                Backtick(span)
+                    if span.len() == 3
+                        && let Some((content, after)) = Self::parse_codeblock(tokens, input) =>
+                {
+                    blocks.push(content);
+                    after
+                }
+                _ if let Some((content, after)) = Self::parse_list(tokens, input) => {
+                    blocks.push(content);
+                    after
+                }
+                _ => {
+                    let (content, after) = Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false);
+
+                    blocks.push(Paragraph { content });
+                    after
+                }
+            }
+        }
+        blocks
+    }
+
+    fn parse_codeblock<'a>(tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
+        use MarkdownBlock::*;
+        use MarkdownToken::*;
+
+        if let [Backtick(span), rest @ ..] = tokens
+            && span.len() == 3
+        {
+            let (rest, language) = if let [TextRaw(lang), NewLine { .. }, inner_rest @ ..] = rest {
+                (inner_rest, Some(lang.to_str(input)))
+            } else {
+                (rest, None)
+            };
+            let (content, rest) = Self::until_tok(rest, MarkdownTokenTyp::Backtick(3), false);
+            if !content.is_empty() {
+                Some((CodeBlock { language, content }, rest))
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
 
-    fn parse_inline(input: &str) -> Vec<MarkdownNode<'_>> {
-        let mut res = Vec::new();
-        let mut stack: Vec<(char, usize, usize)> = Vec::new();
-        let mut cursor = 0;
+    fn parse_list<'a>(mut tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
+        let mut content = vec![];
+        let mut marker = None;
 
-        let chars: Vec<(usize, char)> = input.char_indices().collect();
-        let mut i = 0;
+        while !tokens.is_empty() {
+            let (line, rest) = Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false);
+            let line = if let Some(line) = MarkdownListLine::parse_line(line, input) {
+                line
+            } else {
+                break;
+            };
 
-        while i < chars.len() {
-            let (idx, ch) = chars[i];
-
-            match ch {
-                '*' | '_' => {
-                    let mut count = 1;
-                    while i + count < chars.len() && chars[i + count].1 == ch {
-                        count += 1;
-                    }
-                    if let Some((top_ch, start_idx, top_count)) = stack.last() {
-                        if *top_ch == ch && *top_count <= count {
-                            let inner = &input[start_idx + count..idx];
-
-                            if *start_idx > cursor {
-                                res.push(MarkdownNode::Text(&input[cursor..*start_idx]));
-                            }
-
-                            let inner_nodes = Self::parse_inline(inner);
-                            let node = match count {
-                                1 => MarkdownNode::Italic(inner_nodes),
-                                2 => MarkdownNode::Bold(inner_nodes),
-                                3 => MarkdownNode::Italic(vec![MarkdownNode::Bold(inner_nodes)]),
-                                _ => MarkdownNode::Text(&input[*start_idx..idx + count]),
-                            };
-                            res.push(node);
-
-                            cursor = idx + count;
-                            stack.pop();
-                            i += count - 1;
-                        } else {
-                            stack.push((ch, idx, count));
-                            i += count - 1;
-                        }
-                    } else {
-                        stack.push((ch, idx, count));
-                        i += count - 1;
-                    }
-                }
-
-                '`' => {
-                    let mut count = 1;
-                    while i + count < chars.len() && chars[i + count].1 == '`' {
-                        count += 1;
-                    }
-
-                    if let Some((top_ch, start_idx, top_count)) = stack.last() {
-                        if *top_ch == '`' && *top_count == count {
-                            let inner = &input[start_idx + count..idx];
-                            if *start_idx > cursor {
-                                res.push(MarkdownNode::Text(&input[cursor..*start_idx]));
-                            }
-                            res.push(MarkdownNode::InlineCode(inner));
-
-                            stack.pop();
-                            cursor = idx + count;
-                            i += count - 1;
-                        } else {
-                            stack.push(('`', idx, count));
-                            i += count - 1;
-                        }
-                    } else {
-                        stack.push(('`', idx, count));
-                        i += count - 1;
-                    }
-                }
-                _ => {}
+            if marker.is_none() {
+                marker = Some(line.list_marker);
             }
-            i += 1;
+
+            if let Some(marker) = marker
+                && line.list_marker != marker
+            {
+                break;
+            }
+
+            content.push(line.content);
+            tokens = rest;
         }
 
-        if cursor < input.len() {
-            res.push(MarkdownNode::Text(&input[cursor..]));
+        match marker {
+            Some(ListMarker::Numbered) => Some((MarkdownBlock::OrderedList { content }, tokens)),
+            Some(ListMarker::Dash | ListMarker::Asterisk | ListMarker::Plus) => Some((MarkdownBlock::UnorderedList { content }, tokens)),
+            None => None,
         }
-
-        res
     }
-    fn end_block<'b>(
-        current_block_typ: &mut BlockTyp,
-        active_block: &mut Vec<&'b str>,
-        blocks: &mut Vec<MarkDownBlock<'b>>,
-        code_block_language: &mut &'b str,
-    ) {
-        // println!("Ending block {:?}", current_block_typ);
-        blocks.push(match current_block_typ {
-            BlockTyp::Paragraph => MarkDownBlock::Paragraph {
-                content: std::mem::take(active_block),
+
+    fn parse_quote<'a>(mut tokens: &'a [MarkdownToken]) -> Option<(MarkdownBlock<'a>, &'a [MarkdownToken])> {
+        use MarkdownBlock::*;
+        use MarkdownToken::*;
+
+        let mut content = vec![];
+
+        while !tokens.is_empty() {
+            let (line, rest) = Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false);
+            match line {
+                [BlockQuoteMarker(span), Whitespace(_), quote_content @ ..] | [BlockQuoteMarker(span), quote_content @ ..] if span.len() > 0 => {
+                    content.push(quote_content);
+                    tokens = rest;
+                }
+                _ => break,
+            }
+        }
+
+        if content.is_empty() {
+            None
+        } else {
+            Some((BlockQuote { content }, tokens))
+        }
+    }
+
+    fn until_tok(tokens: &[MarkdownToken], until: MarkdownTokenTyp, include_split: bool) -> (&[MarkdownToken], &[MarkdownToken]) {
+        let split = if let Some(pos) = tokens.iter().position(|token| token.typ() == until) {
+            pos
+        } else {
+            return (tokens, &tokens[0..0]);
+        };
+
+        let (content, rest) = tokens.split_at(split);
+
+        let rest = match (rest, &until) {
+            (with_split @ [tok, ..], _) if tok.typ() == until && include_split => with_split,
+            ([tok, rest_without_split @ ..], _) if tok.typ() == until => rest_without_split,
+            _ => rest,
+        };
+
+        (content, rest)
+    }
+
+    fn tokens_to_string<'a>(mut tokens: &'a [MarkdownToken], input: &'a str) -> Vec<&'a str> {
+        let mut lines = vec![];
+
+        loop {
+            tokens = match Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false) {
+                (line, rest) if !rest.is_empty() && !line.is_empty() => {
+                    let first_idx = line.first().expect("not sure").start();
+                    let last_idx = line.last().expect("not sure").end();
+
+                    lines.push(&input[first_idx..last_idx]);
+                    rest
+                }
+                (line, _) => {
+                    let first_idx = line.first().expect("not sure").start();
+                    let last_idx = line.last().expect("not sure").end();
+
+                    lines.push(&input[first_idx..last_idx]);
+                    break;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        lines
+    }
+
+    fn parse_block_content<'a>(blocks: &'a Vec<MarkdownBlock>, input: &'a str) -> MarkdownNode<'a> {
+        let mut nodes = vec![];
+
+        for block in blocks {
+            match block {
+                MarkdownBlock::Heading { level, content } => {
+                    nodes.push(MarkdownNode::Heading {
+                        level: *level,
+                        children: Self::parse_inline_helper(content, input),
+                    });
+                }
+                MarkdownBlock::Paragraph { content } => {
+                    nodes.push(MarkdownNode::Paragraph(Self::parse_inline_helper(content, input)));
+                }
+                MarkdownBlock::OrderedList { content } => {
+                    let lines = content
+                        .iter()
+                        .map(|line| MarkdownNode::ListItem(Self::parse_inline_helper(line, input)))
+                        .collect();
+                    nodes.push(MarkdownNode::OrderedList(lines));
+                }
+                MarkdownBlock::UnorderedList { content } => {
+                    let lines = content
+                        .iter()
+                        .map(|line| MarkdownNode::ListItem(Self::parse_inline_helper(line, input)))
+                        .collect();
+                    nodes.push(MarkdownNode::UnorderedList(lines));
+                }
+                MarkdownBlock::BlockQuote { content } => {
+                    let lines = content
+                        .iter()
+                        .map(|line| MarkdownNode::Paragraph(Self::parse_inline_helper(line, input)))
+                        .collect();
+                    nodes.push(MarkdownNode::BlockQuote(lines));
+                }
+                MarkdownBlock::_Table { content } => {
+                    todo!()
+                }
+                MarkdownBlock::CodeBlock { language, content } => {
+                    nodes.push(MarkdownNode::CodeBlock {
+                        language: *language,
+                        content: Self::tokens_to_string(content, input),
+                    });
+                }
+                MarkdownBlock::_BreakLine => nodes.push(MarkdownNode::BreakLine),
+                MarkdownBlock::HorizontalLine => nodes.push(MarkdownNode::HorizontalLine),
+            }
+        }
+
+        MarkdownNode::Document(nodes)
+    }
+
+    fn parse_inline_helper<'a>(mut tokens: &'a [MarkdownToken], input: &'a str) -> Vec<MarkdownNode<'a>> {
+        use MarkdownNode::*;
+        use MarkdownToken::*;
+        let mut nodes = vec![];
+        while !tokens.is_empty() {
+            match &tokens {
+                [Backtick(open), rest @ ..] if open.len() == 1 => {
+                    if let Some(close_index) = rest.iter().position(|token| matches!(token, Backtick(span) if span.len() == 1)) {
+                        let Backtick(close) = &rest[close_index] else {
+                            unreachable!();
+                        };
+
+                        nodes.push(InlineCode(&input[open.end..close.start]));
+
+                        tokens = &rest[close_index + 1..];
+                    } else {
+                        nodes.push(Text(&input[open.start..open.end]));
+                        tokens = rest;
+                    }
+                }
+                [Underscore(open), rest @ ..] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
+                    let close_index = tokens
+                        .iter()
+                        .enumerate()
+                        .position(|(idx, token)| matches!(token, Underscore(_)) && Self::delimiter_can_close(tokens, idx));
+                    if let Some(close_index) = close_index {
+                        nodes.push(Italic(Self::parse_inline_helper(&tokens[1..close_index], input)));
+
+                        tokens = &tokens[close_index + 1..];
+                    } else {
+                        nodes.push(Text(open.to_str(input)));
+                        tokens = &tokens[1..];
+                    }
+                }
+                [Asterisk(open), rest @ ..] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
+                    let close_index = tokens
+                        .iter()
+                        .enumerate()
+                        .position(|(idx, token)| matches!(token, Asterisk(_)) && Self::delimiter_can_close(tokens, idx));
+                    if let Some(close_index) = close_index {
+                        nodes.push(Bold(Self::parse_inline_helper(&tokens[1..close_index], input)));
+
+                        tokens = &tokens[close_index + 1..];
+                    } else {
+                        nodes.push(Text(open.to_str(input)));
+                        tokens = &tokens[1..];
+                    }
+                }
+                [Tilde(open), rest @ ..] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
+                    let close_index = tokens
+                        .iter()
+                        .enumerate()
+                        .position(|(idx, token)| matches!(token, Tilde(_)) && Self::delimiter_can_close(tokens, idx));
+                    if let Some(close_index) = close_index {
+                        nodes.push(StrikeThrough(Self::parse_inline_helper(&tokens[1..close_index], input)));
+
+                        tokens = &tokens[close_index + 1..];
+                    } else {
+                        nodes.push(Text(open.to_str(input)));
+                        tokens = &tokens[1..];
+                    }
+                }
+                [Asterisk(count), after @ ..] | [Underscore(count), after @ ..] => {
+                    if count.len() >= 3 {
+                        nodes.push(HorizontalLine);
+                        tokens = after
+                    } else {
+                        nodes.push(Text(count.to_str(input)));
+                        tokens = after
+                    }
+                }
+                [first @ BracketOpen { .. }, after_open @ ..] => {
+                    if let Some((node, rest)) = Self::try_parse_link(after_open, input) {
+                        nodes.push(node);
+                        tokens = rest;
+                    } else {
+                        nodes.push(Text(first.span().to_str(input)));
+                        tokens = after_open;
+                    }
+                }
+                [first @ Exclamation { .. }, second @ BracketOpen { .. }, after_open @ ..] => {
+                    if let Some((node, rest)) = Self::try_parse_image(after_open, input) {
+                        nodes.push(node);
+                        tokens = rest;
+                    } else {
+                        nodes.push(Text(&input[first.start()..second.end()]));
+                        tokens = after_open;
+                    }
+                }
+                _ => {
+                    let mut text_token_count = 0;
+
+                    while let [first, ..] = &tokens[text_token_count..] {
+                        if Self::is_inline_special(first) {
+                            break;
+                        }
+
+                        text_token_count += 1;
+                    }
+
+                    if text_token_count == 0 {
+                        let first = &tokens[0];
+
+                        nodes.push(Text(&input[first.start()..first.end()]));
+                        tokens = &tokens[1..];
+                    } else {
+                        let plain = &tokens[..text_token_count];
+                        let start = plain.first().unwrap().start();
+                        let end = plain.last().unwrap().end();
+
+                        nodes.push(Text(&input[start..end]));
+                        tokens = &tokens[text_token_count..];
+                    }
+                }
+            }
+        }
+
+        nodes
+    }
+
+    fn try_parse_link<'a>(tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownNode<'a>, &'a [MarkdownToken])> {
+        use MarkdownNode::*;
+        use MarkdownToken::*;
+
+        let close_bracket = tokens.iter().position(|token| matches!(token, BracketClose { .. }))?;
+
+        let text_tokens = &tokens[..close_bracket];
+        let after_bracket = &tokens[close_bracket + 1..];
+
+        let [ParenOpen { .. }, TextRaw(url), ParenClose { .. }, rest @ ..] = after_bracket else {
+            return None;
+        };
+
+        Some((
+            Link {
+                text: Self::parse_inline_helper(text_tokens, input),
+                url: url.to_str(input),
             },
-            BlockTyp::UnorderedList => MarkDownBlock::UnorderedList {
-                content: std::mem::take(active_block),
+            rest,
+        ))
+    }
+    fn try_parse_image<'a>(tokens: &'a [MarkdownToken], input: &'a str) -> Option<(MarkdownNode<'a>, &'a [MarkdownToken])> {
+        use MarkdownNode::*;
+        use MarkdownToken::*;
+
+        let close_bracket = tokens.iter().position(|token| matches!(token, BracketClose { .. }))?;
+
+        let text_tokens = &tokens[..close_bracket];
+        let after_bracket = &tokens[close_bracket + 1..];
+
+        let [ParenOpen { .. }, TextRaw(url), ParenClose { .. }, rest @ ..] = after_bracket else {
+            return None;
+        };
+
+        let first = text_tokens.first().unwrap().start();
+        let last = text_tokens.last().unwrap().end();
+        let title = &input[first..last];
+
+        Some((
+            Image {
+                alt: title,
+                path: url.to_str(input),
             },
-            BlockTyp::OrderedList => MarkDownBlock::OrderedList {
-                content: std::mem::take(active_block),
-            },
-            BlockTyp::BlockQuote => MarkDownBlock::BlockQuote {
-                content: std::mem::take(active_block),
-            },
-            BlockTyp::Table => MarkDownBlock::Table {
-                content: std::mem::take(active_block),
-            },
-            BlockTyp::CodeBlockBlock => MarkDownBlock::CodeBlock {
-                language: code_block_language,
-                content: std::mem::take(active_block),
-            },
-            BlockTyp::CodeBlockLine => MarkDownBlock::CodeBlock {
-                language: "",
-                content: std::mem::take(active_block),
-            },
-            BlockTyp::HorizontalLine => MarkDownBlock::BreakLine,
-            BlockTyp::Misc => return,
-        });
-        *code_block_language = "";
+            rest,
+        ))
+    }
+    fn is_inline_special(token: &MarkdownToken) -> bool {
+        matches!(
+            token,
+            MarkdownToken::BracketOpen { .. } | MarkdownToken::Backtick(_) | MarkdownToken::Underscore(_) | MarkdownToken::Asterisk(_)
+        )
+    }
+    fn delimiter_can_open(tokens: &[MarkdownToken]) -> bool {
+        tokens
+            .first()
+            .is_some_and(|token| !matches!(token, MarkdownToken::Whitespace(_) | MarkdownToken::NewLine(_)))
+    }
+
+    fn delimiter_can_close(tokens: &[MarkdownToken], index: usize) -> bool {
+        index
+            .checked_sub(1)
+            .and_then(|index| tokens.get(index))
+            .is_some_and(|token| !matches!(token, MarkdownToken::Whitespace(_) | MarkdownToken::NewLine(_)))
     }
 
     fn to_html(node: MarkdownNode) -> String {
@@ -3001,19 +3418,17 @@ impl MarkdownParser {
     }
 
     fn html_helper(node: &MarkdownNode, builder: &mut String) {
-        // print!("{:?}", node);
         match node {
+            MarkdownNode::BreakLine => {
+                builder.push_str("<br>");
+            }
             MarkdownNode::Document(nodes) => {
                 nodes.iter().for_each(|n| Self::html_helper(n, builder));
             }
             MarkdownNode::Paragraph(children) => {
                 builder.push_str("<p>");
-                for (idx, child) in children.iter().enumerate() {
-                    Self::html_helper(child, builder);
-                    if idx < children.len() - 1 {
-                        builder.push('\n');
-                    }
-                }
+                children.iter().for_each(|n| Self::html_helper(n, builder));
+
                 builder.push_str("</p>\n");
             }
             MarkdownNode::Text(text) => {
@@ -3029,7 +3444,11 @@ impl MarkdownParser {
                 children.iter().for_each(|n| Self::html_helper(n, builder));
                 builder.push_str("</em>");
             }
-
+            MarkdownNode::StrikeThrough(children) => {
+                builder.push_str("<s>");
+                children.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push_str("</s>");
+            }
             MarkdownNode::Heading { level, children } => {
                 let header_level = match level {
                     0 => panic!("Should not be parsed"),
@@ -3068,7 +3487,7 @@ impl MarkdownParser {
                 builder.push_str("</code></pre>\n");
             }
             MarkdownNode::OrderedList(nodes) => {
-                builder.push_str("<ol type=\"1\">\n");
+                builder.push_str("<ol>\n");
                 nodes.iter().for_each(|n| Self::html_helper(n, builder));
                 builder.push_str("</ol>\n");
             }
@@ -3078,9 +3497,9 @@ impl MarkdownParser {
                 builder.push_str("</ul>\n");
             }
             MarkdownNode::ListItem(nodes) => {
-                builder.push_str("  <li> ");
+                builder.push_str("<li>");
                 nodes.iter().for_each(|n| Self::html_helper(n, builder));
-                builder.push('\n');
+                builder.push_str("</li>\n");
             }
             MarkdownNode::BlockQuote(nodes) => {
                 builder.push_str("<blockquote>\n");
@@ -3094,15 +3513,21 @@ impl MarkdownParser {
                 builder.push_str("<hr/>\n");
             }
             MarkdownNode::Link { text, url } => {
-                builder.push('(');
-                text.iter().for_each(|n| Self::html_helper(n, builder));
-                builder.push(')');
-
-                builder.push('[');
+                builder.push_str("<a class=\"link\" href=\"");
                 builder.push_str(url);
-                builder.push(']');
+                builder.push_str("\">");
+
+                text.iter().for_each(|n| Self::html_helper(n, builder));
+                builder.push_str("</a>");
             }
-            MarkdownNode::Table => todo!("tabble"),
+            MarkdownNode::Image { alt, path } => {
+                builder.push_str("<img class=\"image\" src=\"");
+                builder.push_str(path);
+                builder.push_str(" alt=\"");
+                builder.push_str(alt);
+                builder.push_str("\">");
+            }
+            MarkdownNode::_Table => todo!("tabble"),
         }
     }
 }
