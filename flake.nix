@@ -31,9 +31,8 @@
             packages = with pkgs; [
               rust-analyzer-unwrapped
               toolchain
-              typst
-              nodejs
-              
+              sqlite
+
               wrk # for benchmarking
             ];
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";

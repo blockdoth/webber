@@ -5,17 +5,22 @@
 #![allow(unused)]
 // #![allow(unused_mut)]
 
-use core::panic;
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::error::Error;
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::fmt::Debug;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::iter::Peekable;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
 use std::process::Command;
-use std::str::CharIndices;
+use std::ptr::{null, null_mut};
+use std::slice;
+use std::str::{CharIndices, FromStr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use std::vec::IntoIter;
@@ -28,46 +33,53 @@ const TEMPLATES_PATH: &str = "./templates/";
 #[cfg(generated)]
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
-fn main() -> Result<(), TemplateError> {
+fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args().any(|arg| arg.contains("build-script-build")) {
         println!("cargo:warning=Running in build script");
-        comptime();
+        comptime()
     } else {
-        // let file = fs::read_to_string("./assets/posts/test.md").unwrap();
-
-        // let html = MarkdownParser::parse(&file);
-
         println!("Running normally");
-
-        let content = Content::load_embedded()?;
-
-        println!(
-            "Static/Generated asset count: {:?}/{:?}",
-            content.assets.len(),
-            content.templates.len()
-        );
-        let context = Context::load_intial(&content);
-
-        // println!("{context:#?}");
-
-        let router = Router::new(content, context)
-            .route_static_hidden("/layout", "layout.html")
-            .route_static_hidden("/home", "pages/home.html")
-            .route_static_page("/posts", "pages/posts.html")
-            .route_static_page("/about", "pages/about.html")
-            .route_static_page("/qoutes", "pages/quotes.html")
-            .route_static_page("/stats", "pages/stats.html")
-            .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
-            .fallback("/home");
-
-        let listener: TcpListener =
-            TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
-        println!("Started listening on socket http://{SOCKET_ADDR}");
-
-        HttpServer::serve(listener, router);
+        #[cfg(generated)] // Marks everything deadcode during build time
+        runtime();
+        
+        Ok(())
     }
-    Ok(())
-}
+  }
+
+  fn runtime() -> Result<(), Box<dyn Error>> {
+      let db = Db::init_db()?;
+
+      db.test_counter()?;
+      db.sync()?;
+
+      let content = Content::load_embedded()?;
+
+      println!(
+          "Static/Generated asset count: {:?}/{:?}",
+          content.assets.len(),
+          content.templates.len()
+      );
+      let context = Context::load_intial(&content);
+
+      // println!("{context:#?}");
+
+      let router = Router::new(content, context, db)
+          .route_static_hidden("/layout", "layout.html")
+          .route_static_hidden("/home", "pages/home.html")
+          .route_static_page("/posts", "pages/posts.html")
+          .route_static_page("/about", "pages/about.html")
+          .route_static_page("/qoutes", "pages/quotes.html")
+          .route_static_page("/stats", "pages/stats.html")
+          .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
+          .fallback("/home");
+
+      let listener: TcpListener =
+          TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
+      println!("Started listening on socket http://{SOCKET_ADDR}");
+
+      HttpServer::serve(listener, router);
+      Ok(())
+  }
 
 impl Context {
     fn load_intial(content: &Content) -> Context {
@@ -99,12 +111,19 @@ impl Context {
     }
 }
 
-fn comptime() {
+const DEBUG_BIN_PATH: &str = "./target/debug/webber";
+const RELEASE_BIN_PATH: &str = "./target/release/webber";
+
+fn comptime() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=none");
     println!("cargo:rustc-cfg=generated");
+    println!("cargo:rerun-if-changed={DEBUG_BIN_PATH}");
+    println!("cargo:rerun-if-changed={RELEASE_BIN_PATH}");
 
+    // === Init ===
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let file_path = Path::new(&out_dir).join("generated.rs");
+    let last_bin_path = Path::new(&out_dir).join("prev_bin");
+    let generated_code_path = Path::new(&out_dir).join("generated.rs");
     let cwd = std::env::current_dir().expect("current dir");
     let cwd = cwd.to_string_lossy();
 
@@ -153,6 +172,7 @@ fn comptime() {
     out.push_str("}\n");
 
     out.push('\n');
+
     // === Templates ===
 
     let template_paths = walk_dir(TEMPLATES_PATH);
@@ -191,13 +211,62 @@ fn comptime() {
     out.push_str("\tOk(templates)\n");
     out.push_str("}\n");
 
+    // Db
+    let debug_path = PathBuf::from(DEBUG_BIN_PATH);
+    let release_path = PathBuf::from(RELEASE_BIN_PATH);
+
+    let bin_tupple = match (debug_path.exists(), release_path.exists()) {
+        (true, false) => Some((debug_path, true)),
+        (false, true) => Some((release_path, false)),
+
+        (true, true) => {
+            if fs::metadata(&debug_path)?.modified()? > fs::metadata(&release_path)?.modified()? {
+                Some((debug_path, true))
+            } else {
+                Some((release_path, false))
+            }
+        }
+
+        (false, false) => None,
+    };
+
+    match bin_tupple {
+        Some((prev_bin_path, is_debug)) => {
+            fs::copy(&prev_bin_path, &last_bin_path)?;
+
+            println!(
+                "cargo:warning=embedding binary path: {}",
+                prev_bin_path.display()
+            );
+
+            if is_debug {
+                out.push_str("static PREV_BIN_TYPE: Option<&str> = Some(\"debug\");\n");
+            } else {
+                out.push_str("static PREV_BIN_TYPE: Option<&str> = Some(\"release\");\n");
+            }
+
+            out.push_str(&format!(
+                "static PREV_BIN_PATH: Option<&str> = Some({last_bin_path:?});\n"
+            ));
+        }
+
+        None => {
+            println!("cargo:warning=no existing selfmod binary found");
+
+            out.push_str("static PREV_BIN_TYPE: Option<&str> = None;\n");
+            out.push_str("static PREV_BIN_PATH: Option<&str> = None;\n");
+        }
+    };
+
+    // === Git ===
     let (short, long) = get_commit_hash();
 
     out.push_str(&format!("const GIT_HASH_SHORT:&str = {short:?};\n"));
     out.push_str(&format!("const GIT_HASH_LONG:&str = {long:?};\n"));
 
-    fs::write(&file_path, out).unwrap();
+    fs::write(&generated_code_path, out).unwrap();
     println!("cargo:warning=End of build script");
+    Ok(())
 }
 
 fn get_commit_hash() -> (String, String) {
@@ -558,6 +627,7 @@ enum TemplateError {
     Parse(TemplateParseError),
     Render(TemplateRenderError),
 }
+impl Error for TemplateError {}
 
 impl fmt::Display for TemplateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1632,6 +1702,7 @@ impl StaticRoute {
 struct Router {
     content: Content,
     context: Context,
+    db: Db,
     stats: Stats,
     static_routes: HashMap<String, StaticRoute>,
     dynamic_routes: HashMap<String, DynamicRoute>,
@@ -1640,10 +1711,11 @@ struct Router {
 }
 
 impl Router {
-    fn new(content: Content, context: Context) -> Self {
+    fn new(content: Content, context: Context, db: Db) -> Self {
         Router {
             content,
             context,
+            db,
             static_routes: HashMap::new(),
             dynamic_routes: HashMap::new(),
             fallback: None,
@@ -3893,5 +3965,645 @@ impl MarkdownParser {
             }
             MarkdownNode::_Table => todo!("tabble"),
         }
+    }
+}
+
+const SQLITE_OK: c_int = 0;
+const SQLITE_ROW: c_int = 100;
+const SQLITE_DONE: c_int = 101;
+
+const SQLITE_DESERIALIZE_FLAG_FREEONCLOSE: u32 = 1;
+const SQLITE_DESERIALIZE_FLAG_RESIZEABLE: u32 = 2;
+
+const BLOB_MAGIC: &[u8; 11] = b"SQLITEBLOB\0";
+const BLOB_FOOTER_SIZE: usize = 8 + BLOB_MAGIC.len();
+
+fn to_sqlite_err(code: i32) -> String {
+    match code & 0xff {
+        0 => "SQLITE_OK: operation completed successfully",
+        1 => "SQLITE_ERROR: generic SQL error",
+        2 => "SQLITE_INTERNAL: internal SQLite error",
+        5 => "SQLITE_BUSY: database is busy",
+        9 => "SQLITE_INTERRUPT: operation was interrupted",
+        10 => "SQLITE_IOERR: disk I/O error",
+        11 => "SQLITE_CORRUPT: database is corrupted",
+        12 => "SQLITE_NOTFOUND: unknown operation or object",
+        14 => "SQLITE_CANTOPEN: unable to open database file",
+        17 => "SQLITE_SCHEMA: database schema changed",
+        18 => "SQLITE_TOOBIG: string or blob is too large",
+        19 => "SQLITE_CONSTRAINT: constraint violation",
+        20 => "SQLITE_MISMATCH: datatype mismatch",
+        21 => "SQLITE_MISUSE: SQLite API used incorrectly",
+        25 => "SQLITE_RANGE: bind parameter or column index out of range",
+        26 => "SQLITE_NOTADB: file is not a valid SQLite database",
+        27 => "SQLITE_NOTICE: SQLite notice",
+        28 => "SQLITE_WARNING: SQLite warning",
+        100 => "SQLITE_ROW: sqlite3_step produced another row",
+        101 => "SQLITE_DONE: sqlite3_step finished",
+        _ => return format!("unknown SQLite result code {code}"),
+    }
+    .to_owned()
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct sqlite3_stmt {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct sqlite3_handle {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+type sqlite3_destructor = Option<unsafe extern "C" fn(*mut c_void)>;
+
+#[link(name = "sqlite3")]
+unsafe extern "C" {
+    fn sqlite3_open(
+        filename: *const c_char,         /* Database filename (UTF-8) */
+        pp_db: *mut *mut sqlite3_handle, /* OUT: SQLite db handle */
+    ) -> c_int;
+
+    fn sqlite3_close(db: *mut sqlite3_handle) -> c_int;
+    fn sqlite3_prepare_v2(
+        db: *mut sqlite3_handle,                  /* Database handle */
+        sql: *const c_char,                       /* SQL statement, UTF-8 encoded */
+        max_sql_len: c_int,                       /* Maximum length of zSql in bytes. */
+        statement_handle: *mut *mut sqlite3_stmt, /* OUT: Statement handle */
+        unused_sql: *mut *const c_char,           /* OUT: Pointer to unused portion of zSql */
+    ) -> c_int;
+    fn sqlite3_step(statement_handle: *mut sqlite3_stmt) -> c_int;
+    fn sqlite3_finalize(statement_handle: *mut sqlite3_stmt) -> c_int;
+
+    fn sqlite3_bind_blob(
+        statement_handle: *mut sqlite3_stmt,
+        index: c_int,
+        value: *const c_void,
+        value_len: c_int,
+        destructor: sqlite3_destructor,
+    ) -> c_int;
+    fn sqlite3_bind_text(
+        statement_handle: *mut sqlite3_stmt,
+        index: c_int,
+        value: *const i8,
+        value_len: c_int,
+        destructor: sqlite3_destructor,
+    ) -> c_int;
+
+    fn sqlite3_bind_int64(statement_handle: *mut sqlite3_stmt, index: c_int, value: i64) -> c_int;
+
+    fn sqlite3_column_blob(
+        statement_handle: *mut sqlite3_stmt,
+        column_index: c_int,
+    ) -> *const c_void;
+    fn sqlite3_column_int64(statement_handle: *mut sqlite3_stmt, column_index: c_int) -> i64;
+    fn sqlite3_column_text(statement_handle: *mut sqlite3_stmt, column_index: c_int) -> *const u8;
+    fn sqlite3_column_bytes(statement_handle: *mut sqlite3_stmt, column_index: c_int) -> c_int;
+
+    fn sqlite3_serialize(
+        db: *mut sqlite3_handle, /* The database connection */
+        target: *const i8,       /* Which DB to serialize. ex: "main", "temp", ... */
+        result_size: *mut u64,   /* Write size of the DB here, if not NULL */
+        flags: u32,              /* Zero or more SQLITE_SERIALIZE_* flags */
+    ) -> *const u8;
+
+    fn sqlite3_deserialize(
+        db: *mut sqlite3_handle,  /* The database connection */
+        target: *const i8,        /* Which DB to reopen with the deserialization */
+        content: *const u8,       /* The serialized database content */
+        content_len: u64,         /* Number of bytes in the deserialization */
+        content_bufffer_len: u64, /* Total size of content buffer */
+        flags: u32,               /* Zero or more SQLITE_SERIALIZE_* flags */
+    ) -> c_int;
+    fn sqlite3_malloc64(size: u64) -> *mut c_void;
+    fn sqlite3_free(ptr: *mut c_void);
+}
+
+struct Statement {
+    handle: *mut sqlite3_stmt,
+}
+
+impl Statement {
+    fn step(&mut self) -> Result<bool, Box<dyn Error>> {
+        let status = unsafe { sqlite3_step(self.handle) };
+
+        match status {
+            SQLITE_ROW => Ok(true),
+            SQLITE_DONE => Ok(false),
+            code => Err(format!("sqlite3_step failed with code {}", to_sqlite_err(code)).into()),
+        }
+    }
+    fn bind_all(&self, binds: Vec<Bind>) -> Result<(), Box<dyn Error>> {
+        for (i, bind) in binds.iter().enumerate() {
+            bind.apply(self, i)?;
+            // println!("Bound: {bind:?}")
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Statement {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                sqlite3_finalize(self.handle);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Bind<'a> {
+    Text(&'a str),
+    Int(i64),
+    Blob(&'a [u8]),
+}
+
+impl Bind<'_> {
+    fn apply(&self, statement: &Statement, index: usize) -> Result<(), Box<dyn Error>> {
+        let statement = statement.handle;
+        let index = index as c_int + 1; // Stinky sqlite is 1 indexed
+        let status = match self {
+            Bind::Text(value) => unsafe {
+                sqlite3_bind_text(
+                    statement,
+                    index,
+                    value.as_ptr().cast(),
+                    value.len().try_into()?,
+                    None,
+                )
+            },
+
+            Bind::Int(value) => unsafe { sqlite3_bind_int64(statement, index, *value) },
+            Bind::Blob(value) => unsafe {
+                sqlite3_bind_blob(
+                    statement,
+                    index,
+                    value.as_ptr().cast(),
+                    value.len().try_into()?,
+                    None,
+                )
+            },
+        };
+
+        match status {
+            SQLITE_OK => {
+                // println!("Bound: {self:?}");
+                Ok(())
+            }
+            code => Err(format!(
+                "binding parameter {index} failed with code {} for {self:?}",
+                to_sqlite_err(code)
+            )
+            .into()),
+        }
+    }
+}
+struct SqlResult {
+    inner: Vec<Vec<ColumnValue>>,
+}
+
+impl SqlResult {
+    fn get_text_column(&self, idx: usize) -> Result<Vec<&str>, Box<dyn Error>> {
+        self.inner[idx]
+            .iter()
+            .map(|v| match v {
+                ColumnValue::Text(s) => Ok(s.as_str()),
+                ColumnValue::Null => Err("Null".into()),
+                _ => Err("wrong type".into()),
+            })
+            .collect()
+    }
+
+    fn get_int_column(&self, idx: usize) -> Result<Vec<i64>, Box<dyn Error>> {
+        self.inner[idx]
+            .iter()
+            .map(|v| match v {
+                ColumnValue::Int(i) => Ok(*i),
+                ColumnValue::Null => Err("Null".into()),
+                _ => Err("wrong type".into()),
+            })
+            .collect()
+    }
+
+    fn get_blob_column(&self, idx: usize) -> Result<Vec<&[u8]>, Box<dyn Error>> {
+        self.inner[idx]
+            .iter()
+            .map(|v| match v {
+                ColumnValue::Blob(b) => Ok(b.as_slice()),
+                ColumnValue::Null => Err("Null".into()),
+                _ => Err("wrong type".into()),
+            })
+            .collect()
+    }
+}
+
+enum ColumnTyp {
+    Text,
+    Int,
+    Blob,
+}
+
+#[derive(Debug, Clone)]
+enum ColumnValue {
+    Text(String),
+    Int(i64),
+    Blob(Vec<u8>),
+    Null,
+}
+
+impl ColumnTyp {
+    fn get_from_statement(
+        &self,
+        statement: &Statement,
+        column_index: usize,
+    ) -> Result<ColumnValue, Box<dyn Error>> {
+        let statement = statement.handle;
+        let column_index = column_index.try_into()?;
+        match self {
+            ColumnTyp::Text => {
+                let ptr = unsafe { sqlite3_column_text(statement, column_index) };
+
+                if ptr.is_null() {
+                    return Ok(ColumnValue::Null);
+                }
+
+                let len: usize =
+                    unsafe { sqlite3_column_bytes(statement, column_index) }.try_into()?;
+
+                let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+
+                Ok(ColumnValue::Text(str::from_utf8(bytes)?.to_owned()))
+            }
+
+            ColumnTyp::Int => Ok(ColumnValue::Int(unsafe {
+                sqlite3_column_int64(statement, column_index)
+            })),
+
+            ColumnTyp::Blob => {
+                let ptr = unsafe { sqlite3_column_blob(statement, column_index) };
+
+                let len: usize =
+                    unsafe { sqlite3_column_bytes(statement, column_index) }.try_into()?;
+
+                if len == 0 {
+                    return Ok(ColumnValue::Blob(Vec::new()));
+                }
+
+                if ptr.is_null() {
+                    return Err("null blob pointer".into());
+                }
+
+                let bytes = unsafe { slice::from_raw_parts(ptr.cast(), len) };
+
+                Ok(ColumnValue::Blob(bytes.to_vec()))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Connection {
+    handle: *mut sqlite3_handle,
+}
+
+impl Connection {
+    fn open(path: &str) -> Result<Self, Box<dyn Error>> {
+        let c_string = CString::from_str(path)?;
+        let mut handle: *mut sqlite3_handle = null_mut();
+
+        let status = unsafe { sqlite3_open(c_string.as_ptr(), &mut handle) };
+
+        match status {
+            SQLITE_OK => Ok(Self { handle }),
+            code => Err(format!("Opening db at {path} failed with code {code}").into()),
+        }
+    }
+
+    fn prepare(&self, sql: &str) -> Result<Statement, Box<dyn Error>> {
+        let sql = CString::new(sql)?;
+        let mut statement_handle: *mut sqlite3_stmt = null_mut();
+
+        let status = unsafe {
+            sqlite3_prepare_v2(
+                self.handle,
+                sql.as_ptr(),
+                -1,
+                &mut statement_handle,
+                null_mut(),
+            )
+        };
+
+        match status {
+            SQLITE_OK => Ok(Statement {
+                handle: statement_handle,
+            }),
+            code => Err(format!(
+                "sqlite3_prepare_v2 failed with code {}",
+                to_sqlite_err(code)
+            )
+            .into()),
+        }
+    }
+
+    fn execute(&self, sql: &str) -> Result<(), Box<dyn Error>> {
+        let mut statement = self.prepare(sql)?;
+        // println!("Executing query: {sql}");
+
+        match statement.step()? {
+            false => Ok(()),
+            true => Err("execute unexpectedly returned a row".into()),
+        }
+    }
+
+    fn insert(&self, sql: &str, binds: Vec<Bind>) -> Result<(), Box<dyn Error>> {
+        let mut statement = self.prepare(sql)?;
+        statement.bind_all(binds)?;
+
+        // println!("Executing query: {sql}");
+
+        match statement.step()? {
+            false => Ok(()),
+            true => Err("execute unexpectedly returned a row".into()),
+        }
+    }
+
+    fn querry(
+        &self,
+        sql: &str,
+        binds: Vec<Bind>,
+        return_typ: Vec<ColumnTyp>,
+    ) -> Result<SqlResult, Box<dyn Error>> {
+        let mut statement = self.prepare(sql)?;
+
+        statement.bind_all(binds)?;
+        // println!("Executing query: {sql}");
+
+        let mut res = vec![vec![]; return_typ.len()];
+
+        while statement.step()? {
+            for (i, typ) in return_typ.iter().enumerate() {
+                let value = typ.get_from_statement(&statement, i)?;
+
+                res.get_mut(i).expect("invariant").push(value);
+            }
+        }
+
+        Ok(SqlResult { inner: res })
+    }
+    fn serialize(&self) -> Result<&[u8], Box<dyn Error>> {
+        let serialized_db_size = &mut 0;
+        let flags = 0;
+
+        let bytes: &[u8] = unsafe {
+            let serialized_db_ptr =
+                sqlite3_serialize(self.handle, null(), serialized_db_size, flags);
+
+            let bytes =
+                slice::from_raw_parts(serialized_db_ptr.cast(), (*serialized_db_size) as usize);
+
+            sqlite3_free(serialized_db_ptr.cast_mut().cast());
+            bytes
+        };
+
+        Ok(bytes)
+    }
+
+    fn deserialize(content: &[u8]) -> Result<Connection, Box<dyn Error>> {
+        let content_len = content.len() as u64;
+
+        let buffer = unsafe { sqlite3_malloc64(content_len) }.cast::<u8>();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), buffer, content.len());
+        }
+
+        let conn = Connection::open(":memory:")?; // Temp empty db in memory
+        let flags = SQLITE_DESERIALIZE_FLAG_FREEONCLOSE | SQLITE_DESERIALIZE_FLAG_RESIZEABLE;
+
+        let status = unsafe {
+            sqlite3_deserialize(conn.handle, null(), buffer, content_len, content_len, flags)
+        };
+        // println!("Deserialized db");
+
+        match status {
+            SQLITE_OK => Ok(conn),
+            code => {
+                Err(format!("Deserializing db failed with code {}", to_sqlite_err(code)).into())
+            }
+        }
+    }
+
+    fn export_db(&self, path: PathBuf) -> Result<(), Box<dyn Error>> {
+        let bytes = self.serialize()?;
+
+        println!("Exported db to {path:?}");
+        fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn import_db(path: PathBuf) -> Result<Connection, Box<dyn Error>> {
+        let bytes = fs::read(&path)?;
+
+        let conn = Connection::deserialize(&bytes)?;
+        println!("Imported db from {path:?}");
+        Ok(conn)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                sqlite3_close(self.handle);
+            }
+
+            self.handle = null_mut();
+        }
+    }
+}
+
+struct Blob {}
+
+impl Blob {
+    fn read_blob(bytes: &[u8]) -> Result<Option<&[u8]>, Box<dyn Error>> {
+        if bytes.len() < BLOB_FOOTER_SIZE {
+            return Ok(None);
+        }
+
+        let magic_offset = bytes.len() - BLOB_MAGIC.len();
+
+        if &bytes[magic_offset..] != BLOB_MAGIC {
+            return Ok(None);
+        }
+
+        let length_offset = magic_offset - 8;
+
+        let blob_len = u64::from_le_bytes(bytes[length_offset..magic_offset].try_into()?) as usize;
+
+        let blob_offset = length_offset - blob_len;
+
+        Ok(Some(&bytes[blob_offset..length_offset]))
+    }
+
+    fn write_blob(bytes: &mut Vec<u8>, blob: &[u8]) -> Result<(), Box<dyn Error>> {
+        // Replace the existing blob rather than appending another blob each time.
+        Blob::remove_blob(bytes)?;
+
+        bytes.extend_from_slice(blob);
+        bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(BLOB_MAGIC);
+
+        Ok(())
+    }
+
+    fn remove_blob(bytes: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
+        if bytes.len() < BLOB_FOOTER_SIZE {
+            // Binary to small
+            return Ok(());
+        }
+
+        let magic_offset = bytes.len() - BLOB_MAGIC.len();
+
+        if &bytes[magic_offset..] != BLOB_MAGIC {
+            return Ok(());
+        }
+
+        let length_offset = magic_offset - 8;
+
+        let blob_len = u64::from_le_bytes(bytes[length_offset..magic_offset].try_into()?) as usize;
+
+        let blob_offset = length_offset - blob_len;
+
+        bytes.truncate(blob_offset);
+
+        Ok(())
+    }
+
+    fn self_modify(
+        path: &PathBuf,
+        bytes: &mut Vec<u8>,
+        conn: &Connection,
+    ) -> Result<(), Box<dyn Error>> {
+        let serialized = conn.serialize()?;
+
+        Blob::write_blob(bytes, serialized)?;
+
+        let tmp = path.with_extension("tmp");
+
+        fs::write(&tmp, bytes)?;
+
+        let perms = fs::metadata(path)?.permissions();
+        fs::set_permissions(&tmp, perms)?;
+
+        // renames the executable, doesnt affect the currently running process
+        fs::rename(&tmp, path)?;
+        println!(
+            "Serialized db into {} bytes and replaced old binary {:?}",
+            serialized.len(),
+            path
+        );
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Db {
+    connection: Connection,
+}
+
+impl Db {
+    fn init_db() -> Result<Self, Box<dyn Error>> {
+        let current_executable_path = env::current_exe()?;
+
+        let mut executable_bytes = fs::read(&current_executable_path)?;
+
+        let conn = match Blob::read_blob(&executable_bytes)? {
+            Some(blob) => {
+                let conn = Connection::deserialize(blob)?;
+                println!(
+                    "Blob of length {} found in own binary and serialized into db",
+                    blob.len()
+                );
+                conn
+            }
+            None => {
+                #[cfg(generated)] // PREV_BIN_PATH and PREV_BIN_TYPE dont exist during build time
+                if let Some(prev_bin_path) = &PREV_BIN_PATH
+                    && let Ok(prev_bin) = fs::read(prev_bin_path)
+                    && let Ok(Some(blob)) = Blob::read_blob(&prev_bin)
+                    && let Some(prev_bin_type) = &PREV_BIN_TYPE
+                {
+                    println!(
+                        "Blob of length {} found in previous {prev_bin_type} binary and serialized into db",
+                        blob.len()
+                    );
+
+                    Connection::deserialize(blob)?
+                } else {
+                    println!("No blob found, creating new db");
+                    let conn = Connection::open(":memory:")?;
+
+                    Self::init_schema(&conn)?;
+
+                    conn
+                }
+                #[cfg(not(generated))]
+                unreachable!();
+            }
+        };
+
+        Ok(Self { connection: conn })
+    }
+
+    fn init_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
+        connection.execute(
+            "
+        CREATE TABLE counter (
+    count INTEGER NOT NULL
+    );",
+        )?;
+        connection.insert(
+            "
+          INSERT INTO counter (count)
+  VALUES (?);",
+            vec![Bind::Int(0)],
+        )?;
+        Ok(())
+    }
+
+    fn test_counter(&self) -> Result<(), Box<dyn Error>> {
+        let res =
+            self.connection
+                .querry("SELECT count FROM counter", vec![], vec![ColumnTyp::Int])?;
+
+        let counter_col = res.get_int_column(0).unwrap();
+        let counter = *counter_col.first().unwrap();
+
+        println!("Counter: {counter:?}");
+
+        self.connection.insert(
+            "
+        UPDATE counter
+        SET count = ?;",
+            vec![Bind::Int(counter + 1)],
+        )?;
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<(), Box<dyn Error>> {
+        let current_executable_path = env::current_exe()?;
+
+        let mut executable_bytes = fs::read(&current_executable_path)?;
+
+        Blob::self_modify(
+            &current_executable_path,
+            &mut executable_bytes,
+            &self.connection,
+        )
     }
 }

@@ -47,3 +47,5 @@ BlockQuote {
 ```
 
 prior to this I completely separated out block parsing and block content parsing, because I did not support nested blocks. (block quotes, lists). To add nesting I need to collect each line belonging to the same quote and then recursively parse those as a block. However to be aware of recursive depth I would either have to modify my parse function signature, or decrement the `Quote(depth)` tokens. The former I dont like, but the later makes it so I cant just pass a slice of the original  tokenstream to the recursive call because I need to modify it. So i need to collect it into a temporary vec. My parse function takes a slice so need to reference that vec as a slice. This was were rust started to complain because that temprory vec's lifetime does not survive the parse function, which is relevant, because it the parsed blocks dont own their content. To convince the compiler I need to let it know that while the input stream lives longer than the function, token may get dropped 
+
+https://blog.dend.ro/self-modifying-rust/
