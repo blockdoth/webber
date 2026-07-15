@@ -10,11 +10,11 @@ use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
-use std::ffi::{CString, c_char, c_int, c_void};
-use std::fmt::Debug;
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::fmt::{Debug, Display};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::iter::Peekable;
+use std::iter::{Peekable, zip};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
 use std::process::Command;
@@ -22,7 +22,8 @@ use std::ptr::{null, null_mut};
 use std::slice;
 use std::str::{CharIndices, FromStr};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::vec::IntoIter;
 use std::{char, fmt, fs, vec};
 
@@ -40,46 +41,47 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         println!("Running normally");
         #[cfg(generated)] // Marks everything deadcode during build time
-        runtime();
-        
+        runtime()?;
+
         Ok(())
     }
-  }
+}
 
-  fn runtime() -> Result<(), Box<dyn Error>> {
-      let db = Db::init_db()?;
+fn runtime() -> Result<(), Box<dyn Error>> {
+    register_signal_handlers();
 
-      db.test_counter()?;
-      db.sync()?;
+    let mut db = Db::init()?;
+    println!("Initialized db");
+    db.test_counter()?;
+    db.sync()?;
 
-      let content = Content::load_embedded()?;
+    let content = Content::load_embedded()?;
 
-      println!(
-          "Static/Generated asset count: {:?}/{:?}",
-          content.assets.len(),
-          content.templates.len()
-      );
-      let context = Context::load_intial(&content);
+    println!(
+        "Static/Generated asset count: {:?}/{:?}",
+        content.assets.len(),
+        content.templates.len()
+    );
+    let context = Context::load_intial(&content);
 
-      // println!("{context:#?}");
+    // println!("{context:#?}");
 
-      let router = Router::new(content, context, db)
-          .route_static_hidden("/layout", "layout.html")
-          .route_static_hidden("/home", "pages/home.html")
-          .route_static_page("/posts", "pages/posts.html")
-          .route_static_page("/about", "pages/about.html")
-          .route_static_page("/qoutes", "pages/quotes.html")
-          .route_static_page("/stats", "pages/stats.html")
-          .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
-          .fallback("/home");
+    let router = Router::new(content, context, db)
+        .route_static_hidden("/layout", "layout.html")
+        .route_static_hidden("/home", "pages/home.html")
+        .route_static_page("/posts", "pages/posts.html")
+        .route_static_page("/about", "pages/about.html")
+        .route_static_page("/qoutes", "pages/quotes.html")
+        .route_static_page("/stats", "pages/stats.html")
+        .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
+        .fallback("/home");
 
-      let listener: TcpListener =
-          TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
-      println!("Started listening on socket http://{SOCKET_ADDR}");
+    let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
+    println!("Started listening on socket http://{SOCKET_ADDR}");
 
-      HttpServer::serve(listener, router);
-      Ok(())
-  }
+    HttpServer::serve(listener, router)?;
+    Ok(())
+}
 
 impl Context {
     fn load_intial(content: &Content) -> Context {
@@ -1587,87 +1589,14 @@ impl Context {
     }
 }
 
-#[derive(Debug)]
-struct Stats {
-    start_time: SystemTime,
-    request_stats: HashMap<String, RequestStats>,
-}
-
-impl Stats {
-    fn new() -> Self {
-        Self {
-            start_time: SystemTime::now(),
-            request_stats: HashMap::new(),
-        }
-    }
-    fn add_hit(&mut self, key: &str, request_duration: Duration) {
-        let current = self
-            .request_stats
-            .entry(key.to_string())
-            .or_insert_with(RequestStats::new);
-
-        current.count += 1;
-        current.total_time += request_duration;
-    }
-}
-
 impl ToTemplateValue for Duration {
     fn to_template_value(&self) -> TemplateValue {
         TemplateValue::Text(format!("{:.2?}", self))
     }
 }
-
-// impl ToTemplateValue for RequestStats {
-//   fn to_template_value(&self) -> TemplateValue {
-//       TemplateValue::Object(hash_map! {
-//         "count".to_string() => TemplateValue::Text(format!("{}",  self.count)),
-//         "total_time".to_string() => self.total_time.to_template_value(),
-//         "avg".to_string() => self.avg().to_template_value()
-//       }
-//       )
-//   }
-// }
-
-impl ToTemplateValue for Stats {
+impl ToTemplateValue for u64 {
     fn to_template_value(&self) -> TemplateValue {
-        let pages = self
-            .request_stats
-            .iter()
-            .map(|(path, stats)| {
-                TemplateValue::Object(hash_map! {
-                  "path".to_string() => TemplateValue::Text(path.to_string()),
-                  "count".to_string() => TemplateValue::Text(format!("{}",  stats.count)),
-                  "total_time".to_string() => stats.total_time.to_template_value(),
-                  "avg".to_string() => stats.avg().to_template_value()
-                })
-            })
-            .collect();
-
-        TemplateValue::Object(HashMap::from([
-            (
-                "start_time".to_string(),
-                self.start_time.to_template_value(),
-            ),
-            ("pages".to_string(), TemplateValue::List(pages)),
-        ]))
-    }
-}
-
-#[derive(Debug)]
-struct RequestStats {
-    count: u32,
-    total_time: Duration,
-}
-
-impl RequestStats {
-    fn new() -> Self {
-        Self {
-            count: 0,
-            total_time: Duration::ZERO,
-        }
-    }
-    fn avg(&self) -> Duration {
-        self.total_time / self.count
+        TemplateValue::Text(format!("{:.2?}", self))
     }
 }
 
@@ -1703,7 +1632,6 @@ struct Router {
     content: Content,
     context: Context,
     db: Db,
-    stats: Stats,
     static_routes: HashMap<String, StaticRoute>,
     dynamic_routes: HashMap<String, DynamicRoute>,
 
@@ -1719,7 +1647,6 @@ impl Router {
             static_routes: HashMap::new(),
             dynamic_routes: HashMap::new(),
             fallback: None,
-            stats: Stats::new(),
         }
     }
 
@@ -1814,9 +1741,14 @@ impl Router {
             Some(route) => {
                 self.context.push();
 
+                let stats = self
+                    .db
+                    .load_stats()
+                    .expect("TOPO improve error handeling to make this work");
+
                 if header.path == "/stats" {
                     self.context
-                        .insert_local("stats", self.stats.to_template_value());
+                        .insert_local("stats", stats.to_template_value());
                 }
 
                 let page =
@@ -1909,6 +1841,20 @@ enum HttpServerError {
     StreamWriteFailed,
     TemplatingError(TemplateError),
     Todo,
+}
+
+impl Error for HttpServerError {}
+
+impl Display for HttpServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Redirect(location) => write!(f, "redirect to {location}"),
+            Self::LockFailed => write!(f, "failed to acquire lock"),
+            Self::StreamWriteFailed => write!(f, "failed to write to stream"),
+            Self::TemplatingError(error) => write!(f, "templating error: {error}"),
+            Self::Todo => write!(f, "operation not implemented"),
+        }
+    }
 }
 
 impl<T> From<std::sync::PoisonError<T>> for HttpServerError {
@@ -2116,11 +2062,12 @@ impl HttpServer {
         &path[..end]
     }
 
-    fn serve(listener: TcpListener, mut router: Router) {
+    fn serve(listener: TcpListener, mut router: Router) -> Result<(), Box<dyn Error>> {
         let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
         let mut active_streams: Vec<TcpStream> = vec![];
         let mut check_alive_timer = Instant::now();
         let mut check_fs_timer = Instant::now();
+        let mut check_db_sync_timer = Instant::now();
 
         let mut it = 0;
 
@@ -2138,20 +2085,13 @@ impl HttpServer {
         }
 
         println!(" Fallback\t->\t{:?}", router.fallback);
+        listener
+            .set_nonblocking(true)
+            .expect("Unable to set socket to nonblocking mode");
 
-        'main: loop {
+        'main: while !SHUTDOWN.load(Ordering::Relaxed) {
             print!("Loop it {it}\r");
             it += 1;
-
-            if active_streams.is_empty() {
-                listener
-                    .set_nonblocking(false)
-                    .expect("Unable to set socket to nonblocking mode");
-            } else {
-                listener
-                    .set_nonblocking(true)
-                    .expect("Unable to set socket to nonblocking mode");
-            }
 
             if let Ok((mut stream, peer_addr)) = listener.accept() {
                 stream
@@ -2221,8 +2161,9 @@ impl HttpServer {
                         stream.write_all(&bytes).expect("Failed to write to stream");
                         let end_timer = Instant::now();
                         let duration = end_timer - start_timer;
-                        router.stats.add_hit(path, duration);
-                        // println!("served request in {duration:?}")
+                        // router.stats.add_hit(path, duration);
+                        // println!("served request in {duration:?}");
+                        router.db.save_page_hit(path, duration)?;
                     }
                 };
 
@@ -2233,6 +2174,10 @@ impl HttpServer {
                         // println!("Active connections {}", active_streams.len());
                     }
                 }
+            }
+
+            if check_db_sync_timer.elapsed() > Duration::from_secs(10) {
+                router.db.sync()?;
             }
 
             #[cfg(debug_assertions)]
@@ -2277,6 +2222,9 @@ impl HttpServer {
                 }
             }
         }
+
+        // Exit routine
+        router.db.sync()
     }
 }
 
@@ -3978,33 +3926,6 @@ const SQLITE_DESERIALIZE_FLAG_RESIZEABLE: u32 = 2;
 const BLOB_MAGIC: &[u8; 11] = b"SQLITEBLOB\0";
 const BLOB_FOOTER_SIZE: usize = 8 + BLOB_MAGIC.len();
 
-fn to_sqlite_err(code: i32) -> String {
-    match code & 0xff {
-        0 => "SQLITE_OK: operation completed successfully",
-        1 => "SQLITE_ERROR: generic SQL error",
-        2 => "SQLITE_INTERNAL: internal SQLite error",
-        5 => "SQLITE_BUSY: database is busy",
-        9 => "SQLITE_INTERRUPT: operation was interrupted",
-        10 => "SQLITE_IOERR: disk I/O error",
-        11 => "SQLITE_CORRUPT: database is corrupted",
-        12 => "SQLITE_NOTFOUND: unknown operation or object",
-        14 => "SQLITE_CANTOPEN: unable to open database file",
-        17 => "SQLITE_SCHEMA: database schema changed",
-        18 => "SQLITE_TOOBIG: string or blob is too large",
-        19 => "SQLITE_CONSTRAINT: constraint violation",
-        20 => "SQLITE_MISMATCH: datatype mismatch",
-        21 => "SQLITE_MISUSE: SQLite API used incorrectly",
-        25 => "SQLITE_RANGE: bind parameter or column index out of range",
-        26 => "SQLITE_NOTADB: file is not a valid SQLite database",
-        27 => "SQLITE_NOTICE: SQLite notice",
-        28 => "SQLITE_WARNING: SQLite warning",
-        100 => "SQLITE_ROW: sqlite3_step produced another row",
-        101 => "SQLITE_DONE: sqlite3_step finished",
-        _ => return format!("unknown SQLite result code {code}"),
-    }
-    .to_owned()
-}
-
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct sqlite3_stmt {
@@ -4080,6 +4001,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn sqlite3_malloc64(size: u64) -> *mut c_void;
     fn sqlite3_free(ptr: *mut c_void);
+    fn sqlite3_errmsg(db: *mut sqlite3_handle) -> *const i8;
 }
 
 struct Statement {
@@ -4093,7 +4015,11 @@ impl Statement {
         match status {
             SQLITE_ROW => Ok(true),
             SQLITE_DONE => Ok(false),
-            code => Err(format!("sqlite3_step failed with code {}", to_sqlite_err(code)).into()),
+            code => Err(format!(
+                "sqlite3_step failed with code {}",
+                Connection::to_sqlite_err(code, None)
+            )
+            .into()),
         }
     }
     fn bind_all(&self, binds: Vec<Bind>) -> Result<(), Box<dyn Error>> {
@@ -4156,12 +4082,14 @@ impl Bind<'_> {
             }
             code => Err(format!(
                 "binding parameter {index} failed with code {} for {self:?}",
-                to_sqlite_err(code)
+                Connection::to_sqlite_err(code, None)
             )
             .into()),
         }
     }
 }
+
+#[derive(Debug)]
 struct SqlResult {
     inner: Vec<Vec<ColumnValue>>,
 }
@@ -4303,7 +4231,7 @@ impl Connection {
             }),
             code => Err(format!(
                 "sqlite3_prepare_v2 failed with code {}",
-                to_sqlite_err(code)
+                Self::to_sqlite_err(code, Some(self))
             )
             .into()),
         }
@@ -4340,7 +4268,6 @@ impl Connection {
         let mut statement = self.prepare(sql)?;
 
         statement.bind_all(binds)?;
-        // println!("Executing query: {sql}");
 
         let mut res = vec![vec![]; return_typ.len()];
 
@@ -4391,9 +4318,11 @@ impl Connection {
 
         match status {
             SQLITE_OK => Ok(conn),
-            code => {
-                Err(format!("Deserializing db failed with code {}", to_sqlite_err(code)).into())
-            }
+            code => Err(format!(
+                "Deserializing db failed with code {}",
+                Self::to_sqlite_err(code, None)
+            )
+            .into()),
         }
     }
 
@@ -4411,6 +4340,47 @@ impl Connection {
         let conn = Connection::deserialize(&bytes)?;
         println!("Imported db from {path:?}");
         Ok(conn)
+    }
+
+    fn sqlite_error_msg(conn: &Connection) -> String {
+        unsafe {
+            CStr::from_ptr(sqlite3_errmsg(conn.handle))
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    fn to_sqlite_err(code: i32, conn: Option<&Connection>) -> String {
+        match code & 0xff {
+            0 => "SQLITE_OK: operation completed successfully",
+            1 if conn.is_none() => "SQLITE_ERROR: generic SQL error: {}",
+            1 if let Some(conn) = conn => {
+                return format!(
+                    "SQLITE_ERROR: generic SQL error: {}",
+                    Self::sqlite_error_msg(conn)
+                );
+            }
+            2 => "SQLITE_INTERNAL: internal SQLite error",
+            5 => "SQLITE_BUSY: database is busy",
+            9 => "SQLITE_INTERRUPT: operation was interrupted",
+            10 => "SQLITE_IOERR: disk I/O error",
+            11 => "SQLITE_CORRUPT: database is corrupted",
+            12 => "SQLITE_NOTFOUND: unknown operation or object",
+            14 => "SQLITE_CANTOPEN: unable to open database file",
+            17 => "SQLITE_SCHEMA: database schema changed",
+            18 => "SQLITE_TOOBIG: string or blob is too large",
+            19 => "SQLITE_CONSTRAINT: constraint violation",
+            20 => "SQLITE_MISMATCH: datatype mismatch",
+            21 => "SQLITE_MISUSE: SQLite API used incorrectly",
+            25 => "SQLITE_RANGE: bind parameter or column index out of range",
+            26 => "SQLITE_NOTADB: file is not a valid SQLite database",
+            27 => "SQLITE_NOTICE: SQLite notice",
+            28 => "SQLITE_WARNING: SQLite warning",
+            100 => "SQLITE_ROW: sqlite3_step produced another row",
+            101 => "SQLITE_DONE: sqlite3_step finished",
+            _ => return format!("unknown SQLite result code {code}"),
+        }
+        .to_owned()
     }
 }
 
@@ -4488,6 +4458,7 @@ impl Blob {
         bytes: &mut Vec<u8>,
         conn: &Connection,
     ) -> Result<(), Box<dyn Error>> {
+        let start_time = Instant::now();
         let serialized = conn.serialize()?;
 
         Blob::write_blob(bytes, serialized)?;
@@ -4501,10 +4472,12 @@ impl Blob {
 
         // renames the executable, doesnt affect the currently running process
         fs::rename(&tmp, path)?;
+
+        let end_time = Instant::now() - start_time;
         println!(
-            "Serialized db into {} bytes and replaced old binary {:?}",
+            "Serialized db into {} bytes in {:?}",
             serialized.len(),
-            path
+            end_time
         );
 
         Ok(())
@@ -4514,10 +4487,13 @@ impl Blob {
 #[derive(Debug)]
 struct Db {
     connection: Connection,
+    executable_bytes: Vec<u8>,
+    executable_path: PathBuf,
+    unsynced: bool,
 }
 
 impl Db {
-    fn init_db() -> Result<Self, Box<dyn Error>> {
+    fn init() -> Result<Self, Box<dyn Error>> {
         let current_executable_path = env::current_exe()?;
 
         let mut executable_bytes = fs::read(&current_executable_path)?;
@@ -4547,63 +4523,209 @@ impl Db {
                 } else {
                     println!("No blob found, creating new db");
                     let conn = Connection::open(":memory:")?;
-
                     Self::init_schema(&conn)?;
-
                     conn
                 }
                 #[cfg(not(generated))]
                 unreachable!();
             }
         };
-
-        Ok(Self { connection: conn })
+        let mut db = Self {
+            connection: conn,
+            executable_bytes,
+            executable_path: current_executable_path,
+            unsynced: false,
+        };
+        db.sync()?;
+        Ok(db)
     }
 
-    fn init_schema(connection: &Connection) -> Result<(), Box<dyn Error>> {
-        connection.execute(
+    fn sync(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.unsynced {
+            Blob::self_modify(
+                &self.executable_path,
+                &mut self.executable_bytes,
+                &self.connection,
+            )?;
+            self.unsynced = false;
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn init_counter(conn: &Connection) -> Result<(), Box<dyn Error>> {
+        conn.execute(
             "
-        CREATE TABLE counter (
-    count INTEGER NOT NULL
-    );",
+            CREATE TABLE counter (
+              count INTEGER NOT NULL
+            );",
         )?;
-        connection.insert(
+        conn.insert(
             "
-          INSERT INTO counter (count)
-  VALUES (?);",
+            INSERT INTO counter (count)
+            VALUES (?);",
             vec![Bind::Int(0)],
         )?;
         Ok(())
     }
+    fn init_schema(conn: &Connection) -> Result<(), Box<dyn Error>> {
+        Self::init_counter(conn)?;
 
-    fn test_counter(&self) -> Result<(), Box<dyn Error>> {
-        let res =
-            self.connection
-                .querry("SELECT count FROM counter", vec![], vec![ColumnTyp::Int])?;
+        conn.execute(
+            "
+            CREATE TABLE page_metrics (
+              id INTEGER PRIMARY KEY,
+              page TEXT,
+              load_time INTEGER,
+              timestamp TIMESTAMP
+            );",
+        )?;
+        conn.execute(
+            "
+          CREATE TABLE global_stats (
+            id INTEGER PRIMARY KEY,
+            start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );",
+        )?;
+        conn.execute(
+            "
+        INSERT INTO global_stats (id) VALUES (1)",
+        )?;
+        Ok(())
+    }
+
+    fn test_counter(&mut self) -> Result<(), Box<dyn Error>> {
+        let conn = &self.connection;
+
+        let res = conn.querry("SELECT count FROM counter", vec![], vec![ColumnTyp::Int])?;
 
         let counter_col = res.get_int_column(0).unwrap();
         let counter = *counter_col.first().unwrap();
 
         println!("Counter: {counter:?}");
 
-        self.connection.insert(
+        conn.insert(
             "
-        UPDATE counter
-        SET count = ?;",
+            UPDATE counter
+            SET count = ?;",
             vec![Bind::Int(counter + 1)],
         )?;
+        self.unsynced = true;
         Ok(())
     }
 
-    fn sync(&self) -> Result<(), Box<dyn Error>> {
-        let current_executable_path = env::current_exe()?;
+    fn save_page_hit(&mut self, page: &str, loadtime: Duration) -> Result<(), Box<dyn Error>> {
+        let conn = &self.connection;
+        let timestamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        let loadtime_nanos = i64::from(loadtime.subsec_nanos());
 
-        let mut executable_bytes = fs::read(&current_executable_path)?;
+        conn.insert(
+            "
+            INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
+            vec![
+                Bind::Text(page),
+                Bind::Int(loadtime_nanos),
+                Bind::Int(timestamp),
+            ],
+        )?;
+        self.unsynced = true;
 
-        Blob::self_modify(
-            &current_executable_path,
-            &mut executable_bytes,
-            &self.connection,
-        )
+        Ok(())
+    }
+
+    fn load_stats(&self) -> Result<Stats, Box<dyn Error>> {
+        let conn = &self.connection;
+
+        let res = conn.querry(
+            "
+              SELECT start_time
+              FROM global_stats",
+            vec![],
+            vec![ColumnTyp::Text],
+        )?;
+        let col = res.get_text_column(0)?;
+        let start_time = col.first().ok_or("Start time not found")?.to_string();
+
+        let res = conn.querry(
+            "
+                SELECT page, AVG(load_time) AS average_load_time, COUNT(*) AS total_count
+                FROM page_metrics
+                GROUP BY page",
+            vec![],
+            vec![ColumnTyp::Text, ColumnTyp::Int, ColumnTyp::Int],
+        )?;
+
+        let pages = res.get_text_column(0)?;
+        let average_loadtimes = res.get_int_column(1)?;
+        let counts = res.get_int_column(2)?;
+
+        let metrics = zip(pages, zip(average_loadtimes, counts))
+            .map(|(page, (average_loadtime_nanos, count))| PageMetric {
+                page: page.to_owned(),
+                avg_loadtime: Duration::from_nanos(average_loadtime_nanos as u64),
+                count: count as u64,
+            })
+            .collect();
+
+        Ok(Stats {
+            pages: metrics,
+            start_time,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Stats {
+    start_time: String,
+    pages: Vec<PageMetric>,
+}
+
+impl ToTemplateValue for Stats {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::Object(hash_map! {
+          "pages".to_string() => self.pages.to_template_value(),
+          "start_time".to_string() => self.start_time.to_template_value(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PageMetric {
+    page: String,
+    avg_loadtime: Duration,
+    count: u64,
+}
+
+impl ToTemplateValue for PageMetric {
+    fn to_template_value(&self) -> TemplateValue {
+        TemplateValue::Object(hash_map! {
+          "path".to_string() => TemplateValue::Text(self.page.to_string()),
+          "avg".to_string() =>  self.avg_loadtime.to_template_value(),
+          "count".to_string() => self.count.to_template_value(),
+        })
+    }
+}
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+const SIGINT: c_int = 2;
+const SIGTERM: c_int = 15;
+const SIG_ERR: usize = usize::MAX;
+
+extern "C" fn handle_signal(_: c_int) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+unsafe extern "C" {
+    fn signal(signal: c_int, handler: extern "C" fn(c_int)) -> usize;
+}
+
+fn register_signal_handlers() {
+    unsafe {
+        assert_ne!(signal(SIGINT, handle_signal), SIG_ERR);
+        assert_ne!(signal(SIGTERM, handle_signal), SIG_ERR);
     }
 }
