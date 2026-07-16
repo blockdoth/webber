@@ -117,8 +117,9 @@ const DEBUG_BIN_PATH: &str = "./target/debug/webber";
 const RELEASE_BIN_PATH: &str = "./target/release/webber";
 
 fn comptime() -> Result<(), Box<dyn Error>> {
-    println!("cargo:rerun-if-changed=none");
     println!("cargo:rustc-cfg=generated");
+    println!("cargo:rerun-if-changed=./assets");
+    println!("cargo:rerun-if-changed=./templates");
     println!("cargo:rerun-if-changed={DEBUG_BIN_PATH}");
     println!("cargo:rerun-if-changed={RELEASE_BIN_PATH}");
 
@@ -364,9 +365,14 @@ impl ToTemplateValue for AssetData {
             | AssetData::Html(s)
             | AssetData::Css(s)
             | AssetData::Js(s)
+            | AssetData::JsPrism(s, _)
             | AssetData::MdRaw(s)
             | AssetData::Unknown(s) => TemplateValue::Text(s.to_string()),
-            AssetData::MdParsed(ParsedMarkdown { html, metadata }) => {
+            AssetData::MdParsed(ParsedMarkdown {
+                html,
+                metadata,
+                highlighted_langs,
+            }) => {
                 let mut obj = HashMap::new();
 
                 obj.insert("content".to_string(), TemplateValue::Text(html.to_string()));
@@ -385,6 +391,14 @@ impl ToTemplateValue for AssetData {
                 );
                 obj.insert("draft".to_string(), TemplateValue::Bool(metadata.draft));
                 obj.insert("tags".to_string(), metadata.tags.to_template_value());
+
+                let highlighted_langs =
+                    SyntaxHighlightLang::include_dependencies(highlighted_langs);
+
+                obj.insert(
+                    "highlighted_langs".to_string(),
+                    highlighted_langs.to_template_value(),
+                );
 
                 TemplateValue::Object(obj)
             }
@@ -1363,17 +1377,24 @@ impl Template {
                     condition,
                     then_branch,
                     else_branch,
-                } => {
-                    if let TemplateValue::Bool(cond) =
-                        *Self::resolve_var(condition, context, &node.pos)?
-                    {
-                        let cond_str = if cond {
+                } => match Self::resolve_var(condition, context, &node.pos)? {
+                    TemplateValue::Bool(cond) => {
+                        let cond_str = if *cond {
                             Self::render_helper(then_branch, context, blocks)?
                         } else {
                             Self::render_helper(else_branch, context, blocks)?
                         };
                         res.push_str(&cond_str);
-                    } else {
+                    }
+                    TemplateValue::List(template_values) => {
+                        let cond_str = if !template_values.is_empty() {
+                            Self::render_helper(then_branch, context, blocks)?
+                        } else {
+                            Self::render_helper(else_branch, context, blocks)?
+                        };
+                        res.push_str(&cond_str);
+                    }
+                    _ => {
                         return Err(TemplateRenderError::new(
                             TemplateRenderErrorMsg::VariableNotOfExpectedType(
                                 condition.concat(),
@@ -1382,7 +1403,7 @@ impl Template {
                             node.pos.clone(),
                         ))?;
                     }
-                }
+                },
                 For {
                     iter_bind,
                     iter_src,
@@ -1738,19 +1759,24 @@ impl Router {
 
                 Ok(AssetData::Html(cached.to_string()))
             }
-            Some(route) => {
-                self.context.push();
 
+            Some(route) if header.path == "/stats" => {
+                self.context.push();
                 let stats = self
                     .db
                     .load_stats()
                     .expect("TOPO improve error handeling to make this work");
 
-                if header.path == "/stats" {
-                    self.context
-                        .insert_local("stats", stats.to_template_value());
-                }
+                self.context
+                    .insert_local("stats", stats.to_template_value());
 
+                let page =
+                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
+                self.context.pop();
+                Ok(AssetData::Html(page))
+            }
+            Some(route) => {
+                self.context.push();
                 let page =
                     Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
                 self.context.pop();
@@ -2178,6 +2204,7 @@ impl HttpServer {
 
             if check_db_sync_timer.elapsed() > Duration::from_secs(10) {
                 router.db.sync()?;
+                check_db_sync_timer = Instant::now();
             }
 
             #[cfg(debug_assertions)]
@@ -2225,6 +2252,100 @@ impl HttpServer {
 
         // Exit routine
         router.db.sync()
+    }
+}
+
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+enum SyntaxHighlightLang {
+    Bash,
+    C,
+    Clike,
+    Css,
+    Haskell,
+    Nix,
+    Rust,
+    Markdown,
+    Markup,
+    Elixir,
+    Html,
+    Javascript,
+    Typescript,
+}
+
+impl SyntaxHighlightLang {
+    fn from_str(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "bash" => Some(Self::Bash),
+            "c" => Some(Self::C),
+            "clike" => Some(Self::Clike),
+            "css" => Some(Self::Css),
+            "haskell" => Some(Self::Haskell),
+            "nix" => Some(Self::Nix),
+            "rust" => Some(Self::Rust),
+            "markdown" => Some(Self::Markdown),
+            "markup" => Some(Self::Markup),
+            "elixir" => Some(Self::Elixir),
+            "html" => Some(Self::Html),
+            "javascript" => Some(Self::Javascript),
+            "typescript" => Some(Self::Typescript),
+            _ => None,
+        }
+    }
+    fn to_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::C => "c",
+            Self::Clike => "clike",
+            Self::Css => "css",
+            Self::Haskell => "haskell",
+            Self::Nix => "nix",
+            Self::Rust => "rust",
+            Self::Markdown => "markdown",
+            Self::Markup => "markup",
+            Self::Elixir => "elixir",
+            Self::Html => "html",
+            Self::Javascript => "javascript",
+            Self::Typescript => "typescript",
+        }
+    }
+
+    fn include_dependencies(langs: &[SyntaxHighlightLang]) -> Vec<SyntaxHighlightLang> {
+        use SyntaxHighlightLang::*;
+        let mut result = vec![];
+
+        for &lang in langs {
+            let dependency = match lang {
+                Javascript | Typescript => Clike,
+                Html => Markup,
+                _ => continue,
+            };
+            if !result.contains(&dependency) {
+                result.push(dependency);
+            }
+        }
+
+        result.extend_from_slice(langs);
+        result
+    }
+}
+
+impl ToTemplateValue for SyntaxHighlightLang {
+    fn to_template_value(&self) -> TemplateValue {
+        match self {
+            SyntaxHighlightLang::Bash => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::C => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Clike => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Css => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Haskell => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Nix => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Rust => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Markdown => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Markup => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Elixir => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Html => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Javascript => TemplateValue::Text(self.to_str().to_string()),
+            SyntaxHighlightLang::Typescript => TemplateValue::Text(self.to_str().to_string()),
+        }
     }
 }
 
@@ -2285,6 +2406,7 @@ enum AssetData {
     Html(String),
     Css(String),
     Js(String),
+    JsPrism(String, SyntaxHighlightLang),
     Png(Vec<u8>),
     Ico(Vec<u8>),
     MdRaw(String),
@@ -2301,6 +2423,7 @@ impl AssetData {
             | AssetData::Html(s)
             | AssetData::Css(s)
             | AssetData::Js(s)
+            | AssetData::JsPrism(s, _)
             | AssetData::MdRaw(s)
             | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
             | AssetData::Unknown(s) => s.len(),
@@ -2320,6 +2443,16 @@ impl AssetData {
             Some("html") => AssetData::Html(fs::read_to_string(path)?),
             Some("txt") => AssetData::Text(fs::read_to_string(path)?),
             Some("css") => AssetData::Css(fs::read_to_string(path)?),
+            Some("js")
+                if let Some(filename) = path.file_name()
+                    && let Some(filename) = filename.to_str()
+                    && filename.starts_with("prism-")
+                    && let Some(stripped) = filename.strip_prefix("prism-")
+                    && let Some(stripped) = stripped.strip_suffix("js")
+                    && let Some(prism_lang) = SyntaxHighlightLang::from_str(stripped) =>
+            {
+                AssetData::JsPrism(fs::read_to_string(path)?, prism_lang)
+            }
             Some("js") => AssetData::Js(fs::read_to_string(path)?),
             _ => AssetData::Unknown(fs::read_to_string(path)?),
         };
@@ -2332,6 +2465,7 @@ impl AssetData {
             AssetData::Html(_) => "text/html; charset=utf-8",
             AssetData::Css(_) => "text/css",
             AssetData::Js(_) => "text/javascript",
+            AssetData::JsPrism(_, _) => "text/javascript",
             AssetData::Png(_) => "image/png",
             AssetData::Ico(_) => "image/ico",
             AssetData::MdRaw(_) => "text/plain; charset=utf-8",
@@ -2364,6 +2498,7 @@ impl AssetData {
             | AssetData::Html(s)
             | AssetData::Css(s)
             | AssetData::Js(s)
+            | AssetData::JsPrism(s, _)
             | AssetData::MdRaw(s)
             | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
             | AssetData::Unknown(s) => s.as_bytes(),
@@ -2384,7 +2519,6 @@ impl Content {
         let mut assets = load_embedded_assets()?;
         #[cfg(generated)]
         let templates = load_embedded_templates()?;
-
         #[cfg(not(generated))]
         // Stub to make the compiler happy
         let assets = Trie::new();
@@ -2839,6 +2973,7 @@ fn sha1(input: String) -> [u8; 20] {
 struct ParsedMarkdown {
     html: String,
     metadata: MarkdownMetadata,
+    highlighted_langs: Vec<SyntaxHighlightLang>,
 }
 
 #[derive(Clone, Debug)]
@@ -3001,7 +3136,7 @@ enum MarkdownNode<'a> {
         children: Vec<MarkdownNode<'a>>,
     },
     CodeBlock {
-        language: Option<&'a str>,
+        language: Option<SyntaxHighlightLang>,
         content: Vec<&'a str>,
     },
     OrderedList(Vec<MarkdownNode<'a>>),
@@ -3050,7 +3185,7 @@ enum MarkdownBlock<'a> {
         content: Vec<&'a [MarkdownToken]>,
     },
     CodeBlock {
-        language: Option<&'a str>,
+        language: Option<SyntaxHighlightLang>,
         content: &'a [MarkdownToken],
     },
     _BreakLine,
@@ -3237,12 +3372,31 @@ impl MarkdownParser {
         let lex = Self::lex(markdown_input);
         // println!("{lex:#?}");
 
-        let blocks = Self::parse_blocks(&lex, markdown_input);
+        let blocks: Vec<MarkdownBlock<'_>> = Self::parse_blocks(&lex, markdown_input);
         // println!("{blocks:#?}");
         let ast = Self::parse_block_content(&blocks, markdown_input);
+        let highlighted_langs = Self::get_highlighted_langs(&blocks);
         // println!("{ast:#?}");
         let html = Self::to_html(ast);
-        ParsedMarkdown { html, metadata }
+        ParsedMarkdown {
+            html,
+            metadata,
+            highlighted_langs,
+        }
+    }
+
+    fn get_highlighted_langs(blocks: &Vec<MarkdownBlock<'_>>) -> Vec<SyntaxHighlightLang> {
+        let mut langs = vec![];
+        for block in blocks {
+            match block {
+                MarkdownBlock::CodeBlock { language: Some(language), .. } => {
+                    langs.push(*language)
+                }
+                _ => continue,
+            }
+        }
+
+        langs
     }
 
     fn lex(input: &str) -> Vec<MarkdownToken> {
@@ -3391,7 +3545,13 @@ impl MarkdownParser {
             };
             let (content, rest) = Self::until_tok(rest, MarkdownTokenTyp::Backtick(3), false);
             if !content.is_empty() {
-                Some((CodeBlock { language, content }, rest))
+                Some((
+                    CodeBlock {
+                        language: language.and_then(SyntaxHighlightLang::from_str),
+                        content,
+                    },
+                    rest,
+                ))
             } else {
                 None
             }
@@ -3467,6 +3627,7 @@ impl MarkdownParser {
         }
     }
 
+    // With split inc;lludes split in rest
     fn until_tok(
         tokens: &[MarkdownToken],
         until: MarkdownTokenTyp,
@@ -3490,29 +3651,14 @@ impl MarkdownParser {
     }
 
     fn tokens_to_string<'a>(mut tokens: &'a [MarkdownToken], input: &'a str) -> Vec<&'a str> {
-        let mut lines = vec![];
+      let Some(first) = tokens.first() else {
+        return Vec::new();
+      };
 
-        loop {
-            tokens = match Self::until_tok(tokens, MarkdownTokenTyp::NewLine, false) {
-                (line, rest) if !rest.is_empty() && !line.is_empty() => {
-                    let first_idx = line.first().expect("not sure").start();
-                    let last_idx = line.last().expect("not sure").end();
+      let last = tokens.last().expect("invariant");
+      let content = &input[first.start()..last.end()];
 
-                    lines.push(&input[first_idx..last_idx]);
-                    rest
-                }
-                (line, _) => {
-                    let first_idx = line.first().expect("not sure").start();
-                    let last_idx = line.last().expect("not sure").end();
-
-                    lines.push(&input[first_idx..last_idx]);
-                    break;
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        lines
+      content.split('\n').collect() 
     }
 
     fn parse_block_content<'a>(blocks: &'a Vec<MarkdownBlock>, input: &'a str) -> MarkdownNode<'a> {
@@ -3861,12 +4007,19 @@ impl MarkdownParser {
                 builder.push_str("</code>");
             }
             MarkdownNode::CodeBlock { language, content } => {
-                builder.push_str("<pre><code>\n");
-                for (idx, child) in content.iter().enumerate() {
-                    builder.push_str(child);
-                    if idx < content.len() - 1 {
+                if let Some(language) = language {
+                    builder.push_str("<pre><code class=\"language-");
+                    builder.push_str(language.to_str());
+                    builder.push_str("\">\n");
+                } else {
+                    builder.push_str("<pre><code>\n");
+                }
+
+                for (idx, line) in content.iter().enumerate() {
+                    if idx != 0 {
                         builder.push('\n');
                     }
+                    Self::push_escaped_code(builder, line);
                 }
                 builder.push_str("</code></pre>\n");
             }
@@ -3912,6 +4065,17 @@ impl MarkdownParser {
                 builder.push_str("\">");
             }
             MarkdownNode::_Table => todo!("tabble"),
+        }
+    }
+
+    fn push_escaped_code(builder: &mut String, input: &str) {
+        for character in input.chars() {
+            match character {
+                '&' => builder.push_str("&amp;"),
+                '<' => builder.push_str("&lt;"),
+                '>' => builder.push_str("&gt;"),
+                _ => builder.push(character),
+            }
         }
     }
 }

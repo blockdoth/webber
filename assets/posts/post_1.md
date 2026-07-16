@@ -4,5 +4,36 @@ published = 2026-07-07
 ::::
 
 
-# Title 1
-sasas
+# post template
+```html
+{{extends "layout.html"}}
+
+{{block js}}
+  <!-- Syntax highlighting -->
+  {{if post.highlighted_langs}}
+    <link href="/css/prism.css" rel="stylesheet" />
+    <script src="/js/prism-core.js"></script>
+    
+    {{for lang in post.highlighted_langs}}
+      <script src="/js/prism-{{lang}}.js"></script>
+    {{endFor}}
+
+  {{endIf}}
+{{endBlock}}
+
+{{block css}}
+  <style>
+    .post {
+      padding: 20px;
+      margin: 2rem;
+    }
+  </style>
+{{endBlock}}
+
+{{block body}}
+  <div class="post">
+    {{post.content}}
+  </div>
+{{endBlock}}
+
+```
