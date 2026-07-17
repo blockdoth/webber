@@ -4204,6 +4204,7 @@ unsafe extern "C" {
     fn sqlite3_malloc64(size: u64) -> *mut c_void;
     fn sqlite3_free(ptr: *mut c_void);
     fn sqlite3_errmsg(db: *mut sqlite3_handle) -> *const i8;
+    fn sqlite3_reset(statement_handle: *mut sqlite3_stmt) -> c_int;
 }
 
 struct Statement {
@@ -4230,6 +4231,19 @@ impl Statement {
             // println!("Bound: {bind:?}")
         }
         Ok(())
+    }
+
+    fn reset_binds(&self) -> Result<(), Box<dyn Error>> {
+        let status = unsafe { sqlite3_reset(self.handle) };
+
+        match status {
+            SQLITE_OK => Ok(()),
+            code => Err(format!(
+                "sqlite3_step failed with code {}",
+                Connection::to_sqlite_err(code, None)
+            )
+            .into()),
+        }
     }
 }
 
@@ -4413,6 +4427,23 @@ impl Connection {
         }
     }
 
+    fn transaction<F>(&self, transaction: F) -> Result<(), Box<dyn Error>>
+    where
+        F: FnOnce() -> Result<(), Box<dyn Error>>,
+    {
+        self.execute("BEGIN TRANSACTION;")?;
+
+        match transaction() {
+            Ok(()) => {
+                self.execute("COMMIT;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.execute("ROLLBACK;");
+                Err(error)
+            }
+        }
+    }
     fn prepare(&self, sql: &str) -> Result<Statement, Box<dyn Error>> {
         let sql = CString::new(sql)?;
         let mut statement_handle: *mut sqlite3_stmt = null_mut();
@@ -4459,6 +4490,24 @@ impl Connection {
             false => Ok(()),
             true => Err("execute unexpectedly returned a row".into()),
         }
+    }
+
+    fn insert_rows(&self, sql: &str, multi_binds: Vec<Vec<Bind>>) -> Result<(), Box<dyn Error>> {
+        self.transaction(|| {
+            let mut statement = self.prepare(sql)?;
+
+            for binds in multi_binds {
+                statement.bind_all(binds)?;
+
+                match statement.step()? {
+                    false => {}
+                    true => return Err("INSERT unexpectedly returned a row".into()),
+                }
+
+                statement.reset_binds()?;
+            }
+            Ok(())
+        })
     }
 
     fn querry(
@@ -4858,7 +4907,7 @@ impl Db {
         });
         self.unsynced = true;
 
-        if self.metric_cache.len() > 10000 {
+        if self.metric_cache.len() >= 10000 {
             self.sync_metric_cache()?;
         }
 
@@ -4869,26 +4918,31 @@ impl Db {
         let start = Instant::now();
         let conn = &self.connection;
 
-        for CachedPageHit {
-            page,
-            loadtime,
-            timestamp,
-        } in &self.metric_cache
-        {
-            conn.insert(
-                "
-          INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
+        let multi_binds = self
+            .metric_cache
+            .iter()
+            .map(|b| {
                 vec![
-                    Bind::Text(page),
-                    Bind::Int(*loadtime),
-                    Bind::Int(*timestamp),
-                ],
-            )?;
-        }
+                    Bind::Text(&b.page),
+                    Bind::Int(b.loadtime),
+                    Bind::Int(b.timestamp),
+                ]
+            })
+            .collect();
+
+        conn.insert_rows(
+            "INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
+            multi_binds,
+        )?;
+
+        let metric_entries = self.metric_cache.len();
         self.metric_cache = vec![];
         self.unsynced = true;
         let duration = Instant::now() - start;
-        println!("synced metric cache in {:?}", duration);
+        println!(
+            "Synced {} entries in metric cache in {:?}",
+            metric_entries, duration
+        );
 
         Ok(())
     }
@@ -4919,20 +4973,20 @@ impl Db {
         let total_loadtimes = res.get_int_column(1)?;
         let counts = res.get_int_column(2)?;
 
-        let mut hm = HashMap::new();
+        let mut metrics_by_page = HashMap::new();
 
-        zip(pages, zip(total_loadtimes, counts)).map(|(page, (total_loadtime, count))| {
-            hm.insert(page.to_owned(), (total_loadtime, count))
-        });
+        for (page, (total_loadtime, count)) in zip(pages, zip(total_loadtimes, counts)) {
+            metrics_by_page.insert(page.to_owned(), (total_loadtime, count));
+        }
 
         for hit in &self.metric_cache {
-            let entry = hm.entry(hit.page.clone()).or_insert((0, 0));
+            let entry = metrics_by_page.entry(hit.page.clone()).or_insert((0, 0));
 
             entry.0 += hit.loadtime;
             entry.1 += 1;
         }
 
-        let mut metrics: Vec<PageMetric> = hm
+        let mut metrics: Vec<PageMetric> = metrics_by_page
             .into_iter()
             .map(|(page, (total_loadtime, count))| {
                 let average_nanos = total_loadtime / count;
