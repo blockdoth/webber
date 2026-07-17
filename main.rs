@@ -2189,7 +2189,7 @@ impl HttpServer {
                         let duration = end_timer - start_timer;
                         // router.stats.add_hit(path, duration);
                         // println!("served request in {duration:?}");
-                        router.db.save_page_hit(path, duration)?;
+                        router.db.save_page_hit(path,duration)?;
                     }
                 };
 
@@ -2202,7 +2202,7 @@ impl HttpServer {
                 }
             }
 
-            if check_db_sync_timer.elapsed() > Duration::from_secs(10) {
+            if check_db_sync_timer.elapsed() > Duration::from_secs(60) {
                 router.db.sync()?;
                 check_db_sync_timer = Instant::now();
             }
@@ -4640,12 +4640,26 @@ impl Blob {
         let end_time = Instant::now() - start_time;
         println!(
             "Serialized db into {} bytes in {:?}",
-            serialized.len(),
+            Self::pretty_bytes(serialized.len()),
             end_time
         );
 
         Ok(())
     }
+
+    fn pretty_bytes(bytes: usize) -> String {
+      const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  
+      if bytes < 1024 {
+          return format!("{bytes} B");
+      }
+  
+      let exponent = ((bytes as f64).log2() / 10.0).floor() as usize;
+      let exponent = exponent.min(UNITS.len() - 1);
+      let value = bytes as f64 / 1024_f64.powi(exponent as i32);
+  
+      format!("{value:.2} {}", UNITS[exponent])
+  }
 }
 
 #[derive(Debug)]
@@ -4654,6 +4668,7 @@ struct Db {
     executable_bytes: Vec<u8>,
     executable_path: PathBuf,
     unsynced: bool,
+    metric_cache: Vec<CachedPageHit>
 }
 
 impl Db {
@@ -4667,7 +4682,7 @@ impl Db {
                 let conn = Connection::deserialize(blob)?;
                 println!(
                     "Blob of length {} found in own binary and serialized into db",
-                    blob.len()
+                    Blob::pretty_bytes(blob.len())
                 );
                 conn
             }
@@ -4680,7 +4695,7 @@ impl Db {
                 {
                     println!(
                         "Blob of length {} found in previous {prev_bin_type} binary and serialized into db",
-                        blob.len()
+                        Blob::pretty_bytes(blob.len())
                     );
 
                     Connection::deserialize(blob)?
@@ -4699,13 +4714,19 @@ impl Db {
             executable_bytes,
             executable_path: current_executable_path,
             unsynced: false,
+            metric_cache: vec![],
         };
         db.sync()?;
         Ok(db)
     }
 
     fn sync(&mut self) -> Result<(), Box<dyn Error>> {
+        if !self.metric_cache.is_empty() {
+          self.sync_metric_cache()?;
+        }
+        
         if self.unsynced {
+
             Blob::self_modify(
                 &self.executable_path,
                 &mut self.executable_bytes,
@@ -4780,25 +4801,48 @@ impl Db {
     }
 
     fn save_page_hit(&mut self, page: &str, loadtime: Duration) -> Result<(), Box<dyn Error>> {
-        let conn = &self.connection;
         let timestamp = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
         let loadtime_nanos = i64::from(loadtime.subsec_nanos());
 
-        conn.insert(
-            "
-            INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
-            vec![
-                Bind::Text(page),
-                Bind::Int(loadtime_nanos),
-                Bind::Int(timestamp),
-            ],
-        )?;
+        self.metric_cache.push(CachedPageHit {
+            page:page.to_string(),
+            loadtime: loadtime_nanos,
+            timestamp
+        });
         self.unsynced = true;
+
+
+        if self.metric_cache.len() > 10000 {
+          self.sync_metric_cache()?;
+        }
 
         Ok(())
     }
+
+    fn sync_metric_cache(&mut self) -> Result<(), Box<dyn Error>>{
+      let start = Instant::now();
+      let conn = &self.connection;
+
+      for CachedPageHit { page, loadtime, timestamp } in &self.metric_cache {
+        conn.insert(
+          "
+          INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
+          vec![
+              Bind::Text(page),
+              Bind::Int(*loadtime),
+              Bind::Int(*timestamp),
+          ],
+        )?;
+      }
+      self.metric_cache = vec![];
+      let duration = Instant::now() - start;
+      println!("synced metric cache in {:?}", duration);
+
+      Ok(())
+    }
+
 
     fn load_stats(&self) -> Result<Stats, Box<dyn Error>> {
         let conn = &self.connection;
@@ -4839,6 +4883,13 @@ impl Db {
             start_time,
         })
     }
+}
+
+#[derive(Debug)]
+struct CachedPageHit {
+    page: String,
+    loadtime: i64,
+    timestamp: i64
 }
 
 #[derive(Debug)]
