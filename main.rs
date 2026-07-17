@@ -4908,7 +4908,7 @@ impl Db {
 
         let res = conn.querry(
             "
-                SELECT page, AVG(load_time) AS average_load_time, COUNT(*) AS total_count
+                SELECT page, SUM(load_time) AS average_load_time, COUNT(*) AS total_count
                 FROM page_metrics
                 GROUP BY page",
             vec![],
@@ -4916,16 +4916,36 @@ impl Db {
         )?;
 
         let pages = res.get_text_column(0)?;
-        let average_loadtimes = res.get_int_column(1)?;
+        let total_loadtimes = res.get_int_column(1)?;
         let counts = res.get_int_column(2)?;
 
-        let metrics = zip(pages, zip(average_loadtimes, counts))
-            .map(|(page, (average_loadtime_nanos, count))| PageMetric {
-                page: page.to_owned(),
-                avg_loadtime: Duration::from_nanos(average_loadtime_nanos as u64),
-                count: count as u64,
+        let mut hm = HashMap::new();
+
+        zip(pages, zip(total_loadtimes, counts)).map(|(page, (total_loadtime, count))| {
+            hm.insert(page.to_owned(), (total_loadtime, count))
+        });
+
+        for hit in &self.metric_cache {
+            let entry = hm.entry(hit.page.clone()).or_insert((0, 0));
+
+            entry.0 += hit.loadtime;
+            entry.1 += 1;
+        }
+
+        let mut metrics: Vec<PageMetric> = hm
+            .into_iter()
+            .map(|(page, (total_loadtime, count))| {
+                let average_nanos = total_loadtime / count;
+
+                PageMetric {
+                    page,
+                    avg_loadtime: Duration::from_nanos(average_nanos as u64),
+                    count: count as u64,
+                }
             })
             .collect();
+
+        metrics.sort_unstable_by(|a, b| a.avg_loadtime.cmp(&b.avg_loadtime));
 
         Ok(Stats {
             pages: metrics,
