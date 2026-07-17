@@ -4427,13 +4427,13 @@ impl Connection {
         }
     }
 
-    fn transaction<F>(&self, transaction: F) -> Result<(), Box<dyn Error>>
+    fn transaction<F>(&self, query_fn: F) -> Result<(), Box<dyn Error>>
     where
         F: FnOnce() -> Result<(), Box<dyn Error>>,
     {
         self.execute("BEGIN TRANSACTION;")?;
 
-        match transaction() {
+        match query_fn() {
             Ok(()) => {
                 self.execute("COMMIT;")?;
                 Ok(())
@@ -4443,6 +4443,26 @@ impl Connection {
                 Err(error)
             }
         }
+    }
+
+    fn transaction_multi<F>(&self, query_fns: Vec<F>) -> Result<(), Box<dyn Error>>
+    where
+        F: FnOnce() -> Result<(), Box<dyn Error>>,
+    {
+        self.execute("BEGIN TRANSACTION;")?;
+
+        for query in query_fns {
+            match query() {
+                Ok(()) => continue,
+                Err(error) => {
+                    self.execute("ROLLBACK;")?;
+                    return Err(error);
+                }
+            }
+        }
+
+        self.execute("COMMIT;")?;
+        Ok(())
     }
     fn prepare(&self, sql: &str) -> Result<Statement, Box<dyn Error>> {
         let sql = CString::new(sql)?;
@@ -4493,21 +4513,27 @@ impl Connection {
     }
 
     fn insert_rows(&self, sql: &str, multi_binds: Vec<Vec<Bind>>) -> Result<(), Box<dyn Error>> {
-        self.transaction(|| {
-            let mut statement = self.prepare(sql)?;
+        self.transaction(|| self.insert_rows_unchecked(sql, multi_binds))
+    }
+    
+    fn insert_rows_unchecked(
+        &self,
+        sql: &str,
+        multi_binds: Vec<Vec<Bind>>,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut statement = self.prepare(sql)?;
 
-            for binds in multi_binds {
-                statement.bind_all(binds)?;
+        for binds in multi_binds {
+            statement.bind_all(binds)?;
 
-                match statement.step()? {
-                    false => {}
-                    true => return Err("INSERT unexpectedly returned a row".into()),
-                }
-
-                statement.reset_binds()?;
+            match statement.step()? {
+                false => {}
+                true => return Err("INSERT unexpectedly returned a row".into()),
             }
-            Ok(())
-        })
+
+            statement.reset_binds()?;
+        }
+        Ok(())
     }
 
     fn querry(
@@ -4862,6 +4888,14 @@ impl Db {
         )?;
         conn.execute(
             "
+          CREATE TABLE page_metrics_aggregate (
+            page TEXT PRIMARY KEY,
+            total_load_time INTEGER,
+            total_hits INTEGER
+          );",
+        )?;
+        conn.execute(
+            "
           CREATE TABLE global_stats (
             id INTEGER PRIMARY KEY,
             start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -4914,11 +4948,12 @@ impl Db {
         Ok(())
     }
 
+    // TODO wrap both inserts into transaction
     fn sync_metric_cache(&mut self) -> Result<(), Box<dyn Error>> {
         let start = Instant::now();
         let conn = &self.connection;
 
-        let multi_binds = self
+        let multi_binds_metrics = self
             .metric_cache
             .iter()
             .map(|b| {
@@ -4930,10 +4965,50 @@ impl Db {
             })
             .collect();
 
-        conn.insert_rows(
-            "INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
-            multi_binds,
-        )?;
+        let mut sorted: Vec<_> = self.metric_cache.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.page.cmp(&b.page));
+
+        let aggregates =
+            sorted
+                .into_iter()
+                .fold(Vec::<(&str, i64, i64)>::new(), |mut aggregates, hit| {
+                    match aggregates.last_mut() {
+                        Some((page, total_load_time, total_hits)) if *page == hit.page.as_str() => {
+                            *total_load_time += hit.loadtime;
+                            *total_hits += 1;
+                        }
+
+                        _ => aggregates.push((hit.page.as_str(), hit.loadtime, 1)),
+                    }
+
+                    aggregates
+                });
+
+        let multi_binds_metrics_aggregate = aggregates
+            .iter()
+            .map(|b| vec![Bind::Text(b.0), Bind::Int(b.1), Bind::Int(b.2)])
+            .collect();
+
+        conn.transaction(|| {
+            conn.insert_rows_unchecked(
+                "INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
+                multi_binds_metrics,
+            );
+            conn.insert_rows_unchecked(
+                "
+                INSERT INTO page_metrics_aggregate (
+                  page,
+                  total_load_time,
+                  total_hits
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(page)
+                  DO UPDATE SET
+                    total_load_time = total_load_time + excluded.total_load_time,
+                    total_hits = total_hits + excluded.total_hits;",
+                multi_binds_metrics_aggregate,
+            )
+        });
 
         let metric_entries = self.metric_cache.len();
         self.metric_cache = vec![];
@@ -4962,9 +5037,8 @@ impl Db {
 
         let res = conn.querry(
             "
-                SELECT page, SUM(load_time) AS average_load_time, COUNT(*) AS total_count
-                FROM page_metrics
-                GROUP BY page",
+                SELECT page, total_load_time, total_hits
+                FROM page_metrics_aggregate",
             vec![],
             vec![ColumnTyp::Text, ColumnTyp::Int, ColumnTyp::Int],
         )?;
@@ -5000,7 +5074,7 @@ impl Db {
             .collect();
 
         metrics.sort_unstable_by(|a, b| a.avg_loadtime.cmp(&b.avg_loadtime));
-
+        // println!("{metrics:?}");
         Ok(Stats {
             pages: metrics,
             start_time,
@@ -5039,7 +5113,7 @@ impl Db {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CachedPageHit {
     page: String,
     loadtime: i64,
