@@ -8,7 +8,6 @@
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt::{Debug, Display};
@@ -26,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::vec::IntoIter;
 use std::{char, fmt, fs, vec};
+use std::{env, path};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
@@ -48,6 +48,44 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn runtime() -> Result<(), Box<dyn Error>> {
+    let mut args = std::env::args();
+
+    if let Some(first_arg) = args.nth(1) {
+        match first_arg.as_str() {
+            "dumpdb" => {
+                let mut db = Db::init()?;
+                let path = if let Some(path) = args.next() {
+                    PathBuf::from(path)
+                } else {
+                    PathBuf::from("./webber.db")
+                };
+                return db.export_db(path);
+            }
+            "exportdb" => {
+                let mut db = Db::init()?;
+                let path = if let Some(path) = args.next() {
+                    PathBuf::from(path)
+                } else {
+                    PathBuf::from("./webber.db")
+                };
+                return db.export_db_serialized(path);
+            }
+            "loaddb" => {
+                let path = if let Some(path) = args.next() {
+                    PathBuf::from(path)
+                } else {
+                    PathBuf::from("./webber.db")
+                };
+                return Db::import_db(path);
+            }
+            _ => return Err(format!("unknown arg: {}", first_arg).into()),
+        }
+    }
+
+    run_server()
+}
+
+fn run_server() -> Result<(), Box<dyn Error>> {
     register_signal_handlers();
 
     let mut db = Db::init()?;
@@ -79,8 +117,7 @@ fn runtime() -> Result<(), Box<dyn Error>> {
     let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
     println!("Started listening on socket http://{SOCKET_ADDR}");
 
-    HttpServer::serve(listener, router)?;
-    Ok(())
+    HttpServer::serve(listener, router)
 }
 
 impl Context {
@@ -2189,7 +2226,7 @@ impl HttpServer {
                         let duration = end_timer - start_timer;
                         // router.stats.add_hit(path, duration);
                         // println!("served request in {duration:?}");
-                        router.db.save_page_hit(path,duration)?;
+                        router.db.save_page_hit(path, duration)?;
                     }
                 };
 
@@ -3389,9 +3426,10 @@ impl MarkdownParser {
         let mut langs = vec![];
         for block in blocks {
             match block {
-                MarkdownBlock::CodeBlock { language: Some(language), .. } => {
-                    langs.push(*language)
-                }
+                MarkdownBlock::CodeBlock {
+                    language: Some(language),
+                    ..
+                } => langs.push(*language),
                 _ => continue,
             }
         }
@@ -3651,14 +3689,14 @@ impl MarkdownParser {
     }
 
     fn tokens_to_string<'a>(mut tokens: &'a [MarkdownToken], input: &'a str) -> Vec<&'a str> {
-      let Some(first) = tokens.first() else {
-        return Vec::new();
-      };
+        let Some(first) = tokens.first() else {
+            return Vec::new();
+        };
 
-      let last = tokens.last().expect("invariant");
-      let content = &input[first.start()..last.end()];
+        let last = tokens.last().expect("invariant");
+        let content = &input[first.start()..last.end()];
 
-      content.split('\n').collect() 
+        content.split('\n').collect()
     }
 
     fn parse_block_content<'a>(blocks: &'a Vec<MarkdownBlock>, input: &'a str) -> MarkdownNode<'a> {
@@ -4445,16 +4483,17 @@ impl Connection {
 
         Ok(SqlResult { inner: res })
     }
-    fn serialize(&self) -> Result<&[u8], Box<dyn Error>> {
+    fn serialize(&self) -> Result<Vec<u8>, Box<dyn Error>> {
         let serialized_db_size = &mut 0;
         let flags = 0;
 
-        let bytes: &[u8] = unsafe {
+        let bytes = unsafe {
             let serialized_db_ptr =
                 sqlite3_serialize(self.handle, null(), serialized_db_size, flags);
 
             let bytes =
-                slice::from_raw_parts(serialized_db_ptr.cast(), (*serialized_db_size) as usize);
+                slice::from_raw_parts(serialized_db_ptr.cast(), (*serialized_db_size) as usize)
+                    .to_vec();
 
             sqlite3_free(serialized_db_ptr.cast_mut().cast());
             bytes
@@ -4490,10 +4529,13 @@ impl Connection {
         }
     }
 
-    fn export_db(&self, path: PathBuf) -> Result<(), Box<dyn Error>> {
+    fn export_db_serialized(&self, path: PathBuf) -> Result<(), Box<dyn Error>> {
         let bytes = self.serialize()?;
 
-        println!("Exported db to {path:?}");
+        println!(
+            "Exported db of size {} to {path:?}",
+            Blob::pretty_bytes(bytes.len())
+        );
         fs::write(path, bytes)?;
         Ok(())
     }
@@ -4502,7 +4544,11 @@ impl Connection {
         let bytes = fs::read(&path)?;
 
         let conn = Connection::deserialize(&bytes)?;
-        println!("Imported db from {path:?}");
+        println!(
+            "Imported db of size {} from {path:?}",
+            Blob::pretty_bytes(bytes.len())
+        );
+
         Ok(conn)
     }
 
@@ -4625,7 +4671,7 @@ impl Blob {
         let start_time = Instant::now();
         let serialized = conn.serialize()?;
 
-        Blob::write_blob(bytes, serialized)?;
+        Blob::write_blob(bytes, &serialized)?;
 
         let tmp = path.with_extension("tmp");
 
@@ -4648,18 +4694,18 @@ impl Blob {
     }
 
     fn pretty_bytes(bytes: usize) -> String {
-      const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-  
-      if bytes < 1024 {
-          return format!("{bytes} B");
-      }
-  
-      let exponent = ((bytes as f64).log2() / 10.0).floor() as usize;
-      let exponent = exponent.min(UNITS.len() - 1);
-      let value = bytes as f64 / 1024_f64.powi(exponent as i32);
-  
-      format!("{value:.2} {}", UNITS[exponent])
-  }
+        const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+        if bytes < 1024 {
+            return format!("{bytes} B");
+        }
+
+        let exponent = ((bytes as f64).log2() / 10.0).floor() as usize;
+        let exponent = exponent.min(UNITS.len() - 1);
+        let value = bytes as f64 / 1024_f64.powi(exponent as i32);
+
+        format!("{value:.2} {}", UNITS[exponent])
+    }
 }
 
 #[derive(Debug)]
@@ -4668,7 +4714,7 @@ struct Db {
     executable_bytes: Vec<u8>,
     executable_path: PathBuf,
     unsynced: bool,
-    metric_cache: Vec<CachedPageHit>
+    metric_cache: Vec<CachedPageHit>,
 }
 
 impl Db {
@@ -4713,7 +4759,7 @@ impl Db {
             connection: conn,
             executable_bytes,
             executable_path: current_executable_path,
-            unsynced: false,
+            unsynced: true,
             metric_cache: vec![],
         };
         db.sync()?;
@@ -4722,11 +4768,10 @@ impl Db {
 
     fn sync(&mut self) -> Result<(), Box<dyn Error>> {
         if !self.metric_cache.is_empty() {
-          self.sync_metric_cache()?;
+            self.sync_metric_cache()?;
         }
-        
-        if self.unsynced {
 
+        if self.unsynced {
             Blob::self_modify(
                 &self.executable_path,
                 &mut self.executable_bytes,
@@ -4807,42 +4852,46 @@ impl Db {
         let loadtime_nanos = i64::from(loadtime.subsec_nanos());
 
         self.metric_cache.push(CachedPageHit {
-            page:page.to_string(),
+            page: page.to_string(),
             loadtime: loadtime_nanos,
-            timestamp
+            timestamp,
         });
         self.unsynced = true;
 
-
         if self.metric_cache.len() > 10000 {
-          self.sync_metric_cache()?;
+            self.sync_metric_cache()?;
         }
 
         Ok(())
     }
 
-    fn sync_metric_cache(&mut self) -> Result<(), Box<dyn Error>>{
-      let start = Instant::now();
-      let conn = &self.connection;
+    fn sync_metric_cache(&mut self) -> Result<(), Box<dyn Error>> {
+        let start = Instant::now();
+        let conn = &self.connection;
 
-      for CachedPageHit { page, loadtime, timestamp } in &self.metric_cache {
-        conn.insert(
-          "
+        for CachedPageHit {
+            page,
+            loadtime,
+            timestamp,
+        } in &self.metric_cache
+        {
+            conn.insert(
+                "
           INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
-          vec![
-              Bind::Text(page),
-              Bind::Int(*loadtime),
-              Bind::Int(*timestamp),
-          ],
-        )?;
-      }
-      self.metric_cache = vec![];
-      let duration = Instant::now() - start;
-      println!("synced metric cache in {:?}", duration);
+                vec![
+                    Bind::Text(page),
+                    Bind::Int(*loadtime),
+                    Bind::Int(*timestamp),
+                ],
+            )?;
+        }
+        self.metric_cache = vec![];
+        self.unsynced = true;
+        let duration = Instant::now() - start;
+        println!("synced metric cache in {:?}", duration);
 
-      Ok(())
+        Ok(())
     }
-
 
     fn load_stats(&self) -> Result<Stats, Box<dyn Error>> {
         let conn = &self.connection;
@@ -4883,13 +4932,44 @@ impl Db {
             start_time,
         })
     }
+
+    fn import_db(path: PathBuf) -> Result<(), Box<dyn Error>> {
+        let executable_path = env::current_exe()?;
+
+        let mut executable_bytes = fs::read(&executable_path)?;
+
+        let connection = Connection::import_db(path)?;
+        let mut db = Db {
+            connection,
+            executable_bytes,
+            executable_path,
+            unsynced: true,
+            metric_cache: vec![],
+        };
+
+        db.sync()?;
+        Ok(())
+    }
+
+    fn export_db_serialized(&mut self, path: PathBuf) -> Result<(), Box<dyn Error>> {
+        self.connection.export_db_serialized(path)?;
+        self.sync()
+    }
+    fn export_db(&self, path: PathBuf) -> Result<(), Box<dyn Error>> {
+        if path.exists() {
+            return Err(format!("Path {path:?} already exists").into());
+        }
+        let path_str = path.to_string_lossy();
+        self.connection
+            .insert("VACUUM INTO ?;", vec![Bind::Text(&path_str)])
+    }
 }
 
 #[derive(Debug)]
 struct CachedPageHit {
     page: String,
     loadtime: i64,
-    timestamp: i64
+    timestamp: i64,
 }
 
 #[derive(Debug)]
