@@ -65,7 +65,7 @@
         font-size: 24px;
         background-color: black;
         display: flex;
-         
+        margin-top: 10px;
         gap: 1.5rem;       
         align-items: bottom;         
       }
@@ -88,6 +88,7 @@
         /* gap: 0.5rem; */
         text-decoration: none;
         color: inherit;     
+        margin-left: 10px;
       }
 
 
@@ -96,6 +97,11 @@
         font-size: 12px;
         color: gray;
         text-align: center;
+      }
+
+      .active {
+        color: black;
+        background-color: white;
       }
 
 
@@ -125,7 +131,7 @@
               >
           </div>
           
-          <div class="nav_button">
+          <div class="nav_button {{if current_page_url == "/home" }} active {{endIf}}">
             blockdoth
           </div>
 
@@ -134,7 +140,8 @@
         {{for page in pages-static}}
 
 
-        <a href="{{page.url}}" class="nav_button" >{{page.name}}</a>
+        <a href="{{page.url}}" class="nav_button {{if page.url == current_page_url }} active {{endIf}}" >~/{{page.name}}</a>
+        
         {{endFor}}
       </div>
 
