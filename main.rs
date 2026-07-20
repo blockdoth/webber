@@ -1,7 +1,6 @@
 #![feature(tcp_linger)]
 #![feature(if_let_guard)]
 #![feature(hash_map_macro)]
-#![feature(slice_split_once)]
 #![allow(unused)]
 // #![allow(unused_mut)]
 
@@ -19,6 +18,7 @@ use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::str::{CharIndices, FromStr};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use std::{char, fmt, fs, vec};
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         comptime()
     } else {
         println!("Running normally");
-        #[cfg(generated)] // Marks everything deadcode during build time
+        // #[cfg(generated)] // Marks everything deadcode during build time
         runtime()?;
 
         Ok(())
@@ -136,11 +136,7 @@ impl Context {
             );
         }
 
-        #[cfg(debug_assertions)]
-        let hotreload = true;
-        #[cfg(not(debug_assertions))]
-        let hotreload = false;
-        context.insert_global("hotreload", hotreload.to_template_value());
+        context.insert_global("hotreload", cfg!(debug_assertions).to_template_value());
 
         context
     }
@@ -697,22 +693,121 @@ struct TemplateError {
     pos: Option<TemplatePositionData>,
 }
 
+impl TemplateError {
+    fn render_error(
+        error: TemplateError,
+        input: &str,
+        file_path: &str,
+        newlines: &[usize],
+    ) -> String {
+        let (file, code_snippet) = if let Some(pos) = error.pos {
+            if let Some(span) = pos.span {
+                let code_str = span.to_line(input, newlines);
+
+                let start_pos = TemplateError::compute_line_col(newlines, span.start);
+                let end_pos = TemplateError::compute_line_col(newlines, span.end);
+                (
+                    format!("{}:{}:{}", pos.file, start_pos.line, start_pos.column,),
+                    TemplateError::format_code_snippet(
+                        code_str,
+                        start_pos.line,
+                        start_pos.column,
+                        end_pos.column,
+                    ),
+                )
+            } else {
+                (format!("File: {}", pos.file), String::from("No code"))
+            }
+        } else {
+            (String::from("No File"), String::from("No code"))
+        };
+
+        TemplateError::error_page(&file, &code_snippet, &error.typ.to_string())
+    }
+
+    //  Inspired by
+    // https://github.com/rust-lang/rust/blob/main/compiler/rustc_span/src/lib.rs#L2391
+    fn compute_line_col(newlines: &[usize], offset: usize) -> Position {
+        let line = newlines.partition_point(|&newline| newline <= offset);
+
+        let line_start = if line == 0 { 0 } else { newlines[line - 1] };
+
+        Position {
+            line: line + 1,
+            column: offset - line_start,
+        }
+    }
+
+    fn error_page(file_pos: &str, code_snippet: &str, error_msg: &str) -> String {
+        let mut context = Context::new();
+
+        context.insert_global("hotreload", cfg!(debug_assertions).to_template_value());
+        context.insert_global("file", file_pos.to_template_value());
+        context.insert_global("code_snippet", code_snippet.to_template_value());
+        context.insert_global("error_msg", error_msg.to_template_value());
+
+        Template::render_helper(&ERROR_TEMPLATE_NODES, &mut context, &HashMap::new())
+            .expect("needs to work")
+    }
+
+    fn format_code_snippet(
+        code_snippet: &str,
+        line: usize,
+        start_col: usize,
+        end_col: usize,
+    ) -> String {
+        let code_len = code_snippet.chars().count();
+
+        let code_snippet = Self::escape_html(code_snippet);
+
+        let end = end_col.max(start_col + 1).min(code_len);
+
+        let line_str = format!("{line}");
+        let gutter_width = line_str.len();
+
+        format!(
+            "{:width$} |\n\
+         {:>width$} | {}\n\
+         {:width$} | {}{}",
+            "",
+            line,
+            code_snippet,
+            "",
+            " ".repeat(start_col),
+            "^".repeat(end.saturating_sub(start_col).max(1)),
+            width = gutter_width,
+        )
+    }
+    fn escape_html(html: &str) -> String {
+        let mut escaped = String::with_capacity(html.len());
+
+        for c in html.chars() {
+            match c {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '"' => escaped.push_str("&quot;"),
+                '\'' => escaped.push_str("&#39;"),
+                _ => escaped.push(c),
+            }
+        }
+
+        escaped
+    }
+}
+
 #[derive(Debug)]
 enum TemplateErrorMsg {
     VariableNotFound(String),
     FieldNotFoundOnVariable(String, String),
     NodeNotOfExpectedType(String, TemplateNodeKind),
     VariableNotOfExpectedType(String, TemplateValueKind),
-    ContextError(String),
     UnexpectedToken(TemplateTokenTyp, TemplateTokenTyp),
     DidNotExpectToken(TemplateTokenTyp),
     UnexpectedTokenOptions(TemplateTokenTyp, Vec<TemplateTokenTyp>),
-    BrokenInvariant(TemplateTokenTyp, TemplateTokenTyp),
-    ExpectButEOF(TemplateTokenTyp),
     GenericError(String),
     MultiLevelForLoopBind(Vec<String>),
     UnexpectedTemplateValueType(TemplateNodeKind, TemplateNodeKind),
-    MergingSpansFromDifferentFiles(String, String),
     CantCompareTemplateValues(TemplateValueKind, TemplateValueKind),
     CantCompareWithLiteral(TemplateValueKind),
     ExtendsNotFirstLine,
@@ -746,20 +841,16 @@ impl TemplateErrorMsg {
             | FieldNotFoundOnVariable(_, _)
             | NodeNotOfExpectedType(_, _)
             | VariableNotOfExpectedType(_, _)
-            | ContextError(_)
             | CantCompareTemplateValues(_, _)
             | CantCompareWithLiteral(_) => Render,
 
             UnexpectedToken(_, _)
             | DidNotExpectToken(_)
             | UnexpectedTokenOptions(_, _)
-            | ExpectButEOF(_)
             | MultiLevelForLoopBind(_)
             | UnexpectedTemplateValueType(_, _)
             | ExtendsNotFirstLine
             | UnexpectedEOF => Parse,
-
-            BrokenInvariant(_, _) | MergingSpansFromDifferentFiles(_, _) => Internal,
 
             GenericError(_) => Internal,
         }
@@ -772,7 +863,7 @@ impl Display for TemplateErrorMsg {
         let error_kind = self.kind();
         match self {
             VariableNotFound(var) => {
-                write!(f, "{error_kind}: Variable '{var}' was not found")
+                write!(f, "{error_kind}: Variable '{var}' was not found in context")
             }
             FieldNotFoundOnVariable(var, field) => {
                 write!(
@@ -792,9 +883,7 @@ impl Display for TemplateErrorMsg {
                     "{error_kind}: Variable '{var}' is not of expected type {expected:?}"
                 )
             }
-            ContextError(msg) => {
-                write!(f, "{error_kind}: Context error: {msg}")
-            }
+
             UnexpectedToken(found, expected) => {
                 write!(
                     f,
@@ -819,18 +908,6 @@ impl Display for TemplateErrorMsg {
 
                 Ok(())
             }
-            BrokenInvariant(expected, found) => {
-                write!(
-                    f,
-                    "Parser invariant broken: expected {expected:?}, found {found:?}"
-                )
-            }
-            ExpectButEOF(expected) => {
-                write!(
-                    f,
-                    "{error_kind}: Unexpected end of file while expecting {expected:?}"
-                )
-            }
             GenericError(msg) => {
                 write!(f, "{error_kind}: {msg}")
             }
@@ -845,12 +922,6 @@ impl Display for TemplateErrorMsg {
                 write!(
                     f,
                     "{error_kind}: Expected template node of type {expected:?}, found {found:?}"
-                )
-            }
-            MergingSpansFromDifferentFiles(file1, file2) => {
-                write!(
-                    f,
-                    "{error_kind}: Cannot merge spans from different files ('{file1}' and '{file2}')"
                 )
             }
             CantCompareTemplateValues(lhs, rhs) => {
@@ -1109,11 +1180,19 @@ impl<'a> TemplateLexer<'a> {
     }
 
     fn flush_ident(tokens: &mut Vec<TemplateToken>, start: usize, end: usize) {
-        if start < end {
+        if start < end && start > 0 {
             tokens.push(TemplateToken::Identifier(Span::from_double(start, end)));
         }
     }
 }
+
+static ERROR_TEMPLATE_NODES: LazyLock<Vec<TemplateNode>> = LazyLock::new(|| {
+    const ERROR_TEMPLATE_STR: &str = include_str!("templates/error.html");
+
+    TemplateLexer::lex("templates/error.html", ERROR_TEMPLATE_STR)
+        .parse_until(&[])
+        .expect("error template must be valid")
+});
 
 struct TemplateParser<'a> {
     file_path: &'a str,
@@ -1138,93 +1217,30 @@ impl<'a> TemplateParser<'a> {
                 required_variables: parser.required_variables,
                 origin_file: file_path.to_string(),
                 last_modified: SystemTime::now(),
+                input: input.to_owned(),
+                newlines: parser.newlines,
             },
-            Err(err) => parser.render_error(err),
-        }
-    }
-
-    fn render_error(&self, error: TemplateError) -> Template {
-        let (file, code_snippet) = if let Some(pos) = error.pos {
-            if let Some(span) = pos.span {
-                let code_str = span.to_line(self.input);
-
-                let start_pos = self.compute_line_col(span.start);
-                let end_pos = self.compute_line_col(span.end);
-                (
-                    format!("{}:{}:{}", pos.file, start_pos.line, start_pos.column,),
-                    Self::format_code_snippet(
-                        code_str,
-                        start_pos.line,
-                        start_pos.column,
-                        end_pos.column,
-                    ),
-                )
-            } else {
-                (format!("File: {}", pos.file), String::from("No code"))
+            Err(err) => {
+                let error_page =
+                    TemplateError::render_error(err, input, file_path, &parser.newlines);
+                Template {
+                    template: vec![TemplateNode {
+                        data: TemplateNodeData::Text(error_page),
+                        pos: TemplatePositionData {
+                            file: file_path.to_string(),
+                            span: None,
+                        },
+                    }],
+                    parent: None,
+                    blocks: HashMap::new(),
+                    required_variables: vec![],
+                    origin_file: file_path.to_string(),
+                    last_modified: SystemTime::now(),
+                    input: input.to_owned(),
+                    newlines: parser.newlines,
+                }
             }
-        } else {
-            (String::from("No File"), String::from("No code"))
-        };
-
-        let error_page = Self::error_page(&file, &code_snippet, &error.typ.to_string());
-
-        Template {
-            template: vec![TemplateNode {
-                data: TemplateNodeData::Text(error_page),
-                pos: TemplatePositionData {
-                    file: self.file_path.to_string(),
-                    span: None,
-                },
-            }],
-            parent: None,
-            blocks: HashMap::new(),
-            required_variables: vec![],
-            origin_file: self.file_path.to_string(),
-            last_modified: SystemTime::now(),
         }
-    }
-
-    fn error_page(file: &str, code_snippet: &str, error_msg: &str) -> String {
-        let error_file_str = include_str!("templates/error.html");
-
-        let template = TemplateLexer::lex("templates/error.html", error_file_str)
-            .parse_until(&[])
-            .expect("needs to be done");
-
-        let mut context = Context::new();
-
-        #[cfg(debug_assertions)]
-        let hotreload = true;
-        #[cfg(not(debug_assertions))]
-        let hotreload = false;
-
-        context.insert_global("hotreload", hotreload.to_template_value());
-        context.insert_global("file", file.to_template_value());
-        context.insert_global("code_snippet", code_snippet.to_template_value());
-        context.insert_global("error_msg", error_msg.to_template_value());
-
-        Template::render_helper(&template, &mut context, &HashMap::new()).expect("needs to work")
-    }
-    fn format_code_snippet(code: &str, line: usize, start_col: usize, end_col: usize) -> String {
-        let code_len = code.chars().count();
-
-        let end = end_col.max(start_col + 1).min(code_len);
-
-        let line_str = format!("{line}");
-        let gutter_width = line_str.len();
-
-        format!(
-            "{:width$} |\n\
-             {:>width$} | {}\n\
-             {:width$} | {}{}",
-            "",
-            line,
-            code,
-            "",
-            " ".repeat(start_col),
-            "^".repeat(end.saturating_sub(start_col).max(1)),
-            width = gutter_width,
-        )
     }
 
     fn show_next_n_tokens(&self, n: usize) {
@@ -1266,33 +1282,16 @@ impl<'a> TemplateParser<'a> {
         }
     }
 
-    fn spans_to_position(&self, start: Span, end: Span) -> TemplatePositionData {
+    fn range_to_position(&self, start: usize, end: usize) -> TemplatePositionData {
         TemplatePositionData {
             file: self.file_path.to_string(),
-            span: Some(Span::from_double(start.start, end.end)),
+            span: Some(Span::from_double(start, end)),
         }
     }
     fn position(&self) -> TemplatePositionData {
         TemplatePositionData {
             file: self.file_path.to_string(),
             span: None,
-        }
-    }
-
-    //  Inspired by
-    // https://github.com/rust-lang/rust/blob/main/compiler/rustc_span/src/lib.rs#L2391
-    fn compute_line_col(&self, offset: usize) -> Position {
-        let line = self.newlines.partition_point(|&newline| newline <= offset);
-
-        let line_start = if line == 0 {
-            0
-        } else {
-            self.newlines[line - 1]
-        };
-
-        Position {
-            line: line + 1,
-            column: offset - line_start,
         }
     }
 
@@ -1338,7 +1337,7 @@ impl<'a> TemplateParser<'a> {
                 tok => {
                     return Err(TemplateError::new(
                         TemplateErrorMsg::DidNotExpectToken(tok.typ()),
-                        self.span_to_position(tok.span()),
+                        self.range_to_position(tok.start() - 1, tok.end() - 1),
                     ))?;
                 }
             };
@@ -1372,7 +1371,8 @@ impl<'a> TemplateParser<'a> {
             let position = if let Some(token) = self.tokens.last() {
                 self.span_to_position(token.span())
             } else {
-                self.position()
+                let input_len = self.input.len();
+                self.span_to_position(&Span::from_double(input_len, input_len))
             };
             return Err(TemplateError::new(
                 TemplateErrorMsg::UnexpectedEOF,
@@ -1410,18 +1410,18 @@ impl<'a> TemplateParser<'a> {
 
         let start_tok = self.consume(If)?;
         self.consume(Whitespace)?;
-
         let cond_node = self.parse_var()?;
 
         let cond_1 = match cond_node.data {
             TemplateNodeData::Variable(path) => path,
             node => {
+                let span = cond_node.pos.span.expect("todo");
                 return Err(TemplateError::new(
                     TemplateErrorMsg::UnexpectedTemplateValueType(
                         TemplateNodeKind::Variable,
                         node.kind(),
                     ),
-                    cond_node.pos,
+                    self.span_to_position(&span),
                 ))?;
             }
         };
@@ -1435,6 +1435,7 @@ impl<'a> TemplateParser<'a> {
             } else {
                 let cond_node = self.parse_var()?;
 
+                let span = cond_node.pos.span.expect("todo");
                 match cond_node.data {
                     TemplateNodeData::Variable(cond_2) => ConditionExpr::VarComp(cond_1, cond_2),
                     node => {
@@ -1443,7 +1444,7 @@ impl<'a> TemplateParser<'a> {
                                 TemplateNodeKind::Variable,
                                 node.kind(),
                             ),
-                            cond_node.pos,
+                            self.span_to_position(&span),
                         ))?;
                     }
                 }
@@ -1454,7 +1455,9 @@ impl<'a> TemplateParser<'a> {
 
         let then_branch = self.parse_until(&[Else, EndIf])?;
 
-        match self.next_token()?.typ() {
+        let next_tok = self.next_token()?;
+        let next_tok_span = next_tok.span();
+        match next_tok.typ() {
             Else => {
                 // Self::show_next_n_tokens(tokens, 3);
                 self.consume(Else)?;
@@ -1466,7 +1469,7 @@ impl<'a> TemplateParser<'a> {
                         then_branch,
                         else_branch,
                     },
-                    pos: self.spans_to_position(start_tok, end_tok),
+                    pos: self.range_to_position(start_tok.start, end_tok.end),
                 })
             }
             EndIf => {
@@ -1478,12 +1481,12 @@ impl<'a> TemplateParser<'a> {
                         then_branch,
                         else_branch: vec![],
                     },
-                    pos: self.spans_to_position(start_tok, end_tok),
+                    pos: self.range_to_position(start_tok.start, end_tok.end),
                 })
             }
             tok => Err(TemplateError::new(
                 TemplateErrorMsg::UnexpectedTokenOptions(tok, vec![Else, EndIf]),
-                cond_node.pos,
+                self.span_to_position(next_tok_span),
             ))?,
         }
     }
@@ -1491,7 +1494,7 @@ impl<'a> TemplateParser<'a> {
     fn parse_var(&mut self) -> Result<TemplateNode, TemplateError> {
         use TemplateToken::*;
 
-        let start_span = self.next_token()?.span().start;
+        let start_span = self.next_token()?.span().start - 1;
 
         let mut ident = Vec::new();
 
@@ -1501,7 +1504,7 @@ impl<'a> TemplateParser<'a> {
             let span = self.consume(TemplateTokenTyp::Identifier)?;
 
             ident.push(span.to_str(input).to_owned());
-            let end_span = span.end;
+            let end_span = span.end - 1;
             match self.tokens.get(self.cursor) {
                 Some(Dot(_)) => {
                     self.consume(TemplateTokenTyp::Dot)?;
@@ -1523,6 +1526,7 @@ impl<'a> TemplateParser<'a> {
         let whitespace_tok = self.consume(Whitespace)?;
 
         let node = self.parse_var()?;
+        let node_span = node.pos.span.expect("msg");
         let bind = if let TemplateNodeData::Variable(var) = node.data {
             if var.len() == 1
                 && let Some(bind) = var.first()
@@ -1531,7 +1535,7 @@ impl<'a> TemplateParser<'a> {
             } else {
                 return Err(TemplateError::new(
                     TemplateErrorMsg::MultiLevelForLoopBind(var),
-                    self.spans_to_position(start_tok, whitespace_tok),
+                    self.range_to_position(whitespace_tok.end, node_span.end),
                 ))?;
             }
         } else {
@@ -1540,7 +1544,7 @@ impl<'a> TemplateParser<'a> {
                     TemplateNodeKind::Variable,
                     node.data.kind(),
                 ),
-                self.spans_to_position(start_tok, whitespace_tok),
+                self.range_to_position(whitespace_tok.end, node_span.end),
             ))?;
         };
 
@@ -1550,6 +1554,7 @@ impl<'a> TemplateParser<'a> {
 
         // Self::show_next_n_tokens(tokens, 3);
         let iter_node = self.parse_var()?;
+        let iter_span = iter_node.pos.span.expect("todo");
         let iter_src = match iter_node.data {
             TemplateNodeData::Variable(path) => path,
             node => {
@@ -1558,7 +1563,7 @@ impl<'a> TemplateParser<'a> {
                         TemplateNodeKind::Variable,
                         node.kind(),
                     ),
-                    iter_node.pos,
+                    self.span_to_position(&iter_span),
                 ))?;
             }
         };
@@ -1573,7 +1578,7 @@ impl<'a> TemplateParser<'a> {
                 iter_src,
                 body,
             },
-            pos: self.spans_to_position(start_tok, whitespace_tok),
+            pos: self.range_to_position(start_tok.start, end_tok.end),
         })
     }
 
@@ -1614,7 +1619,7 @@ impl<'a> TemplateParser<'a> {
                 ident: ident.to_string(),
                 body,
             },
-            pos: self.spans_to_position(start_tok, end_tok),
+            pos: self.range_to_position(start_tok.start, end_tok.end),
         })
     }
 }
@@ -1627,6 +1632,8 @@ struct Template {
     required_variables: Vec<Vec<String>>,
     origin_file: String,
     last_modified: SystemTime,
+    input: String,
+    newlines: Vec<usize>,
 }
 
 impl Template {
@@ -1792,19 +1799,35 @@ impl Template {
     fn resolve_var<'a>(
         ident_fields: &[String],
         context: &'a Context,
-        span: &TemplatePositionData,
+        pos: &TemplatePositionData,
     ) -> Result<&'a TemplateValue, TemplateError> {
         let mut current = if let Some(current) = context.lookup(&ident_fields[0]) {
             current
         } else {
+            let field = ident_fields[0].to_string();
+            let mut pos = pos.clone();
+
+            if let Some(span) = &mut pos.span {
+                span.end = span.start + field.len();
+            }
+
             return Err(TemplateError::new(
-                TemplateErrorMsg::VariableNotFound(ident_fields[0].to_string()),
-                span.clone(),
+                TemplateErrorMsg::VariableNotFound(field),
+                pos,
             ));
         };
 
-        let mut idx = 1;
+        let mut field_idx = 1;
+
+        let mut node_span = pos.span.as_ref().expect("pretty sure this is always true");
+        let mut start_field = node_span.start
+            + ident_fields
+                .first()
+                .expect("pretty sure this is always true")
+                .len();
+
         for field in &ident_fields[1..] {
+            start_field += 1;
             current = match current {
                 TemplateValue::Object(map) => {
                     if let Some(obj) = map.get(field.as_str()) {
@@ -1812,10 +1835,13 @@ impl Template {
                     } else {
                         return Err(TemplateError::new(
                             TemplateErrorMsg::FieldNotFoundOnVariable(
-                                ident_fields[1..idx].concat(),
+                                ident_fields[0..field_idx].concat(),
                                 field.to_string(),
                             ),
-                            span.clone(),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(Span::from_double(start_field, node_span.end)),
+                            },
                         ));
                     }
                 }
@@ -1824,11 +1850,15 @@ impl Template {
                         field.to_string(),
                         TemplateValueKind::List,
                     ),
-                    span.clone(),
+                    TemplatePositionData {
+                        file: pos.file.clone(),
+                        span: Some(Span::from_double(start_field, node_span.end)),
+                    },
                 ))?,
             };
+            start_field += field.len();
 
-            idx += 1;
+            field_idx += 1;
         }
         Ok(current)
     }
@@ -1849,6 +1879,10 @@ impl Template {
                 node.pos.clone(),
             ))?,
         }
+    }
+
+    fn render_error(&self, error: TemplateError) -> String {
+        TemplateError::render_error(error, &self.input, &self.origin_file, &self.newlines)
     }
 }
 //  === end templating ===
@@ -2110,14 +2144,14 @@ impl Router {
                     .insert_local("stats", stats.to_template_value());
 
                 let page =
-                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
+                    Self::render_template(&self.content.templates, &mut self.context, &route.path);
                 self.context.pop();
                 Ok(AssetData::Html(page))
             }
             Some(route) => {
                 self.context.push();
                 let page =
-                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
+                    Self::render_template(&self.content.templates, &mut self.context, &route.path);
                 self.context.pop();
                 Ok(AssetData::Html(page))
             }
@@ -2148,7 +2182,7 @@ impl Router {
                         &self.content.templates,
                         &mut self.context,
                         &dyn_route.template_path,
-                    )?;
+                    );
                     self.context.pop();
                     Ok(AssetData::Html(page))
                 }
@@ -2169,29 +2203,35 @@ impl Router {
         templates: &HashMap<String, Template>,
         context: &mut Context,
         path: &str,
-    ) -> Result<String, TemplateError> {
+    ) -> String {
         //TODO unfuck
         let mut slug = path.strip_suffix(".html").unwrap_or(path);
         slug = slug.strip_prefix("pages").unwrap_or(slug);
         context.insert_local("current_page_url", slug.to_template_value());
 
         let template = templates.get(path).expect("template not found");
-        if let Some(parent_path) = &template.parent {
+        let result = if let Some(parent_path) = &template.parent {
             let parent = templates
                 .get(parent_path)
                 .expect("Parent template not found: {parent_path}");
+
             if parent.parent.is_some() {
-                return Err(TemplateError::only_file(
+                Err(TemplateError::only_file(
                     TemplateErrorMsg::GenericError(format!(
                         "Nested extends are not allowed: {parent_path} extends {parent_path}, but {parent_path} also extends another template"
                     )),
                     parent_path,
-                ))?;
+                ))
+            } else {
+                parent.render_with_blocks(context, &template.blocks)
             }
-
-            Ok(parent.render_with_blocks(context, &template.blocks)?)
         } else {
-            Ok(template.render(context)?)
+            template.render(context)
+        };
+
+        match result {
+            Ok(string) => string,
+            Err(err) => template.render_error(err),
         }
     }
 
@@ -3656,18 +3696,18 @@ impl Span {
         &input[self.start..self.end]
     }
 
-    fn to_line<'a>(&self, input: &'a str) -> &'a str {
-        let bytes = input.as_bytes();
+    fn to_line<'a>(&self, input: &'a str, newlines: &[usize]) -> &'a str {
+        let line_start = match newlines.partition_point(|&newline| newline < self.start) {
+            0 => 0,
+            index => newlines[index - 1] + 1,
+        };
 
-        let mut line_start = self.start;
-        while line_start > 0 && bytes[line_start - 1] != b'\n' {
-            line_start -= 1;
-        }
+        let line_end = match newlines.partition_point(|&newline| newline < self.end) {
+            index if index < newlines.len() => newlines[index] - 1,
+            _ => input.len(),
+        };
 
-        let mut line_end = self.end;
-        while line_end < bytes.len() && bytes[line_end] != b'\n' {
-            line_end += 1;
-        }
+        println!("{}", &input[line_start..line_end]);
 
         &input[line_start..line_end]
     }
