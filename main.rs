@@ -1926,29 +1926,23 @@ impl Context {
     }
 
     fn lookup(&self, key: &str) -> Option<&TemplateValue> {
-        if let Some(val) = self.global_context.get(key) {
-            Some(val)
-        } else {
-            for context in &self.local_context {
-                if let Some(val) = context.get(key) {
-                    return Some(val);
-                }
-            }
-            None
+      for scope in self.local_context.iter().rev() {
+        if let Some(value) = scope.get(key) {
+            return Some(value);
         }
     }
 
+    self.global_context.get(key)
+  }
+
     fn lookup_mut(&mut self, key: &str) -> Option<&mut TemplateValue> {
-        if let Some(val) = self.global_context.get_mut(key) {
-            Some(val)
-        } else {
-            for context in &mut self.local_context {
-                if let Some(val) = context.get_mut(key) {
-                    return Some(val);
-                }
-            }
-            None
+      for scope in self.local_context.iter_mut().rev() {
+        if let Some(value) = scope.get_mut(key) {
+            return Some(value);
         }
+    }
+
+    self.global_context.get_mut(key)
     }
 
     fn update_posts(&mut self, content: &Content) {
