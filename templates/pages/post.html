@@ -2,13 +2,14 @@
 
 
 {{block js}}
-<!-- Syntax highlighting -->
 {{if post.highlighted_langs}}
-<link href="/css/prism.css" rel="stylesheet" />
-<script src="/js/prism-core.js"></script>
-{{for lang in post.highlighted_langs}}
-<script src="/js/prism-{{lang}}.js"></script>
-{{endFor}}
+  <!-- Syntax highlighting -->
+  <link href="/css/prism.css" rel="stylesheet" />
+  <script src="/js/prism-core.js"></script>
+  
+  {{for lang in post.highlighted_langs}}
+    <script src="/js/prism-{{lang}}.js"></script>
+  {{endFor}}
 
 {{endIf}}
 
@@ -28,7 +29,6 @@
 {{block body}}
 <div class="post">
   {{post.content}}
-
 
 </div>
 
