@@ -4,6 +4,7 @@
 #![allow(unused)]
 // #![allow(unused_mut)]
 
+use core::panic;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -98,17 +99,17 @@ fn run_server() -> Result<(), Box<dyn Error>> {
     );
     let context = Context::load_intial(&content);
 
-    // println!("{context:#?}");
-
     let router = Router::new(content, context, db)
         .route_static_hidden("/layout", "layout.html")
         .route_static_hidden("/home", "pages/home.html")
+        .route_static_hidden("/rss", "rss.html")
         .route_static_page("/posts", "pages/posts.html")
         .route_static_page("/quotes", "pages/quotes.html")
         .route_static_page("/stats", "pages/stats.html")
         .route_static_page("/about", "pages/about.html")
         .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")?
-        .fallback("/home");
+        .fallback("/home")
+        .error_page("error.html");
 
     let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
     println!("Started listening on socket http://{SOCKET_ADDR}");
@@ -210,7 +211,7 @@ fn comptime() -> Result<(), Box<dyn Error>> {
     let template_paths = walk_dir(TEMPLATES_PATH);
 
     out.push_str(
-        "fn load_embedded_templates() -> Result<HashMap<String, Template>,TemplateError> {\n",
+        "fn load_embedded_templates() -> Result<HashMap<String, Result<Template,TemplateError>>,TemplateError> {\n",
     );
     out.push_str("\tlet mut templates = HashMap::new();\n");
 
@@ -687,42 +688,88 @@ struct Position {
     column: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TemplateError {
     typ: TemplateErrorMsg,
     pos: Option<TemplatePositionData>,
+    info: Option<Box<TemplateInfo>>, // Box because otherwise clippy complains about Result size
+}
+
+#[derive(Debug, Clone)]
+struct TemplateInfo {
+    input: String,
+    newlines: Vec<usize>,
+    last_modified: SystemTime,
 }
 
 impl TemplateError {
-    fn render_error(
-        error: TemplateError,
-        input: &str,
-        file_path: &str,
-        newlines: &[usize],
-    ) -> String {
-        let (file, code_snippet) = if let Some(pos) = error.pos {
-            if let Some(span) = pos.span {
-                let code_str = span.to_line(input, newlines);
+    fn new(typ: TemplateErrorMsg, pos: TemplatePositionData) -> TemplateError {
+        TemplateError {
+            typ,
+            pos: Some(pos),
+            info: None,
+        }
+    }
 
-                let start_pos = TemplateError::compute_line_col(newlines, span.start);
-                let end_pos = TemplateError::compute_line_col(newlines, span.end);
-                (
-                    format!("{}:{}:{}", pos.file, start_pos.line, start_pos.column,),
-                    TemplateError::format_code_snippet(
-                        code_str,
-                        start_pos.line,
-                        start_pos.column,
-                        end_pos.column,
-                    ),
-                )
+    fn no_info(typ: TemplateErrorMsg) -> Self {
+        Self {
+            typ,
+            pos: None,
+            info: None,
+        }
+    }
+    fn only_file(typ: TemplateErrorMsg, file: &str) -> Self {
+        Self {
+            typ,
+            pos: Some(TemplatePositionData {
+                file: file.to_owned(),
+                span: None,
+            }),
+            info: None,
+        }
+    }
+
+    fn render_error(&self, error_template: &Option<&Template>) -> String {
+        let (file_info, code_snippet) = self.render_error_info();
+
+        if let Some(error_template) = error_template {
+            let mut context = Context::new();
+
+            context.insert_global("hotreload", cfg!(debug_assertions).to_template_value());
+            context.insert_global("file", file_info.to_template_value());
+            context.insert_global("code_snippet", code_snippet.to_template_value());
+            context.insert_global("error_msg", self.typ.to_string().to_template_value());
+
+            error_template.render(&mut context).expect("needs to work")
+        } else {
+            format!("{file_info}\n{code_snippet}")
+        }
+    }
+
+    fn render_error_info(&self) -> (String, String) {
+        if let Some(pos) = &self.pos
+            && let Some(info) = &self.info
+        {
+            if let Some(span) = &pos.span {
+                let code_str = span.to_line(&info.input, &info.newlines);
+
+                let start_pos = TemplateError::compute_line_col(&info.newlines, span.start);
+                let end_pos = TemplateError::compute_line_col(&info.newlines, span.end);
+
+                let file_str = format!("{}:{}:{}", pos.file, start_pos.line, start_pos.column,);
+                let code_snippet = TemplateError::format_code_snippet(
+                    code_str,
+                    start_pos.line,
+                    start_pos.column,
+                    end_pos.column,
+                );
+                (file_str, code_snippet)
             } else {
                 (format!("File: {}", pos.file), String::from("No code"))
             }
         } else {
             (String::from("No File"), String::from("No code"))
-        };
-
-        TemplateError::error_page(&file, &code_snippet, &error.typ.to_string())
+        }
     }
 
     //  Inspired by
@@ -796,7 +843,7 @@ impl TemplateError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TemplateErrorMsg {
     VariableNotFound(String),
     FieldNotFoundOnVariable(String, String),
@@ -960,27 +1007,6 @@ impl From<std::io::Error> for TemplateError {
 impl From<StripPrefixError> for TemplateError {
     fn from(e: StripPrefixError) -> Self {
         TemplateError::no_info(TemplateErrorMsg::GenericError(e.to_string()))
-    }
-}
-
-impl TemplateError {
-    fn new(typ: TemplateErrorMsg, pos: TemplatePositionData) -> Self {
-        Self {
-            typ,
-            pos: Some(pos),
-        }
-    }
-    fn no_info(typ: TemplateErrorMsg) -> Self {
-        Self { typ, pos: None }
-    }
-    fn only_file(typ: TemplateErrorMsg, file: &str) -> Self {
-        Self {
-            typ,
-            pos: Some(TemplatePositionData {
-                file: file.to_owned(),
-                span: None,
-            }),
-        }
     }
 }
 
@@ -1205,42 +1231,21 @@ struct TemplateParser<'a> {
 }
 
 impl<'a> TemplateParser<'a> {
-    fn parse(input: &str, file_path: &str) -> Template {
+    fn parse(input: &str, file_path: &str) -> Result<Template, TemplateError> {
         let mut parser = TemplateLexer::lex(file_path, input);
 
         let parent = parser.parse_parent();
-        match parser.parse_until(&[]) {
-            Ok(template) => Template {
-                template,
-                parent,
-                blocks: parser.blocks,
-                required_variables: parser.required_variables,
-                origin_file: file_path.to_string(),
-                last_modified: SystemTime::now(),
-                input: input.to_owned(),
-                newlines: parser.newlines,
-            },
-            Err(err) => {
-                let error_page =
-                    TemplateError::render_error(err, input, file_path, &parser.newlines);
-                Template {
-                    template: vec![TemplateNode {
-                        data: TemplateNodeData::Text(error_page),
-                        pos: TemplatePositionData {
-                            file: file_path.to_string(),
-                            span: None,
-                        },
-                    }],
-                    parent: None,
-                    blocks: HashMap::new(),
-                    required_variables: vec![],
-                    origin_file: file_path.to_string(),
-                    last_modified: SystemTime::now(),
-                    input: input.to_owned(),
-                    newlines: parser.newlines,
-                }
-            }
-        }
+        let template = parser.parse_until(&[])?;
+        Ok(Template {
+            template,
+            parent,
+            blocks: parser.blocks,
+            required_variables: parser.required_variables,
+            origin_file: file_path.to_string(),
+            last_modified: SystemTime::now(),
+            input: input.to_owned(),
+            newlines: parser.newlines,
+        })
     }
 
     fn show_next_n_tokens(&self, n: usize) {
@@ -1294,6 +1299,17 @@ impl<'a> TemplateParser<'a> {
             span: None,
         }
     }
+    fn error(&self, typ: TemplateErrorMsg, pos: TemplatePositionData) -> TemplateError {
+        TemplateError {
+            typ,
+            pos: Some(pos),
+            info: Some(Box::new(TemplateInfo {
+                input: self.input.to_owned(),
+                newlines: self.newlines.clone(),
+                last_modified: SystemTime::now(),
+            })),
+        }
+    }
 
     fn parse_until(
         &mut self,
@@ -1320,7 +1336,7 @@ impl<'a> TemplateParser<'a> {
                     continue;
                 }
                 Extends(span) => {
-                    return Err(TemplateError::new(
+                    return Err(self.error(
                         TemplateErrorMsg::ExtendsNotFirstLine,
                         self.span_to_position(span),
                     ))?;
@@ -1335,7 +1351,7 @@ impl<'a> TemplateParser<'a> {
                     text
                 }
                 tok => {
-                    return Err(TemplateError::new(
+                    return Err(self.error(
                         TemplateErrorMsg::DidNotExpectToken(tok.typ()),
                         self.range_to_position(tok.start() - 1, tok.end() - 1),
                     ))?;
@@ -1350,7 +1366,7 @@ impl<'a> TemplateParser<'a> {
 
     fn next_token(&self) -> Result<&TemplateToken, TemplateError> {
         if self.cursor >= self.tokens.len() {
-            Err(TemplateError::new(
+            Err(self.error(
                 TemplateErrorMsg::UnexpectedEOF,
                 self.span_to_position(
                     self.tokens
@@ -1374,14 +1390,11 @@ impl<'a> TemplateParser<'a> {
                 let input_len = self.input.len();
                 self.span_to_position(&Span::from_double(input_len, input_len))
             };
-            return Err(TemplateError::new(
-                TemplateErrorMsg::UnexpectedEOF,
-                position,
-            ));
+            return Err(self.error(TemplateErrorMsg::UnexpectedEOF, position));
         };
 
         if token.typ() != expected {
-            return Err(TemplateError::new(
+            return Err(self.error(
                 TemplateErrorMsg::UnexpectedToken(token.typ(), expected),
                 self.span_to_position(token.span()),
             ));
@@ -1416,7 +1429,7 @@ impl<'a> TemplateParser<'a> {
             TemplateNodeData::Variable(path) => path,
             node => {
                 let span = cond_node.pos.span.expect("todo");
-                return Err(TemplateError::new(
+                return Err(self.error(
                     TemplateErrorMsg::UnexpectedTemplateValueType(
                         TemplateNodeKind::Variable,
                         node.kind(),
@@ -1439,7 +1452,7 @@ impl<'a> TemplateParser<'a> {
                 match cond_node.data {
                     TemplateNodeData::Variable(cond_2) => ConditionExpr::VarComp(cond_1, cond_2),
                     node => {
-                        return Err(TemplateError::new(
+                        return Err(self.error(
                             TemplateErrorMsg::UnexpectedTemplateValueType(
                                 TemplateNodeKind::Variable,
                                 node.kind(),
@@ -1484,7 +1497,7 @@ impl<'a> TemplateParser<'a> {
                     pos: self.range_to_position(start_tok.start, end_tok.end),
                 })
             }
-            tok => Err(TemplateError::new(
+            tok => Err(self.error(
                 TemplateErrorMsg::UnexpectedTokenOptions(tok, vec![Else, EndIf]),
                 self.span_to_position(next_tok_span),
             ))?,
@@ -1533,13 +1546,13 @@ impl<'a> TemplateParser<'a> {
             {
                 bind.to_string()
             } else {
-                return Err(TemplateError::new(
+                return Err(self.error(
                     TemplateErrorMsg::MultiLevelForLoopBind(var),
                     self.range_to_position(whitespace_tok.end, node_span.end),
                 ))?;
             }
         } else {
-            return Err(TemplateError::new(
+            return Err(self.error(
                 TemplateErrorMsg::UnexpectedTemplateValueType(
                     TemplateNodeKind::Variable,
                     node.data.kind(),
@@ -1558,7 +1571,7 @@ impl<'a> TemplateParser<'a> {
         let iter_src = match iter_node.data {
             TemplateNodeData::Variable(path) => path,
             node => {
-                return Err(TemplateError::new(
+                return Err(self.error(
                     TemplateErrorMsg::UnexpectedTemplateValueType(
                         TemplateNodeKind::Variable,
                         node.kind(),
@@ -1590,7 +1603,7 @@ impl<'a> TemplateParser<'a> {
         let ident_node = self.parse_var()?;
         let ident = match ident_node.data {
             ref node @ TemplateNodeData::Variable(ref var) if var.len() > 1 => {
-                return Err(TemplateError::new(
+                return Err(self.error(
                     TemplateErrorMsg::GenericError(format!(
                         "blocks can only contain single level identifiers {node}"
                     )),
@@ -1599,7 +1612,7 @@ impl<'a> TemplateParser<'a> {
             }
             TemplateNodeData::Variable(var) => var.first().expect("invariant").clone(),
             node => {
-                return Err(TemplateError::new(
+                return Err(self.error(
                     TemplateErrorMsg::UnexpectedTemplateValueType(
                         TemplateNodeKind::Variable,
                         node.kind(),
@@ -1640,40 +1653,29 @@ impl Template {
     fn from_path<P: AsRef<Path> + Debug + Copy>(path: P) -> Result<Self, TemplateError> {
         let path_string = path.as_ref().to_string_lossy().to_string();
 
-        let template_str = match fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err(TemplateError::only_file(
-                    TemplateErrorMsg::GenericError(e.to_string()),
-                    &path_string,
-                ))?;
-            }
-        };
+        let template_str = fs::read_to_string(path).expect("invariant");
 
-        Ok(TemplateParser::parse(&template_str, &path_string))
+        TemplateParser::parse(&template_str, &path_string)
     }
 
     fn update_from_path<P: AsRef<Path> + Debug + Copy>(
-        template: &mut Template,
+        template: &mut Result<Template, TemplateError>,
         path: P,
-    ) -> Result<(), TemplateError> {
+    ) {
         let path_string = path.as_ref().to_string_lossy().to_string();
 
-        let template_str = match fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err(TemplateError::only_file(
-                    TemplateErrorMsg::GenericError(e.to_string()),
-                    &path_string,
-                ))?;
-            }
+        *template = match fs::read_to_string(path) {
+            Ok(template_str) => TemplateParser::parse(&template_str, &path_string),
+            Err(e) => Err(TemplateError::only_file(
+                TemplateErrorMsg::GenericError(e.to_string()),
+                &path_string,
+            )),
         };
-        *template = TemplateParser::parse(&template_str, &path_string);
-        Ok(())
     }
 
     fn render(&self, context: &mut Context) -> Result<String, TemplateError> {
         Self::render_helper(&self.template, context, &HashMap::new())
+            .map_err(|e| self.enhance_error(e))
     }
 
     fn render_with_blocks(
@@ -1681,7 +1683,25 @@ impl Template {
         context: &mut Context,
         blocks: &HashMap<String, Vec<TemplateNode>>,
     ) -> Result<String, TemplateError> {
-        Self::render_helper(&self.template, context, blocks)
+        Self::render_helper(&self.template, context, blocks).map_err(|e| self.enhance_error(e))
+    }
+    fn render_with_parent(
+        &self,
+        context: &mut Context,
+        parent: &Template,
+    ) -> Result<String, TemplateError> {
+        Self::render_helper(&parent.template, context, &self.blocks).map_err(|e| match &e.pos {
+            Some(pos) => {
+                if pos.file == self.origin_file {
+                    self.enhance_error(e)
+                } else if pos.file == parent.origin_file {
+                    parent.enhance_error(e)
+                } else {
+                    panic!("cosmic ray type event")
+                }
+            }
+            None => self.enhance_error(e),
+        })
     }
 
     fn render_helper(
@@ -1796,6 +1816,18 @@ impl Template {
         Ok(res)
     }
 
+    fn error(&self, typ: TemplateErrorMsg, pos: TemplatePositionData) -> TemplateError {
+        TemplateError {
+            typ,
+            pos: Some(pos),
+            info: Some(Box::new(TemplateInfo {
+                input: self.input.to_owned(),
+                newlines: self.newlines.clone(),
+                last_modified: SystemTime::now(),
+            })),
+        }
+    }
+
     fn resolve_var<'a>(
         ident_fields: &[String],
         context: &'a Context,
@@ -1881,8 +1913,16 @@ impl Template {
         }
     }
 
-    fn render_error(&self, error: TemplateError) -> String {
-        TemplateError::render_error(error, &self.input, &self.origin_file, &self.newlines)
+    fn enhance_error(&self, err: TemplateError) -> TemplateError {
+        TemplateError {
+            typ: err.typ,
+            pos: err.pos,
+            info: Some(Box::new(TemplateInfo {
+                input: self.input.clone(),
+                newlines: self.newlines.clone(),
+                last_modified: self.last_modified,
+            })),
+        }
     }
 }
 //  === end templating ===
@@ -1926,23 +1966,23 @@ impl Context {
     }
 
     fn lookup(&self, key: &str) -> Option<&TemplateValue> {
-      for scope in self.local_context.iter().rev() {
-        if let Some(value) = scope.get(key) {
-            return Some(value);
+        for scope in self.local_context.iter().rev() {
+            if let Some(value) = scope.get(key) {
+                return Some(value);
+            }
         }
-    }
 
-    self.global_context.get(key)
-  }
+        self.global_context.get(key)
+    }
 
     fn lookup_mut(&mut self, key: &str) -> Option<&mut TemplateValue> {
-      for scope in self.local_context.iter_mut().rev() {
-        if let Some(value) = scope.get_mut(key) {
-            return Some(value);
+        for scope in self.local_context.iter_mut().rev() {
+            if let Some(value) = scope.get_mut(key) {
+                return Some(value);
+            }
         }
-    }
 
-    self.global_context.get_mut(key)
+        self.global_context.get_mut(key)
     }
 
     fn update_posts(&mut self, content: &Content) {
@@ -2024,6 +2064,7 @@ struct Router {
     dynamic_routes: HashMap<String, DynamicRoute>,
 
     fallback: Option<String>,
+    error_page: Option<String>,
 }
 
 impl Router {
@@ -2035,6 +2076,7 @@ impl Router {
             static_routes: HashMap::new(),
             dynamic_routes: HashMap::new(),
             fallback: None,
+            error_page: None,
         }
     }
 
@@ -2115,6 +2157,17 @@ impl Router {
         self
     }
 
+    fn error_page(mut self, template: &str) -> Self {
+        match self.content.templates.get(template) {
+            None => panic!("Error page: \"{template}\" must be in the templates"),
+            Some(Err(err)) => {
+                panic!("Error page: \"{template}\" has a render or parsing error: {err:?}")
+            }
+            Some(Ok(asset)) => self.error_page = Some(template.to_owned()),
+        }
+        self
+    }
+
     fn serve_page(
         &mut self,
         header: &HttpRequestHeader,
@@ -2138,14 +2191,14 @@ impl Router {
                     .insert_local("stats", stats.to_template_value());
 
                 let page =
-                    Self::render_template(&self.content.templates, &mut self.context, &route.path);
+                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
                 self.context.pop();
                 Ok(AssetData::Html(page))
             }
             Some(route) => {
                 self.context.push();
                 let page =
-                    Self::render_template(&self.content.templates, &mut self.context, &route.path);
+                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
                 self.context.pop();
                 Ok(AssetData::Html(page))
             }
@@ -2176,7 +2229,7 @@ impl Router {
                         &self.content.templates,
                         &mut self.context,
                         &dyn_route.template_path,
-                    );
+                    )?;
                     self.context.pop();
                     Ok(AssetData::Html(page))
                 }
@@ -2194,38 +2247,36 @@ impl Router {
     }
 
     fn render_template(
-        templates: &HashMap<String, Template>,
+        templates: &HashMap<String, Result<Template, TemplateError>>,
         context: &mut Context,
         path: &str,
-    ) -> String {
+    ) -> Result<String, TemplateError> {
         //TODO unfuck
         let mut slug = path.strip_suffix(".html").unwrap_or(path);
         slug = slug.strip_prefix("pages").unwrap_or(slug);
         context.insert_local("current_page_url", slug.to_template_value());
 
-        let template = templates.get(path).expect("template not found");
-        let result = if let Some(parent_path) = &template.parent {
-            let parent = templates
-                .get(parent_path)
-                .expect("Parent template not found: {parent_path}");
-
-            if parent.parent.is_some() {
-                Err(TemplateError::only_file(
-                    TemplateErrorMsg::GenericError(format!(
-                        "Nested extends are not allowed: {parent_path} extends {parent_path}, but {parent_path} also extends another template"
-                    )),
-                    parent_path,
-                ))
-            } else {
-                parent.render_with_blocks(context, &template.blocks)
+        match templates.get(path).expect("template not found") {
+            Ok(template) => {
+                if let Some(parent_path) = &template.parent {
+                    match templates
+                        .get(parent_path)
+                        .expect("Parent template not found: {parent_path}")
+                    {
+                        Ok(parent_template) => {
+                            if parent_template.parent.is_some() {
+                                todo!("nested parents")
+                            } else {
+                                template.render_with_parent(context, parent_template)
+                            }
+                        }
+                        Err(err) => Err(template.enhance_error(err.clone())),
+                    }
+                } else {
+                    template.render(context)
+                }
             }
-        } else {
-            template.render(context)
-        };
-
-        match result {
-            Ok(string) => string,
-            Err(err) => template.render_error(err),
+            Err(template_error) => Err(template_error.clone()),
         }
     }
 
@@ -2554,6 +2605,22 @@ impl HttpServer {
                                 HttpResponseCode::RedirectOther(redirect_path),
                                 &AssetData::Empty,
                             ),
+                            Err(HttpServerError::TemplatingError(err)) => {
+                                let error_template = if let Some(error_page_path) =
+                                    &router.error_page
+                                    && let Some(Ok(template)) =
+                                        router.content.templates.get(error_page_path)
+                                {
+                                    Some(template)
+                                } else {
+                                    None
+                                };
+
+                                Self::build_response(
+                                    HttpResponseCode::Ok,
+                                    &AssetData::Html(err.render_error(&error_template)),
+                                )
+                            }
                             Err(err) => {
                                 println!("Server error {err:#?}");
                                 Self::build_response(
@@ -2590,13 +2657,7 @@ impl HttpServer {
                 let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
                     check_fs_timer = Instant::now();
 
-                    match router.content.check_update(&mut router.context) {
-                        Ok(reload) => reload,
-                        Err(err) => {
-                            println!("Error while reloading: {err}");
-                            false
-                        }
-                    }
+                    router.content.check_update(&mut router.context)?
                 } else {
                     false
                 };
@@ -2888,7 +2949,7 @@ impl AssetData {
 #[derive(Debug)]
 struct Content {
     assets: Trie<Asset>,
-    templates: HashMap<String, Template>,
+    templates: HashMap<String, Result<Template, TemplateError>>,
 }
 
 impl Content {
@@ -2931,14 +2992,32 @@ impl Content {
             let last_modified = path.metadata()?.modified()?;
             let path_str = path.to_string_lossy().to_string();
 
-            for (key, template) in self.templates.iter_mut() {
-                if template.origin_file == path_str {
-                    is_new = false;
-                    if template.last_modified < last_modified {
-                        Template::update_from_path(template, path)?;
-                        changed = true;
+            for (key, template_res) in self.templates.iter_mut() {
+                match template_res {
+                    Ok(template) => {
+                        if template.origin_file == path_str {
+                            is_new = false;
+                            if template.last_modified < last_modified {
+                                Template::update_from_path(template_res, path);
+                                changed = true;
 
-                        println!("Updated template {:?}, for page: {key:?}", path_str,);
+                                println!("Updated template {:?}, for page: {key:?}", path_str,);
+                            }
+                        }
+                    }
+                    Err(template_err) => {
+                        if let Some(pos) = &template_err.pos
+                            && let Some(info) = &template_err.info
+                            && pos.file == path_str
+                        {
+                            is_new = false;
+                            if info.last_modified < last_modified {
+                                Template::update_from_path(template_res, path);
+                                changed = true;
+
+                                println!("Updated template {:?}, for page: {key:?}", path_str,);
+                            }
+                        }
                     }
                 }
             }
@@ -2946,7 +3025,7 @@ impl Content {
             if is_new {
                 let template = Template::from_path(path)?;
                 println!("Added template {path_str:?}");
-                self.templates.insert(path_str.clone(), template);
+                self.templates.insert(path_str.clone(), Ok(template));
                 changed = true;
             }
         }

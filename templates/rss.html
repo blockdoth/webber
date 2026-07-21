@@ -1,0 +1,16 @@
+<rss version="2.0">
+  <channel>
+      <title>blockdoth's blog</title> 
+      <link>https://todo.com</link>
+      <description>blockdoth's blog</description>
+      <language>en-us</language>
+      
+      {{ for post in posts }}
+          <item>
+              <title>{{ post.title }}</title>
+              <link>{{ post.slug }}</link>
+
+            </item>
+      {{ endFor }}
+  </channel>
+</rss>
