@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::fmt::Write as FmtWrite;
 use std::fmt::{Debug, Display};
 use std::io::{self, Read, Write};
 use std::iter::{Peekable, zip};
@@ -27,7 +28,6 @@ use std::str::{CharIndices, FromStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use std::{char, fmt, fs, vec};
-use std::fmt::Write as FmtWrite;
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
@@ -105,7 +105,9 @@ fn comptime() -> Result<(), Box<dyn Error>> {
             .to_string_lossy()
             .into_owned();
         let content_str = match asset_path.extension().and_then(|s| s.to_str()) {
-            Some("png") | Some("ico") => &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())"),
+            Some("png") | Some("ico") => {
+                &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())")
+            }
             Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
             Some("md") => &format!(
                 "AssetData::MdParsed(MarkdownParser::parse(include_str!({global_path:?})))"
@@ -187,29 +189,29 @@ fn comptime() -> Result<(), Box<dyn Error>> {
         (false, false) => None,
     };
 
-     if let Some((prev_bin_path, is_debug)) = bin_tupple {
-         fs::copy(&prev_bin_path, &last_bin_path)?;
+    if let Some((prev_bin_path, is_debug)) = bin_tupple {
+        fs::copy(&prev_bin_path, &last_bin_path)?;
 
-         println!(
-             "cargo:warning=embedding binary path: {}",
-             prev_bin_path.display()
-         );
+        println!(
+            "cargo:warning=embedding binary path: {}",
+            prev_bin_path.display()
+        );
 
-         if is_debug {
-             out.push_str("static PREV_BIN_TYPE: Option<&str> = Some(\"debug\");\n");
-         } else {
-             out.push_str("static PREV_BIN_TYPE: Option<&str> = Some(\"release\");\n");
-         }
+        if is_debug {
+            out.push_str("static PREV_BIN_TYPE: Option<&str> = Some(\"debug\");\n");
+        } else {
+            out.push_str("static PREV_BIN_TYPE: Option<&str> = Some(\"release\");\n");
+        }
 
-         out.push_str(&format!(
-             "static PREV_BIN_PATH: Option<&str> = Some({last_bin_path:?});\n"
-         ));
-     } else {
-         println!("cargo:warning=no existing selfmod binary found");
+        out.push_str(&format!(
+            "static PREV_BIN_PATH: Option<&str> = Some({last_bin_path:?});\n"
+        ));
+    } else {
+        println!("cargo:warning=no existing selfmod binary found");
 
-         out.push_str("static PREV_BIN_TYPE: Option<&str> = None;\n");
-         out.push_str("static PREV_BIN_PATH: Option<&str> = None;\n");
-     };
+        out.push_str("static PREV_BIN_TYPE: Option<&str> = None;\n");
+        out.push_str("static PREV_BIN_PATH: Option<&str> = None;\n");
+    };
 
     // === Git ===
     let (short, long) = get_commit_hash();
@@ -269,7 +271,6 @@ fn run_server() -> Result<(), Box<dyn Error>> {
     db.sync()?;
 
     let content = Content::load_embedded();
-
 
     let context = Context::load_intial(&content);
 
@@ -346,8 +347,10 @@ impl HttpServer {
             && let Some(_) = header.sec_websocket_version
         {
             let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-            let websocket_accept =
-                base64(&sha1(&format!("{}{magic_string}", sec_websocket_key.trim())));
+            let websocket_accept = base64(&sha1(&format!(
+                "{}{magic_string}",
+                sec_websocket_key.trim()
+            )));
             format!(
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
             )
@@ -479,7 +482,11 @@ impl HttpServer {
     }
 
     fn clean_path(path: &str) -> &str {
-        let end = path.find(['?', '#', '%']).unwrap_or(path.len());
+        let end = path
+            .as_bytes()
+            .iter()
+            .position(|&b| b == b'?' || b == b'#')
+            .unwrap_or(path.len());
 
         &path[..end]
     }
@@ -512,7 +519,7 @@ impl HttpServer {
             .expect("Unable to set socket to nonblocking mode");
 
         'main: while !SHUTDOWN.load(Ordering::Relaxed) {
-            print!("Loop it {it}\r");
+            // print!("Loop it {it}\r");
             it += 1;
 
             if let Ok((mut stream, peer_addr)) = listener.accept() {
@@ -527,7 +534,7 @@ impl HttpServer {
                             continue 'main;
                         }
                         Ok(n) => break n,
-                        _ => {},
+                        _ => {}
                     };
                 };
                 let start_timer = Instant::now();
@@ -861,25 +868,20 @@ impl Router {
             }
 
             Some(route) if header.path == "/stats" => {
-                self.context.push();
                 let stats = self
                     .db
                     .load_stats()
                     .expect("TOPO improve error handeling to make this work");
+                let page = self.context.within_context_content(&self.content, |ctx, content| {
+                    ctx.insert_local("stats", stats.to_template_value());
+                    Self::render_template(&content.templates, ctx, &route.path)
+                })?;
 
-                self.context
-                    .insert_local("stats", stats.to_template_value());
-
-                let page =
-                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
-                self.context.pop();
                 Ok(AssetData::Html(page))
             }
             Some(route) => {
-                self.context.push();
                 let page =
                     Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
-                self.context.pop();
                 Ok(AssetData::Html(page))
             }
             _ => match self.dynamic_routes.get(&header.path) {
@@ -889,7 +891,7 @@ impl Router {
                     Ok(AssetData::Html(cached.to_string()))
                 }
                 Some(dyn_route) => {
-                    println!("Serving dynamic page {}", header.path);
+                    // println!("Serving dynamic page {}", header.path);
 
                     let page_context_var = if let Some(TemplateValue::Object(posts_by_slug)) =
                         self.context.lookup("posts_by_slug")
@@ -900,16 +902,11 @@ impl Router {
                         todo!("slug not found");
                     };
 
-                    self.context.push();
-                    self.context
-                        .insert_local(&dyn_route.page_var_name, page_context_var);
+                    let page = self.context.within_context_content(&self.content, |ctx, content| {
+                        ctx.insert_local(&dyn_route.page_var_name, page_context_var);
+                        Self::render_template(&content.templates, ctx, &dyn_route.template_path)
+                    })?;
 
-                    let page = Self::render_template(
-                        &self.content.templates,
-                        &mut self.context,
-                        &dyn_route.template_path,
-                    )?;
-                    self.context.pop();
                     Ok(AssetData::Html(page))
                 }
 
@@ -1007,8 +1004,10 @@ impl Template {
     }
 
     fn render(&self, context: &mut Context) -> Result<String, TemplateError> {
-        Self::render_helper(&self.template, context, &HashMap::new())
-            .map_err(|e| self.enhance_error(e))
+        let mut out = String::new();
+        Self::render_helper(&self.template, context, &HashMap::new(), &mut out)
+            .map_err(|e| self.enhance_error(e));
+        Ok(out)
     }
 
     fn render_with_parent(
@@ -1016,36 +1015,40 @@ impl Template {
         context: &mut Context,
         parent: &Template,
     ) -> Result<String, TemplateError> {
-        Self::render_helper(&parent.template, context, &self.blocks).map_err(|e| match &e.pos {
-            Some(pos) => {
-                if pos.file == self.origin_file {
-                    self.enhance_error(e)
-                } else if pos.file == parent.origin_file {
-                    parent.enhance_error(e)
-                } else {
-                    panic!("cosmic ray type event")
+        let mut out = String::new();
+        Self::render_helper(&parent.template, context, &self.blocks, &mut out).map_err(
+            |e| match &e.pos {
+                Some(pos) => {
+                    if pos.file == self.origin_file {
+                        self.enhance_error(e)
+                    } else if pos.file == parent.origin_file {
+                        parent.enhance_error(e)
+                    } else {
+                        panic!("cosmic ray type event")
+                    }
                 }
-            }
-            None => self.enhance_error(e),
-        })
+                None => self.enhance_error(e),
+            },
+        );
+        Ok(out)
     }
 
     fn render_helper(
         template: &[TemplateNode],
         context: &mut Context,
         blocks: &HashMap<String, Vec<TemplateNode>>,
-    ) -> Result<String, TemplateError> {
+        out: &mut String,
+    ) -> Result<(), TemplateError> {
         use TemplateNodeData::*;
-        let mut res = String::new();
         for node in template {
             match &node.data {
-                Text(text) => res.push_str(text),
+                Text(text) => out.push_str(text),
                 Variable(ident_fields) => {
                     match Self::resolve_var(ident_fields, context, &node.pos)? {
-                        TemplateValue::Text(text) => res.push_str(text),
-                        TemplateValue::Bool(bool_val) => write!(&mut res, "{bool_val}")?,
-                        TemplateValue::List(list) => write!(&mut res, "{list:?}")?,
-                        TemplateValue::Object(object) => write!(&mut res,"{object:?}")?,
+                        TemplateValue::Text(text) => out.push_str(text),
+                        TemplateValue::Bool(bool_val) => write!(out, "{bool_val}")?,
+                        TemplateValue::List(list) => write!(out, "{list:?}")?,
+                        TemplateValue::Object(object) => write!(out, "{object:?}")?,
                     }
                 }
                 If {
@@ -1089,29 +1092,30 @@ impl Template {
                         }
                     };
 
-                    let cond_str = if cond {
-                        Self::render_helper(then_branch, context, blocks)?
+                    if cond {
+                        Self::render_helper(then_branch, context, blocks, out)?
                     } else {
-                        Self::render_helper(else_branch, context, blocks)?
+                        Self::render_helper(else_branch, context, blocks, out)?
                     };
-                    res.push_str(&cond_str);
                 }
                 For {
                     iter_bind,
                     iter_src,
                     body,
                 } => {
+                  // Todo remove clone
                     if let TemplateValue::List(iter) =
                         Self::resolve_var(iter_src, context, &node.pos)?.clone()
                     {
                         let mut for_res = String::new();
                         for it in iter {
-                            context.push();
-                            context.insert_local(iter_bind, it.clone());
-                            for_res.push_str(&Self::render_helper(body, context, blocks)?);
-                            context.pop();
+
+                            let page = context.within_context( |ctx| {
+                                ctx.insert_local(iter_bind, it.clone());
+                                Self::render_helper(body, ctx, blocks, &mut for_res)
+                            })?;
                         }
-                        res.push_str(&for_res);
+                        out.push_str(&for_res);
                     } else {
                         return Err(TemplateError::new(
                             TemplateErrorMsg::VariableNotOfExpectedType(
@@ -1124,16 +1128,14 @@ impl Template {
                 }
                 Block { ident, body } => {
                     if let Some(override_body) = blocks.get(ident) {
-                        let body_str = Self::render_helper(override_body, context, blocks)?;
-                        res.push_str(&body_str);
+                        Self::render_helper(override_body, context, blocks, out)?;
                     } else {
-                        let body_str = Self::render_helper(body, context, blocks)?;
-                        res.push_str(&body_str);
+                        Self::render_helper(body, context, blocks, out)?;
                     }
                 }
             };
         }
-        Ok(res)
+        Ok(())
     }
 
     fn resolve_var<'a>(
@@ -1141,19 +1143,19 @@ impl Template {
         context: &'a Context,
         pos: &TemplatePositionData,
     ) -> Result<&'a TemplateValue, TemplateError> {
-       let Some(mut current) = context.lookup(&ident_fields[0]) else {
-             let field = ident_fields[0].to_string();
-             let mut pos = pos.clone();
+        let Some(mut current) = context.lookup(&ident_fields[0]) else {
+            let field = ident_fields[0].to_string();
+            let mut pos = pos.clone();
 
-             if let Some(span) = &mut pos.span {
-                 span.end = span.start + field.len();
-             }
+            if let Some(span) = &mut pos.span {
+                span.end = span.start + field.len();
+            }
 
-             return Err(TemplateError::new(
-                 TemplateErrorMsg::VariableNotFound(field),
-                 pos,
-             ));
-         };
+            return Err(TemplateError::new(
+                TemplateErrorMsg::VariableNotFound(field),
+                pos,
+            ));
+        };
 
         let mut field_idx = 1;
 
@@ -1291,7 +1293,11 @@ impl ToTemplateValue for SystemTime {
 
 impl<T: ToTemplateValue> ToTemplateValue for Vec<T> {
     fn to_template_value(&self) -> TemplateValue {
-        TemplateValue::List(self.iter().map(ToTemplateValue::to_template_value).collect())
+        TemplateValue::List(
+            self.iter()
+                .map(ToTemplateValue::to_template_value)
+                .collect(),
+        )
     }
 }
 
@@ -1330,7 +1336,8 @@ impl ToTemplateValue for SyntaxHighlightLang {
         use SyntaxHighlightLang::*;
         use TemplateValue::*;
         match self {
-          Bash | C | Clike | Css | Haskell | Nix | Rust | Markdown | Markup | Elixir | Html | Javascript | Typescript => Text(self.to_str().to_string()),
+            Bash | C | Clike | Css | Haskell | Nix | Rust | Markdown | Markup | Elixir | Html
+            | Javascript | Typescript => Text(self.to_str().to_string()),
         }
     }
 }
@@ -1344,12 +1351,9 @@ impl ToTemplateValue for AssetData {
                 todo!("Cant isnert binary assets into context yet")
             }
             Empty => todo!("not sure what to do with this"),
-            AssetData::Text(s)
-            | Html(s)
-            | Css(s)
-            | Js(s)
-            | MdRaw(s)
-            | Unknown(s) => TemplateValue::Text(s.to_string()),
+            AssetData::Text(s) | Html(s) | Css(s) | Js(s) | MdRaw(s) | Unknown(s) => {
+                TemplateValue::Text(s.to_string())
+            }
             MdParsed(ParsedMarkdown {
                 html,
                 metadata,
@@ -1970,13 +1974,34 @@ impl Context {
     fn push(&mut self) {
         self.local_context.push(HashMap::new());
     }
-
     fn pop(&mut self) {
         if self.local_context.len() > 1 {
             self.local_context.pop();
         } else {
             self.local_context = vec![HashMap::new()];
         }
+    }
+
+    fn within_context<T, E>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<T, E> {
+        self.push();
+
+        let result = f(self);
+        self.pop();
+
+        result
+    }
+
+    fn within_context_content<T, E>(
+        &mut self,
+        content: &Content,
+        f: impl FnOnce(&mut Self, &Content) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.push();
+
+        let result = f(self, content);
+        self.pop();
+
+        result
     }
 
     fn insert_local(&mut self, key: &str, value: TemplateValue) {
@@ -2050,7 +2075,7 @@ struct Content {
 }
 
 impl Content {
-    fn load_embedded() -> Self{
+    fn load_embedded() -> Self {
         #[cfg(generated)]
         let assets = load_embedded_assets();
         #[cfg(generated)]
@@ -2271,15 +2296,17 @@ impl AssetData {
 
     fn typ(&self) -> &str {
         match self {
-          AssetData::Html(_) => "text/html; charset=utf-8",
-          AssetData::Css(_) => "text/css",
-          AssetData::Js(_) => "text/javascript",
-          AssetData::Png(_) => "image/png",
-          AssetData::Ico(_) => "image/ico",
-          AssetData::Woff2(_) => "font/woff2",
-          AssetData::MdParsed(_) => "text/html; charset=utf-8",
-          AssetData::Text(_) | AssetData::MdRaw(_) | AssetData::Unknown(_)=> "text/plain; charset=utf-8",
-          AssetData::Empty => "",
+            AssetData::Html(_) => "text/html; charset=utf-8",
+            AssetData::Css(_) => "text/css",
+            AssetData::Js(_) => "text/javascript",
+            AssetData::Png(_) => "image/png",
+            AssetData::Ico(_) => "image/ico",
+            AssetData::Woff2(_) => "font/woff2",
+            AssetData::MdParsed(_) => "text/html; charset=utf-8",
+            AssetData::Text(_) | AssetData::MdRaw(_) | AssetData::Unknown(_) => {
+                "text/plain; charset=utf-8"
+            }
+            AssetData::Empty => "",
         }
     }
 
@@ -3130,7 +3157,10 @@ impl MarkdownMetadata {
 
         let first_line = &input[cursor..first_line_end];
 
-        assert!(first_line.starts_with("::::"), "markdown must have metadata");
+        assert!(
+            first_line.starts_with("::::"),
+            "markdown must have metadata"
+        );
 
         cursor = if first_line_end < input.len() {
             first_line_end + 1
@@ -3228,9 +3258,9 @@ impl MarkdownMetadata {
         let value = value.trim();
 
         if value.is_empty() {
-          None
+            None
         } else {
-          Some(value.to_string())
+            Some(value.to_string())
         }
     }
     fn parse_tags(value: &str) -> Vec<String> {
@@ -3689,17 +3719,17 @@ impl MarkdownParser {
                 (rest, None)
             };
             let (content, rest) = Self::until_tok(rest, MarkdownTokenTyp::Backtick(3), false);
-            
+
             if content.is_empty() {
-              None
+                None
             } else {
-              Some((
-                  CodeBlock {
-                      language: language.and_then(SyntaxHighlightLang::from_str),
-                      content,
-                  },
-                  rest,
-              ))
+                Some((
+                    CodeBlock {
+                        language: language.and_then(SyntaxHighlightLang::from_str),
+                        content,
+                    },
+                    rest,
+                ))
             }
         } else {
             None
@@ -3718,7 +3748,7 @@ impl MarkdownParser {
             let Some(line) = MarkdownListLine::parse_line(line, input) else {
                 break;
             };
-            
+
             if marker.is_none() {
                 marker = Some(line.list_marker);
             }
@@ -3778,7 +3808,7 @@ impl MarkdownParser {
         include_split: bool,
     ) -> (&[MarkdownToken], &[MarkdownToken]) {
         let Some(split) = tokens.iter().position(|token| token.typ() == until) else {
-          return (tokens, &tokens[0..0]);
+            return (tokens, &tokens[0..0]);
         };
 
         let (content, rest) = tokens.split_at(split);
@@ -4193,7 +4223,9 @@ impl MarkdownParser {
                 builder.push_str(url);
                 builder.push_str("\">");
 
-                for n in text.iter() { Self::html_helper(n, builder); }
+                for n in text.iter() {
+                    Self::html_helper(n, builder);
+                }
                 builder.push_str("</a>");
             }
             MarkdownNode::Image { alt, path } => {
@@ -4667,9 +4699,9 @@ impl Connection {
         let mut statement = self.prepare(sql)?;
 
         if statement.step()? {
-          Err("execute unexpectedly returned a row".into())
-        }else {
-          Ok(())
+            Err("execute unexpectedly returned a row".into())
+        } else {
+            Ok(())
         }
     }
 
@@ -4678,9 +4710,9 @@ impl Connection {
         statement.bind_all(binds)?;
 
         if statement.step()? {
-          Err("insertion unexpectedly returned a row".into())
-        }else {
-          Ok(())
+            Err(format!("insertion unexpectedly returned a row {sql}").into())
+        } else {
+            Ok(())
         }
     }
 
@@ -4698,8 +4730,8 @@ impl Connection {
         for binds in multi_binds {
             statement.bind_all(&binds)?;
 
-            if !statement.step()? {
-              return Err("insertion unexpectedly returned a row".into())
+            if statement.step()? {
+                return Err(format!("insertion unexpectedly returned a row {sql}").into());
             }
 
             statement.reset_binds()?;
@@ -5099,8 +5131,9 @@ impl Db {
     fn save_page_hit(&mut self, page: &str, loadtime: Duration) -> Result<(), Box<dyn Error>> {
         let timestamp = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs().cast_signed();
-          
+            .as_secs()
+            .cast_signed();
+
         let loadtime_nanos = i64::from(loadtime.subsec_nanos());
 
         self.metric_cache.push(CachedPageHit {
@@ -5110,7 +5143,7 @@ impl Db {
         });
         self.unsynced = true;
 
-        if self.metric_cache.len() >= 1000 {
+        if self.metric_cache.len() >= 500 {
             self.sync_metric_cache()?;
         }
 
@@ -5183,10 +5216,7 @@ impl Db {
         self.metric_cache = vec![];
         self.unsynced = true;
         let duration = start.elapsed();
-        println!(
-            "Synced {metric_entries} entries in metric cache in {duration:?}",
-
-        );
+        println!("Synced {metric_entries} entries in metric cache in {duration:?}",);
 
         Ok(())
     }
@@ -5216,10 +5246,10 @@ impl Db {
         let total_loadtimes = res.get_int_column(1)?;
         let counts = res.get_int_column(2)?;
 
-        let mut metrics_by_page = HashMap::new();
+        let mut metrics_by_page: HashMap<&str, (i64, i64)> = HashMap::new();
 
         for (page, (total_loadtime, count)) in zip(pages, zip(total_loadtimes, counts)) {
-            metrics_by_page.insert(page.to_owned(), (total_loadtime, count));
+            metrics_by_page.insert(page, (total_loadtime, count));
         }
 
         for hit in &self.metric_cache {
@@ -5227,7 +5257,7 @@ impl Db {
                 entry.0 += hit.loadtime;
                 entry.1 += 1;
             } else {
-                metrics_by_page.insert(hit.page.clone(), (hit.loadtime, 1));
+                metrics_by_page.insert(&hit.page, (hit.loadtime, 1));
             }
         }
 
@@ -5237,7 +5267,7 @@ impl Db {
                 let average_nanos = total_loadtime / count;
 
                 PageMetric {
-                    page,
+                    page: page.to_owned(),
                     avg_loadtime: Duration::from_nanos(average_nanos as u64),
                     count: count as u64,
                 }
@@ -5367,7 +5397,8 @@ fn base64(bytes: &[u8]) -> String {
 
     let mut i = 0;
     while i + 3 < bytes.len() {
-        let merged = u32::from(bytes[i]) << 16 | u32::from(bytes[i + 1]) << 8 | u32::from(bytes[i + 2]);
+        let merged =
+            u32::from(bytes[i]) << 16 | u32::from(bytes[i + 1]) << 8 | u32::from(bytes[i + 2]);
 
         encoded.push(BASE64_CONVERSION[((merged >> 18) & 0b111111) as usize]);
         encoded.push(BASE64_CONVERSION[((merged >> 12) & 0b111111) as usize]);
