@@ -872,16 +872,17 @@ impl Router {
                     .db
                     .load_stats()
                     .expect("TOPO improve error handeling to make this work");
-                let page = self.context.within_context_content(&self.content, |ctx, content| {
-                    ctx.insert_local("stats", stats.to_template_value());
-                    Self::render_template(&content.templates, ctx, &route.path)
-                })?;
+                let stats = stats.to_template_value();
+                let local_context = LocalContext::new(&self.context, "stats", &stats);
+
+                let page =
+                    Self::render_template(&self.content.templates, &local_context, &route.path)?;
 
                 Ok(AssetData::Html(page))
             }
             Some(route) => {
                 let page =
-                    Self::render_template(&self.content.templates, &mut self.context, &route.path)?;
+                    Self::render_template(&self.content.templates, &self.context, &route.path)?;
                 Ok(AssetData::Html(page))
             }
             _ => match self.dynamic_routes.get(&header.path) {
@@ -901,11 +902,17 @@ impl Router {
                     } else {
                         todo!("slug not found");
                     };
+                    let local_context = LocalContext::new(
+                        &self.context,
+                        &dyn_route.page_var_name,
+                        &page_context_var,
+                    );
 
-                    let page = self.context.within_context_content(&self.content, |ctx, content| {
-                        ctx.insert_local(&dyn_route.page_var_name, page_context_var);
-                        Self::render_template(&content.templates, ctx, &dyn_route.template_path)
-                    })?;
+                    let page = Self::render_template(
+                        &self.content.templates,
+                        &local_context,
+                        &dyn_route.template_path,
+                    )?;
 
                     Ok(AssetData::Html(page))
                 }
@@ -924,13 +931,15 @@ impl Router {
 
     fn render_template(
         templates: &HashMap<String, Result<Template, TemplateError>>,
-        context: &mut Context,
+        context: &dyn TemplateContext,
         path: &str,
     ) -> Result<String, TemplateError> {
         //TODO unfuck
         let mut slug = path.strip_suffix(".html").unwrap_or(path);
         slug = slug.strip_prefix("pages").unwrap_or(slug);
-        context.insert_local("current_page_url", slug.to_template_value());
+        let url = &slug.to_template_value();
+
+        let context = LocalContext::new(context, "current_page_url", url);
 
         match templates.get(path).expect("template not found") {
             Ok(template) => {
@@ -943,13 +952,13 @@ impl Router {
                             if parent_template.parent.is_some() {
                                 todo!("nested parents")
                             } else {
-                                template.render_with_parent(context, parent_template)
+                                template.render_with_parent(&context, parent_template)
                             }
                         }
                         Err(err) => Err(template.enhance_error(err.clone())),
                     }
                 } else {
-                    template.render(context)
+                    template.render(&context)
                 }
             }
             Err(template_error) => Err(template_error.clone()),
@@ -1003,7 +1012,7 @@ impl Template {
         };
     }
 
-    fn render(&self, context: &mut Context) -> Result<String, TemplateError> {
+    fn render(&self, context: &dyn TemplateContext) -> Result<String, TemplateError> {
         let mut out = String::new();
         Self::render_helper(&self.template, context, &HashMap::new(), &mut out)
             .map_err(|e| self.enhance_error(e));
@@ -1012,7 +1021,7 @@ impl Template {
 
     fn render_with_parent(
         &self,
-        context: &mut Context,
+        context: &dyn TemplateContext,
         parent: &Template,
     ) -> Result<String, TemplateError> {
         let mut out = String::new();
@@ -1035,7 +1044,7 @@ impl Template {
 
     fn render_helper(
         template: &[TemplateNode],
-        context: &mut Context,
+        context: &dyn TemplateContext,
         blocks: &HashMap<String, Vec<TemplateNode>>,
         out: &mut String,
     ) -> Result<(), TemplateError> {
@@ -1103,17 +1112,15 @@ impl Template {
                     iter_src,
                     body,
                 } => {
-                  // Todo remove clone
+                    // Todo remove clone
                     if let TemplateValue::List(iter) =
-                        Self::resolve_var(iter_src, context, &node.pos)?.clone()
+                        Self::resolve_var(iter_src, context, &node.pos)?
                     {
                         let mut for_res = String::new();
                         for it in iter {
+                            let child_context = LocalContext::new(context, iter_bind, it);
 
-                            let page = context.within_context( |ctx| {
-                                ctx.insert_local(iter_bind, it.clone());
-                                Self::render_helper(body, ctx, blocks, &mut for_res)
-                            })?;
+                            Self::render_helper(body, &child_context, blocks, &mut for_res)?;
                         }
                         out.push_str(&for_res);
                     } else {
@@ -1140,7 +1147,7 @@ impl Template {
 
     fn resolve_var<'a>(
         ident_fields: &[String],
-        context: &'a Context,
+        context: &'a dyn TemplateContext,
         pos: &TemplatePositionData,
     ) -> Result<&'a TemplateValue, TemplateError> {
         let Some(mut current) = context.lookup(&ident_fields[0]) else {
@@ -1205,7 +1212,7 @@ impl Template {
 
     fn resolve_bool(
         condition: &[String],
-        context: &Context,
+        context: &dyn TemplateContext,
         node: &TemplateNode,
     ) -> Result<bool, TemplateError> {
         match Self::resolve_var(condition, context, &node.pos)? {
@@ -1691,7 +1698,7 @@ impl TemplateError {
             context.insert_global("code_snippet", code_snippet.to_template_value());
             context.insert_global("error_msg", self.typ.to_string().to_template_value());
 
-            error_template.render(&mut context).expect("needs to work")
+            error_template.render(&context).expect("needs to work")
         } else {
             format!("{file_info}\n{code_snippet}")
         }
@@ -1960,77 +1967,20 @@ impl From<std::fmt::Error> for TemplateError {
 #[derive(Debug)]
 struct Context {
     global_context: HashMap<String, TemplateValue>,
-    local_context: Vec<HashMap<String, TemplateValue>>,
 }
 
 impl Context {
     fn new() -> Self {
         Context {
             global_context: HashMap::new(),
-            local_context: vec![HashMap::new()],
         }
     }
 
-    fn push(&mut self) {
-        self.local_context.push(HashMap::new());
-    }
-    fn pop(&mut self) {
-        if self.local_context.len() > 1 {
-            self.local_context.pop();
-        } else {
-            self.local_context = vec![HashMap::new()];
-        }
-    }
-
-    fn within_context<T, E>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, E>) -> Result<T, E> {
-        self.push();
-
-        let result = f(self);
-        self.pop();
-
-        result
-    }
-
-    fn within_context_content<T, E>(
-        &mut self,
-        content: &Content,
-        f: impl FnOnce(&mut Self, &Content) -> Result<T, E>,
-    ) -> Result<T, E> {
-        self.push();
-
-        let result = f(self, content);
-        self.pop();
-
-        result
-    }
-
-    fn insert_local(&mut self, key: &str, value: TemplateValue) {
-        self.local_context
-            .last_mut()
-            .expect("invariant")
-            .insert(key.to_owned(), value);
-    }
     fn insert_global(&mut self, key: &str, value: TemplateValue) {
         self.global_context.insert(key.to_owned(), value);
     }
 
-    fn lookup(&self, key: &str) -> Option<&TemplateValue> {
-        for scope in self.local_context.iter().rev() {
-            if let Some(value) = scope.get(key) {
-                return Some(value);
-            }
-        }
-
-        self.global_context.get(key)
-    }
-
     fn lookup_mut(&mut self, key: &str) -> Option<&mut TemplateValue> {
-        for scope in self.local_context.iter_mut().rev() {
-            if let Some(value) = scope.get_mut(key) {
-                return Some(value);
-            }
-        }
-
         self.global_context.get_mut(key)
     }
 
@@ -2063,6 +2013,38 @@ impl Context {
             "posts_by_slug".to_string(),
             TemplateValue::Object(posts_by_slug),
         );
+    }
+}
+
+trait TemplateContext {
+    fn lookup(&self, key: &str) -> Option<&TemplateValue>;
+}
+
+impl TemplateContext for Context {
+    fn lookup(&self, key: &str) -> Option<&TemplateValue> {
+        self.global_context.get(key)
+    }
+}
+
+struct LocalContext<'a> {
+    parent: &'a dyn TemplateContext,
+    key: &'a str,
+    value: &'a TemplateValue,
+}
+
+impl<'a> LocalContext<'a> {
+    fn new(parent: &'a dyn TemplateContext, key: &'a str, value: &'a TemplateValue) -> Self {
+        Self { parent, key, value }
+    }
+}
+
+impl TemplateContext for LocalContext<'_> {
+    fn lookup(&self, key: &str) -> Option<&TemplateValue> {
+        if self.key == key {
+            Some(self.value)
+        } else {
+            self.parent.lookup(key)
+        }
     }
 }
 
@@ -4231,9 +4213,10 @@ impl MarkdownParser {
             MarkdownNode::Image { alt, path } => {
                 builder.push_str("<img class=\"image\" src=\"");
                 builder.push_str(path);
-                builder.push_str(" alt=\"");
-                builder.push_str(alt);
-                builder.push_str("\">");
+                // builder.push_str(" alt=\"");
+                // builder.push_str(alt);
+                // builder.push_str("\"");
+                builder.push('>');
             }
             MarkdownNode::_Table => todo!("tabble"),
         }
@@ -5143,7 +5126,7 @@ impl Db {
         });
         self.unsynced = true;
 
-        if self.metric_cache.len() >= 500 {
+        if self.metric_cache.len() >= 1000 {
             self.sync_metric_cache()?;
         }
 
@@ -5216,7 +5199,7 @@ impl Db {
         self.metric_cache = vec![];
         self.unsynced = true;
         let duration = start.elapsed();
-        println!("Synced {metric_entries} entries in metric cache in {duration:?}",);
+        // println!("Synced {metric_entries} entries in metric cache in {duration:?}",);
 
         Ok(())
     }
