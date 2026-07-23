@@ -1,5 +1,14 @@
 {{extends "layout.html"}}
 
+{{block meta}}
+  <title>{{ post.title }}</title>
+  <meta name="description" content="{{ post.summary }}">
+  <meta property="og:title" content="{{ post.title }}">
+  <meta property="og:description" content="{{ post.summary }}">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://{{ domain }}/posts/{{ post.slug }}">
+  <meta property="og:image" content="https://{{ domain }}/images/image.png">
+{{endBlock}}
 
 {{block js}}
 {{if post.highlighted_langs}}
@@ -29,7 +38,6 @@
 {{block body}}
 <div class="post">
   {{post.content}}
-
 </div>
 
 {{endBlock}}

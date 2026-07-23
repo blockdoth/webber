@@ -30,6 +30,7 @@ use std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{char, fmt, fs, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
+const DOMAIN: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
 const TEMPLATES_PATH: &str = "./templates/";
 
@@ -296,13 +297,14 @@ impl Context {
     fn load_intial(content: &Content) -> Context {
         let mut context = Context::new();
 
-        let (day, hour, minute, second) = system_time_to_date_quartet(SystemTime::now()).unwrap();
-        let last_build_date = date_quartet_to_rfc1123(day, hour, minute, second);
+        let last_build_date = system_time_to_date(SystemTime::now())
+            .expect("failed to parse date")
+            .to_rfc1123();
 
         context.update_posts(content);
         context.insert_global("copyright_start", TemplateValue::Text("2026".to_string()));
         context.insert_global("copyright_end", TemplateValue::Text("2026".to_string())); // TODO make dynamic
-        context.insert_global("host", TemplateValue::Text("127.0.0.1:4000".to_string())); // TODO make dynamic
+        context.insert_global("domain", TemplateValue::Text(DOMAIN.to_string())); // TODO make dynamic
         context.insert_global("last_build_date", TemplateValue::Text(last_build_date)); // TODO make dynamic
 
         #[cfg(generated)]
@@ -389,7 +391,7 @@ impl HttpServer {
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "could not find header/body separator",
+                "could not find header/body separator".to_string(),
             ))
         }
     }
@@ -543,8 +545,13 @@ impl HttpServer {
                     };
                 };
                 let start_timer = Instant::now();
-                let (header, body) =
-                    HttpServer::parse_request(&buffer[..n]).expect("Unable to parse request");
+                let (header, body) = match HttpServer::parse_request(&buffer[..n]) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        eprintln!("Failed to parse request: {err}");
+                        continue;
+                    }
+                };
 
                 let mut is_ws = false;
 
@@ -1054,7 +1061,7 @@ impl Template {
     fn render(&self, context: &dyn TemplateContext) -> Result<String, TemplateError> {
         let mut out = String::new();
         Self::render_helper(&self.template, context, &HashMap::new(), &mut out)
-            .map_err(|e| self.enhance_error(e));
+            .map_err(|e| self.enhance_error(e))?;
         Ok(out)
     }
 
@@ -1077,7 +1084,7 @@ impl Template {
                 }
                 None => self.enhance_error(e),
             },
-        );
+        )?;
         Ok(out)
     }
 
@@ -1407,27 +1414,27 @@ impl ToTemplateValue for AssetData {
 
 impl ToTemplateValue for ParsedMarkdown {
     fn to_template_value(&self) -> TemplateValue {
-        let published = match &self.metadata.published {
-            Ok(system_time) => TemplateValue::Text(
-                system_time
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_secs().to_string())
-                    .unwrap_or_else(|err| err.to_string()),
-            ),
+        let (published, published_rfc1123) = match &self.metadata.published {
+            Ok(system_time) => match system_time_to_date(*system_time) {
+                Ok(date) => {
+                    let published = TemplateValue::Text(date.to_rfc_idk());
 
-            Err(err) => TemplateValue::Text((*err).to_owned()),
-        };
+                    let published_rfc1123 = TemplateValue::Text(date.to_rfc1123());
 
-        let published_rfc1123 = match &self.metadata.published {
-            Ok(system_time) => system_time_to_date_quartet(*system_time)
-                .map(|(day, hour, minute, second)| {
-                    TemplateValue::Text(date_quartet_to_rfc1123(day, hour, minute, second))
-                })
-                .unwrap_or_else(|err| {
-                    TemplateValue::Text(format!("Failed to convert publish SystemTime: {err}"))
-                }),
+                    (published, published_rfc1123)
+                }
 
-            Err(err) => TemplateValue::Text((*err).to_owned()),
+                Err(err) => {
+                    let error =
+                        TemplateValue::Text(format!("Failed to convert publish SystemTime: {err}"));
+                    (error.clone(), error)
+                }
+            },
+
+            Err(err) => {
+                let error = TemplateValue::Text((*err).to_owned());
+                (error.clone(), error)
+            }
         };
 
         let summary = self
@@ -1436,6 +1443,8 @@ impl ToTemplateValue for ParsedMarkdown {
             .clone()
             .unwrap_or("No summary provided".to_owned())
             .to_template_value();
+
+        let highlighted_langs = SyntaxHighlightLang::include_dependencies(&self.highlighted_langs);
 
         TemplateValue::Object(
             [
@@ -1446,7 +1455,8 @@ impl ToTemplateValue for ParsedMarkdown {
                 ("tags", self.metadata.tags.to_template_value()),
                 ("summary", summary),
                 ("draft", self.metadata.draft.to_template_value()),
-                ("html", self.html.to_template_value()),
+                ("content", self.html.to_template_value()),
+                ("highlighted_langs", highlighted_langs.to_template_value()),
             ]
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
@@ -2708,16 +2718,11 @@ impl<'a> TemplateLexer<'a> {
                     let keyword_end = cursor + keyword.len();
 
                     // Do not tokenize the "if" in identifiers such as "iffy"
-                    if let Some(c) = input[keyword_end..].chars().next()
-                        && c != ' '
-                        && c != '\n'
-                        && c != '{'
-                        && c != '}'
-                    {
-                        return None;
+                    if Self::valid_keyword(input, cursor, keyword_end) {
+                        Some((make_token, keyword_end))
+                    } else {
+                        None
                     }
-
-                    Some((make_token, keyword_end))
                 })
             {
                 Self::flush_ident(&mut tokens, start_ident, cursor);
@@ -2732,6 +2737,20 @@ impl<'a> TemplateLexer<'a> {
         Self::flush_ident(&mut tokens, start_ident, end);
 
         tokens
+    }
+
+    fn valid_keyword(input: &str, start: usize, end: usize) -> bool {
+        let valid_before = input[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}'));
+
+        let valid_after = input[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}'));
+
+        valid_before && valid_after
     }
 
     fn flush_ident(tokens: &mut Vec<TemplateToken>, start: usize, end: usize) {
@@ -3247,6 +3266,7 @@ impl MarkdownMetadata {
         let mut published: Option<Result<SystemTime, &'static str>> = None;
         let mut tags: Vec<String> = Vec::new();
         let mut draft: bool = true;
+        let mut summary: Option<String> = None;
 
         for line in lines {
             let line = line.trim();
@@ -3263,6 +3283,7 @@ impl MarkdownMetadata {
             match key {
                 "title" => title = Self::parse_string(value),
                 "slug" => slug = Self::parse_string(value),
+                "summary" => summary = Self::parse_string(value),
                 "published" => published = Some(Self::parse_date(value)),
                 "tags" => tags = Self::parse_tags(value),
                 "draft" => match value {
@@ -3281,7 +3302,7 @@ impl MarkdownMetadata {
             published: published.unwrap_or(Err("no publish date specified")),
             tags,
             draft,
-            summary: None,
+            summary,
         }
     }
 
@@ -4289,6 +4310,7 @@ impl MarkdownParser {
             MarkdownNode::Image { alt, path } => {
                 builder.push_str("<img class=\"image\" src=\"");
                 builder.push_str(path);
+                builder.push('"');
                 // builder.push_str(" alt=\"");
                 // builder.push_str(alt);
                 // builder.push_str("\"");
@@ -5572,29 +5594,54 @@ fn sha1(input: &str) -> [u8; 20] {
     digest
 }
 
-fn system_time_to_date_quartet(time: SystemTime) -> Result<(i64, i64, i64, i64), SystemTimeError> {
+struct Date {
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+}
+
+impl Date {
+    fn to_rfc_idk(&self) -> String {
+        let (year, month, day) = civil_from_days(self.day);
+
+        format!("{year}/{month:02}/{day:02}")
+    }
+
+    fn to_rfc1123(&self) -> String {
+        let weekday =
+            ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][self.day.rem_euclid(7) as usize];
+
+        let (year, month, day) = civil_from_days(self.day);
+
+        let month = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ][month as usize - 1];
+
+        let hour = self.hour;
+        let minute = self.minute;
+        let second = self.second;
+
+        format!("{weekday}, {day:02} {month} {year:04} {hour:02}:{minute:02}:{second:02} GMT")
+    }
+}
+
+fn system_time_to_date(time: SystemTime) -> Result<Date, SystemTimeError> {
     let unix_seconds = time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
-    let days = unix_seconds.div_euclid(86_400);
+    let day = unix_seconds.div_euclid(86_400);
     let seconds_today = unix_seconds.rem_euclid(86_400);
 
     let hour = seconds_today / 3_600;
     let minute = (seconds_today % 3_600) / 60;
     let second = seconds_today % 60;
 
-    Ok((days, hour, minute, second))
-}
-
-fn date_quartet_to_rfc1123(day: i64, hour: i64, minute: i64, second: i64) -> String {
-    let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][day.rem_euclid(7) as usize];
-
-    let (year, month, day) = civil_from_days(day);
-
-    let month = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ][month as usize - 1];
-
-    format!("{weekday}, {day:02} {month} {year:04} {hour:02}:{minute:02}:{second:02} GMT")
+    Ok(Date {
+        day,
+        hour,
+        minute,
+        second,
+    })
 }
 
 // Inspired by this posts and rewriten in rust by clanker
