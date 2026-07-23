@@ -1,16 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
   <channel>
-      <title>blockdoth's blog</title> 
-      <link>https://todo.com</link>
-      <description>blockdoth's blog</description>
-      <language>en-us</language>
-      
-      {{ for post in posts }}
-          <item>
-              <title>{{ post.title }}</title>
-              <link>{{ post.slug }}</link>
-
-            </item>
-      {{ endFor }}
+    <title>blockdoth's blog</title> 
+    <link>https://{{ host }}</link>
+    <description>blockdoth's blog</description>
+    <language>en-us</language>
+    <lastBuildDate>{{ last_build_date }}</lastBuildDate>
+    {{ for post in posts }}
+    <item>
+      <title>{{ post.title }}</title>
+      <link>https://{{ host }}/posts/{{ post.slug }}</link>
+      <guid isPermaLink="true">https://{{ host }}/posts/{{ post.slug }}</guid>
+      <description>{{ post.summary }}</description>
+      <pubDate>{{ post.published_rfc1123 }}</pubDate>
+    </item>
+    {{ endFor }}
   </channel>
 </rss>

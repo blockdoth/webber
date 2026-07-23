@@ -26,7 +26,7 @@ use std::ptr::{null, null_mut};
 use std::slice;
 use std::str::{CharIndices, FromStr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{char, fmt, fs, vec};
 
 const SOCKET_ADDR: &str = "127.0.0.1:4000";
@@ -277,14 +277,14 @@ fn run_server() -> Result<(), Box<dyn Error>> {
     let router = Router::new(content, context, db)
         .route_static_hidden("/layout", "layout.html")
         .route_static_hidden("/home", "pages/home.html")
-        .route_static_hidden("/rss", "rss.html")
         .route_static_page("/posts", "pages/posts.html")
         .route_static_page("/quotes", "pages/quotes.html")
         .route_static_page("/stats", "pages/stats.html")
         .route_static_page("/about", "pages/about.html")
         .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")
         .fallback("/home")
-        .error_page("error.html");
+        .error_page("error.html")
+        .rss("rss.html");
 
     let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
     println!("Started listening on socket http://{SOCKET_ADDR}");
@@ -296,9 +296,14 @@ impl Context {
     fn load_intial(content: &Content) -> Context {
         let mut context = Context::new();
 
+        let (day, hour, minute, second) = system_time_to_date_quartet(SystemTime::now()).unwrap();
+        let last_build_date = date_quartet_to_rfc1123(day, hour, minute, second);
+
         context.update_posts(content);
         context.insert_global("copyright_start", TemplateValue::Text("2026".to_string()));
         context.insert_global("copyright_end", TemplateValue::Text("2026".to_string())); // TODO make dynamic
+        context.insert_global("host", TemplateValue::Text("127.0.0.1:4000".to_string())); // TODO make dynamic
+        context.insert_global("last_build_date", TemplateValue::Text(last_build_date)); // TODO make dynamic
 
         #[cfg(generated)]
         {
@@ -752,6 +757,7 @@ struct Router {
 
     fallback: Option<String>,
     error_page: Option<String>,
+    rss_template: Option<String>,
 }
 
 impl Router {
@@ -764,6 +770,21 @@ impl Router {
             dynamic_routes: HashMap::new(),
             fallback: None,
             error_page: None,
+            rss_template: None,
+        }
+    }
+
+    fn add_to_static_pages(context: &mut Context, obj: TemplateValue) {
+        if let Some(pages) = context.lookup_mut("pages-static") {
+            if let TemplateValue::List(list) = pages {
+                list.push(obj);
+            } else {
+                panic!("overwrote \"pages-static\" with something")
+            }
+        } else {
+            let page_list = TemplateValue::List(vec![obj]);
+
+            context.insert_global("pages-static", page_list);
         }
     }
 
@@ -777,18 +798,7 @@ impl Router {
           "hidden".to_string() => TemplateValue::Bool(route.hidden),
           "name".to_string() => TemplateValue::Text(name.to_string()),
         });
-
-        if let Some(pages) = self.context.lookup_mut("pages-static") {
-            if let TemplateValue::List(list) = pages {
-                list.push(obj);
-            } else {
-                panic!("overwrote \"pages-static\" with something")
-            }
-        } else {
-            let page_list = TemplateValue::List(vec![obj]);
-
-            self.context.insert_global("pages-static", page_list);
-        }
+        Self::add_to_static_pages(&mut self.context, obj);
 
         self
     }
@@ -846,12 +856,35 @@ impl Router {
 
     fn error_page(mut self, template: &str) -> Self {
         match self.content.templates.get(template) {
-            None => panic!("Error page: \"{template}\" must be in the templates"),
+            None => panic!("Error template page: \"{template}\" must be in the templates"),
             Some(Err(err)) => {
-                panic!("Error page: \"{template}\" has a render or parsing error: {err:?}")
+                panic!(
+                    "Error template page: \"{template}\" has a render or parsing error: {err:#?}"
+                )
             }
             Some(Ok(_)) => self.error_page = Some(template.to_owned()),
         }
+        self
+    }
+
+    fn rss(mut self, template: &str) -> Self {
+        match self.content.templates.get(template) {
+            None => panic!("RSS template page: \"{template}\" must be in the templates"),
+            Some(Err(err)) => {
+                panic!("RSS template page: \"{template}\" has a render or parsing error: {err:#?}")
+            }
+            Some(Ok(_)) => self.rss_template = Some(template.to_owned()),
+        }
+        self.static_routes
+            .insert("/rss".into(), StaticRoute::new(template, false));
+
+        let obj = TemplateValue::Object(hash_map! {
+          "url".to_string() => TemplateValue::Text("/rss".to_string()),
+          "name".to_string() => TemplateValue::Text("rss".to_string()),
+        });
+
+        Self::add_to_static_pages(&mut self.context, obj);
+
         self
     }
 
@@ -879,6 +912,12 @@ impl Router {
                     Self::render_template(&self.content.templates, &local_context, &route.path)?;
 
                 Ok(AssetData::Html(page))
+            }
+            Some(route) if header.path == "/rss" => {
+                let page =
+                    Self::render_template(&self.content.templates, &self.context, &route.path)?;
+
+                Ok(AssetData::Text(page))
             }
             Some(route) => {
                 let page =
@@ -1361,41 +1400,58 @@ impl ToTemplateValue for AssetData {
             AssetData::Text(s) | Html(s) | Css(s) | Js(s) | MdRaw(s) | Unknown(s) => {
                 TemplateValue::Text(s.to_string())
             }
-            MdParsed(ParsedMarkdown {
-                html,
-                metadata,
-                highlighted_langs,
-            }) => {
-                let mut obj = HashMap::new();
-
-                obj.insert("content".to_string(), TemplateValue::Text(html.to_string()));
-
-                obj.insert(
-                    "title".to_string(),
-                    TemplateValue::Text(metadata.title.to_string()),
-                );
-                obj.insert(
-                    "slug".to_string(),
-                    TemplateValue::Text(metadata.slug.to_string()),
-                );
-                obj.insert(
-                    "published".to_string(),
-                    TemplateValue::Text(metadata.published.to_string()),
-                );
-                obj.insert("draft".to_string(), Bool(metadata.draft));
-                obj.insert("tags".to_string(), metadata.tags.to_template_value());
-
-                let highlighted_langs =
-                    SyntaxHighlightLang::include_dependencies(highlighted_langs);
-
-                obj.insert(
-                    "highlighted_langs".to_string(),
-                    highlighted_langs.to_template_value(),
-                );
-
-                Object(obj)
-            }
+            MdParsed(parsed) => parsed.to_template_value(),
         }
+    }
+}
+
+impl ToTemplateValue for ParsedMarkdown {
+    fn to_template_value(&self) -> TemplateValue {
+        let published = match &self.metadata.published {
+            Ok(system_time) => TemplateValue::Text(
+                system_time
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs().to_string())
+                    .unwrap_or_else(|err| err.to_string()),
+            ),
+
+            Err(err) => TemplateValue::Text((*err).to_owned()),
+        };
+
+        let published_rfc1123 = match &self.metadata.published {
+            Ok(system_time) => system_time_to_date_quartet(*system_time)
+                .map(|(day, hour, minute, second)| {
+                    TemplateValue::Text(date_quartet_to_rfc1123(day, hour, minute, second))
+                })
+                .unwrap_or_else(|err| {
+                    TemplateValue::Text(format!("Failed to convert publish SystemTime: {err}"))
+                }),
+
+            Err(err) => TemplateValue::Text((*err).to_owned()),
+        };
+
+        let summary = self
+            .metadata
+            .summary
+            .clone()
+            .unwrap_or("No summary provided".to_owned())
+            .to_template_value();
+
+        TemplateValue::Object(
+            [
+                ("title", self.metadata.title.to_template_value()),
+                ("slug", self.metadata.slug.to_template_value()),
+                ("published", published),
+                ("published_rfc1123", published_rfc1123),
+                ("tags", self.metadata.tags.to_template_value()),
+                ("summary", summary),
+                ("draft", self.metadata.draft.to_template_value()),
+                ("html", self.html.to_template_value()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+        )
     }
 }
 
@@ -3124,8 +3180,9 @@ struct ParsedMarkdown {
 struct MarkdownMetadata {
     title: String,
     slug: String,
-    published: String,
+    published: Result<SystemTime, &'static str>,
     tags: Vec<String>,
+    summary: Option<String>,
     draft: bool,
 }
 
@@ -3187,9 +3244,9 @@ impl MarkdownMetadata {
     fn parse_metadata_content(lines: Vec<&str>) -> MarkdownMetadata {
         let mut title: Option<String> = None;
         let mut slug: Option<String> = None;
-        let mut published: Option<String> = None;
+        let mut published: Option<Result<SystemTime, &'static str>> = None;
         let mut tags: Vec<String> = Vec::new();
-        let mut draft: bool = false;
+        let mut draft: bool = true;
 
         for line in lines {
             let line = line.trim();
@@ -3206,7 +3263,7 @@ impl MarkdownMetadata {
             match key {
                 "title" => title = Self::parse_string(value),
                 "slug" => slug = Self::parse_string(value),
-                "published" => published = Self::parse_date(value),
+                "published" => published = Some(Self::parse_date(value)),
                 "tags" => tags = Self::parse_tags(value),
                 "draft" => match value {
                     "true" => draft = true,
@@ -3221,9 +3278,10 @@ impl MarkdownMetadata {
         MarkdownMetadata {
             slug: slug.unwrap_or(title_str.replace(' ', "-").to_lowercase()),
             title: title_str,
-            published: published.unwrap_or("data unknown".to_owned()),
+            published: published.unwrap_or(Err("no publish date specified")),
             tags,
             draft,
+            summary: None,
         }
     }
 
@@ -3236,15 +3294,33 @@ impl MarkdownMetadata {
         }
     }
 
-    fn parse_date(value: &str) -> Option<String> {
-        let value = value.trim();
+    fn parse_date(date: &str) -> Result<SystemTime, &'static str> {
+        let mut parts = date.split('-');
 
-        if value.is_empty() {
-            None
-        } else {
-            Some(value.to_string())
+        let year: i32 = parts
+            .next()
+            .ok_or("missing year")?
+            .parse()
+            .map_err(|_| "invalid year")?;
+        let month: u32 = parts
+            .next()
+            .ok_or("missing month")?
+            .parse()
+            .map_err(|_| "invalid month")?;
+        let day: u32 = parts
+            .next()
+            .ok_or("missing day")?
+            .parse()
+            .map_err(|_| "invalid day")?;
+
+        if parts.next().is_some() {
+            return Err("too many components");
         }
+
+        let days = days_from_civil(year, month, day);
+        Ok(UNIX_EPOCH + Duration::from_secs((days as u64) * 86_400))
     }
+
     fn parse_tags(value: &str) -> Vec<String> {
         if !value.starts_with('[') || !value.ends_with(']') {
             return vec![];
@@ -5494,4 +5570,67 @@ fn sha1(input: &str) -> [u8; 20] {
     digest[12..16].copy_from_slice(&h3.to_be_bytes());
     digest[16..20].copy_from_slice(&h4.to_be_bytes());
     digest
+}
+
+fn system_time_to_date_quartet(time: SystemTime) -> Result<(i64, i64, i64, i64), SystemTimeError> {
+    let unix_seconds = time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds_today = unix_seconds.rem_euclid(86_400);
+
+    let hour = seconds_today / 3_600;
+    let minute = (seconds_today % 3_600) / 60;
+    let second = seconds_today % 60;
+
+    Ok((days, hour, minute, second))
+}
+
+fn date_quartet_to_rfc1123(day: i64, hour: i64, minute: i64, second: i64) -> String {
+    let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][day.rem_euclid(7) as usize];
+
+    let (year, month, day) = civil_from_days(day);
+
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][month as usize - 1];
+
+    format!("{weekday}, {day:02} {month} {year:04} {hour:02}:{minute:02}:{second:02} GMT")
+}
+
+// Inspired by this posts and rewriten in rust by clanker
+// https://howardhinnant.github.io/date_algorithms.html
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+
+    let mut year = year_of_era + era * 400;
+
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+
+    year += i64::from(month <= 2);
+
+    (year, month as u32, day as u32)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut year = year as i64;
+    let month = month as i64;
+    let day = day as i64;
+
+    year -= if month <= 2 { 1 } else { 0 };
+
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+
+    era * 146_097 + doe - 719_468
 }
