@@ -21,7 +21,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt::Write as FmtWrite;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 use std::iter::{Peekable, zip};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
@@ -407,20 +407,17 @@ impl HttpServer {
         buffer: &'a [u8],
     ) -> Result<(HttpRequestHeader<'a>, AssetData), HttpServerError> {
         if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            let (header, alloc) = GLOBAL.measure(|| {
-                let header_str = str::from_utf8(&buffer[..pos])
-                    .map_err(|_| HttpServerError::MalformedRequest)
-                    .expect("fix after 0 alloc");
-                Self::parse_header(header_str).expect("Unable to parse header")
-            });
-            // println!("Allocs header parsing {alloc}\t{}", header.path);
+
+            let header_str = str::from_utf8(&buffer[..pos])
+                .map_err(|_| HttpServerError::MalformedRequest)
+                .expect("fix after 0 alloc");
+            
+            let header = Self::parse_header(header_str).expect("Unable to parse header");
 
             let content = AssetData::from_asset_type(&buffer[pos + 4..], &header.content_typ);
-            // println!("{content:?}");
 
             Ok((header, content))
         } else {
-            // Could not find header body seperator
             Err(HttpServerError::MalformedRequest)
         }
     }
@@ -452,9 +449,10 @@ impl HttpServer {
             body.len(),
         )
         .expect("writing to Vec<u8> cannot fail");
-
+      
+        response_buffer.extend_from_slice(body);
         stream.write_all(response_buffer)?;
-        stream.write_all(body)?;
+
         Ok(())
     }
 
@@ -602,10 +600,8 @@ impl HttpServer {
             .set_nonblocking(true)
             .expect("Unable to set socket to nonblocking mode");
 
-        let before = GLOBAL.snapshot();
 
         'main: while !SHUTDOWN.load(Ordering::Relaxed) {
-            let loop_usage = GLOBAL.usage_snapshot();
 
             if let Ok((mut stream, peer_addr)) = listener.accept() {
                 stream
@@ -623,12 +619,10 @@ impl HttpServer {
                     };
                 };
 
-                let mem_before = GLOBAL.usage_snapshot();
                 let start_timer = Instant::now();
 
-                let (res, alloc) = GLOBAL.measure(|| HttpServer::parse_request(&buffer[..n]));
 
-                let (header, body) = match res {
+                let (header, body) = match HttpServer::parse_request(&buffer[..n]) {
                     Ok(request) => request,
                     Err(err) => {
                         eprintln!("Failed to parse request: {err}");
@@ -658,30 +652,20 @@ impl HttpServer {
                                 ),
                                 Err(err) => self.build_error_response(&router, err, &mut stream),
                             }
-                        } else if let (Some(asset), alloc) =
-                            GLOBAL.measure(|| router.content.assets.get_ref(header.path))
+                        } else if let Some(asset) = router.content.assets.get_ref(header.path)
                             && !asset.internal
                         {
-                            // println!("Allocs searching asset {alloc}\t{path}");
-                            let (t, alloc) = GLOBAL.measure(|| {
-                                Self::build_response(
-                                    HttpResponseCode::Ok,
-                                    asset.data.as_ref(),
-                                    &mut self.response_buffer,
-                                    &mut stream,
-                                )
-                            });
-                            // println!("Allocs building response {alloc}\t{path}");
 
-                            t
+                            Self::build_response(
+                                HttpResponseCode::Ok,
+                                asset.data.as_ref(),
+                                &mut self.response_buffer,
+                                &mut stream,
+                            )
+
                         } else {
-                            let (res, alloc) = GLOBAL.measure(|| {
-                                router.serve_page(&header, body, &mut self.render_buffer)
-                            });
 
-                            // println!("Allocs serving page {alloc}\t{path}");
-
-                            match res {
+                            match router.serve_page(&header, body, &mut self.render_buffer) {
                                 Ok(content) => Self::build_response(
                                     HttpResponseCode::Ok,
                                     content,
@@ -694,19 +678,9 @@ impl HttpServer {
 
                         let end_timer = Instant::now();
                         let duration = end_timer - start_timer;
-                        let mem_after = GLOBAL.usage_snapshot();
 
-                        let (_, alloc) = GLOBAL.measure(|| {
-                            router.db.save_page_hit(path, duration).expect("in measure");
-                        });
-                        // println!("Allocs saving page hit {alloc}\t{path}");
+                        router.db.save_page_hit(path, duration).expect("in measure");
 
-                        let alloc_info = mem_after.diff(mem_before);
-                        // println!(
-                        //     "Total allocations: {} -> {}\t{path} ",
-                        //     alloc_info.count,
-                        //     Blob::pretty_bytes(alloc_info.bytes)
-                        // );
                     }
                 };
 
@@ -756,20 +730,10 @@ impl HttpServer {
                     });
                 }
             }
-            let allocs = GLOBAL.usage_snapshot().diff(loop_usage);
 
-            // if allocs.count != 0 && allocs.count != 259 {
-            //   println!("Loop it alloc: {allocs}");
-            // }
         }
 
         // Exit routine
-        let after = GLOBAL.snapshot();
-        let diff = after.diff(before);
-        println!("During serving");
-        println!("{diff}");
-        println!("Total");
-        println!("{after}");
 
         router.db.sync()?;
         Ok(())
@@ -5626,8 +5590,8 @@ struct PageMetric {
     count: i64,
 }
 
-#[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator::new();
+// #[global_allocator]
+// static GLOBAL: CountingAllocator = CountingAllocator::new();
 
 #[derive(Debug, Clone, Copy)]
 struct AllocationInfo {
