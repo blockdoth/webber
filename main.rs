@@ -1,6 +1,7 @@
 #![feature(tcp_linger)]
 #![feature(if_let_guard)]
 #![feature(hash_map_macro)]
+#![feature(allocator_api)]
 #![allow(unused)]
 
 // #![warn(clippy::pedantic)]
@@ -10,13 +11,16 @@
 // #![allow(clippy::cast_possible_wrap)]
 // #![allow(clippy::enum_glob_use)]
 
+use std::alloc::{Allocator, Global, GlobalAlloc, Layout, System};
 use std::borrow::Cow;
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt::Write as FmtWrite;
 use std::fmt::{Debug, Display};
+use std::hash::Hash;
 use std::io::{self, Read, Write};
 use std::iter::{Peekable, zip};
 use std::net::{TcpListener, TcpStream};
@@ -36,6 +40,7 @@ const TEMPLATES_PATH: &str = "./templates/";
 
 const DEBUG_BIN_PATH: &str = "./target/debug/webber";
 const RELEASE_BIN_PATH: &str = "./target/release/webber";
+const METRICS_CACHE_SIZE: usize = 1000;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -290,7 +295,7 @@ fn run_server() -> Result<(), Box<dyn Error>> {
     let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
     println!("Started listening on socket http://{SOCKET_ADDR}");
 
-    HttpServer::serve(listener, router)
+    HttpServer::new().serve(listener, router)
 }
 
 impl Context {
@@ -328,14 +333,14 @@ impl Context {
 // === Http Server ===
 
 #[derive(Debug)]
-struct HttpRequestHeader {
+struct HttpRequestHeader<'a> {
     _typ: HttpRequestType,
-    path: String,
-    _origin: Option<String>,
-    _user_agent: Option<String>,
-    sec_websocket_key: Option<String>,
-    sec_websocket_version: Option<String>,
-    upgrade: Option<String>,
+    path: &'a str,
+    _origin: Option<&'a str>,
+    _user_agent: Option<&'a str>,
+    sec_websocket_key: Option<&'a str>,
+    sec_websocket_version: Option<&'a str>,
+    upgrade: Option<&'a str>,
     content_typ: AssetTyp,
 }
 
@@ -345,10 +350,24 @@ enum HttpRequestType {
     GET,
 }
 
-struct HttpServer {}
+struct HttpServer {
+    response_buffer: Vec<u8>,
+    render_buffer: String,
+}
 
 impl HttpServer {
-    fn upgrade_websocket(header: HttpRequestHeader) -> Vec<u8> {
+    fn new() -> Self {
+        Self {
+            response_buffer: Vec::with_capacity(64 * 1024),
+            render_buffer: String::with_capacity(64 * 1024),
+        }
+    }
+
+    fn upgrade_websocket(
+        &mut self,
+        header: HttpRequestHeader,
+        stream: &mut TcpStream,
+    ) -> Result<(), HttpServerError> {
         if let Some(_) = header.upgrade
             && let Some(sec_websocket_key) = header.sec_websocket_key
             && let Some(_) = header.sec_websocket_version
@@ -358,69 +377,131 @@ impl HttpServer {
                 "{}{magic_string}",
                 sec_websocket_key.trim()
             )));
-            format!(
+
+            write!(self.response_buffer,
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
-            )
-            .as_bytes()
-            .to_vec()
+            ).expect("writing in a Vec<u8> can not fail");
         } else {
             println!("Failed");
             Self::build_response(
                 HttpResponseCode::BadRequest,
-                &AssetData::Text("Invalid websocket upgrade request".to_owned()),
-            )
+                AssetDataRef::Text("Invalid websocket upgrade request"),
+                &mut self.response_buffer,
+                stream,
+            );
         }
+        Ok(())
     }
 
-    fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), io::Error> {
+    fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), HttpServerError> {
         let mut frame = Vec::new();
         frame.push(0x81); // first bit for FIN frame and 8th bit for message type text 
         frame.push(msg.len() as u8); // should technically u7, but not needed for my use case
         frame.extend_from_slice(msg.as_bytes());
         stream.write_all(&frame)?;
-        stream.flush()
+        stream.flush()?;
+        Ok(())
     }
 
-    fn parse_request(buffer: &[u8]) -> Result<(HttpRequestHeader, AssetData), io::Error> {
+    fn parse_request<'a>(
+        buffer: &'a [u8],
+    ) -> Result<(HttpRequestHeader<'a>, AssetData), HttpServerError> {
         if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            let header = Self::parse_header(String::from_utf8_lossy(&buffer[..pos]).to_string())
-                .expect("Unable to parse header");
+            let (header, alloc) = GLOBAL.measure(|| {
+                let header_str = str::from_utf8(&buffer[..pos])
+                    .map_err(|_| HttpServerError::MalformedRequest)
+                    .expect("fix after 0 alloc");
+                Self::parse_header(header_str).expect("Unable to parse header")
+            });
+            // println!("Allocs header parsing {alloc}\t{}", header.path);
+
             let content = AssetData::from_asset_type(&buffer[pos + 4..], &header.content_typ);
+            // println!("{content:?}");
 
             Ok((header, content))
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "could not find header/body separator".to_string(),
-            ))
+            // Could not find header body seperator
+            Err(HttpServerError::MalformedRequest)
         }
     }
 
-    fn build_response(code: HttpResponseCode, content: &AssetData) -> Vec<u8> {
-        let status = code.to_string();
-
-        let body = content.as_bytes();
-
+    fn build_response<'a>(
+        code: HttpResponseCode,
+        content: AssetDataRef<'a>,
+        response_buffer: &'a mut Vec<u8>,
+        stream: &mut TcpStream,
+    ) -> Result<(), HttpServerError> {
         let cache_control = match content {
-            AssetData::Png(_) | AssetData::Ico(_) | AssetData::Css(_) | AssetData::Js(_) => {
-                "Cache-Control: public, max-age=3600\r\n"
-            }
+            AssetDataRef::Png(_)
+            | AssetDataRef::Ico(_)
+            | AssetDataRef::Css(_)
+            | AssetDataRef::Js(_) => "Cache-Control: public, max-age=3600\r\n",
             _ => "",
         };
 
-        let mut res = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{cache_control}Connection: close\r\n\r\n",
+        let body = content.as_bytes();
+        response_buffer.clear();
+        write!(
+            response_buffer,
+            "HTTP/1.1 {code}\r\n\
+            Content-Type: {}\r\n\
+            Content-Length: {}\r\n\
+            {cache_control}\
+            Connection: close\r\n\r\n",
             content.typ(),
-            body.len()
+            body.len(),
         )
-        .as_bytes()
-        .to_vec();
+        .expect("writing to Vec<u8> cannot fail");
 
-        res.extend_from_slice(body);
-        res
+        stream.write_all(response_buffer)?;
+        stream.write_all(body)?;
+        Ok(())
     }
 
-    fn parse_header(header_str: String) -> Result<HttpRequestHeader, io::Error> {
+    fn build_error_response(
+        &mut self,
+        router: &Router,
+        err: HttpServerError,
+        stream: &mut TcpStream,
+    ) -> Result<(), HttpServerError> {
+        match err {
+            HttpServerError::Redirect(redirect_path) => Self::build_response(
+                HttpResponseCode::Redirect(&redirect_path),
+                AssetDataRef::Empty,
+                &mut self.response_buffer,
+                stream,
+            ),
+
+            HttpServerError::TemplatingError(err) => {
+                let error_template = router
+                    .error_page
+                    .as_ref()
+                    .and_then(|path| router.content.templates.get(path))
+                    .and_then(|result| result.as_ref().ok());
+                let err_str = err.render_error(error_template, &mut self.render_buffer);
+
+                Self::build_response(
+                    HttpResponseCode::Ok,
+                    AssetDataRef::Html(&err_str),
+                    &mut self.response_buffer,
+                    stream,
+                )
+            }
+
+            err => {
+                println!("Server error {err:#?}");
+
+                Self::build_response(
+                    HttpResponseCode::InternalServer,
+                    AssetDataRef::Empty,
+                    &mut self.response_buffer,
+                    stream,
+                )
+            }
+        }
+    }
+
+    fn parse_header<'a>(header_str: &'a str) -> Result<HttpRequestHeader<'a>, HttpServerError> {
         let mut lines = header_str.lines();
 
         let first_line = lines.next().expect("Unable to get next line");
@@ -428,21 +509,14 @@ impl HttpServer {
 
         let request_type = match first_line_words.next() {
             Some("GET") => HttpRequestType::GET,
-            invalid => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid request type {invalid:?}"),
-                ));
-            }
+            Some(invalid) => return Err(HttpServerError::InvalidRequestType(invalid.to_string())),
+            None => return Err(HttpServerError::MalformedRequest),
         };
 
         let path = if let Some(path) = first_line_words.next() {
             Self::clean_path(path)
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid request path",
-            ));
+            return Err(HttpServerError::MalformedRequest);
         };
 
         let mut origin = None;
@@ -454,31 +528,32 @@ impl HttpServer {
 
         for line in lines {
             if let Some((key, value)) = line.split_once(':') {
-                let value = value.to_string();
-                match key.to_ascii_lowercase().as_str() {
-                    "origin" => origin = Some(value),
-                    "sec-websocket-key" => sec_websocket_key = Some(value),
-                    "sec-websocket-version" => sec_websocket_version = Some(value),
-                    "user-agent" => user_agent = Some(value),
-                    "upgrade" => upgrade = Some(value),
-                    "content-type" => {
-                        content_typ = match value.as_str() {
-                            "text/plain" => AssetTyp::Text,
-                            "text/html" => AssetTyp::Html,
-                            "text/css" => AssetTyp::Css,
-                            "text/javascript" => AssetTyp::Js,
-                            "image/png" => AssetTyp::Png,
-                            _ => AssetTyp::Unknown,
-                        }
-                    }
-                    _ => {}
+                if key.eq_ignore_ascii_case("origin") {
+                    origin = Some(value);
+                } else if key.eq_ignore_ascii_case("sec-websocket-key") {
+                    sec_websocket_key = Some(value);
+                } else if key.eq_ignore_ascii_case("sec-websocket-version") {
+                    sec_websocket_version = Some(value);
+                } else if key.eq_ignore_ascii_case("user-agent") {
+                    user_agent = Some(value);
+                } else if key.eq_ignore_ascii_case("upgrade") {
+                    upgrade = Some(value);
+                } else if key.eq_ignore_ascii_case("content-type") {
+                    content_typ = match value {
+                        "text/plain" => AssetTyp::Text,
+                        "text/html" => AssetTyp::Html,
+                        "text/css" => AssetTyp::Css,
+                        "text/javascript" => AssetTyp::Js,
+                        "image/png" => AssetTyp::Png,
+                        _ => AssetTyp::Unknown,
+                    };
                 }
             }
         }
 
         Ok(HttpRequestHeader {
             _typ: request_type,
-            path: path.to_owned(),
+            path,
             _origin: origin,
             _user_agent: user_agent,
             sec_websocket_key,
@@ -498,14 +573,15 @@ impl HttpServer {
         &path[..end]
     }
 
-    fn serve(listener: TcpListener, mut router: Router) -> Result<(), Box<dyn Error>> {
+    fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), Box<dyn Error>> {
         let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
+
+        #[cfg(debug_assertions)]
         let mut active_streams: Vec<TcpStream> = vec![];
+
         let mut check_alive_timer = Instant::now();
         let mut check_fs_timer = Instant::now();
         let mut check_db_sync_timer = Instant::now();
-
-        let mut it = 0;
 
         println!("Static Routes:");
         for (route, page) in &router.static_routes {
@@ -521,13 +597,15 @@ impl HttpServer {
         }
 
         println!(" Fallback\t->\t{:?}", router.fallback);
+
         listener
             .set_nonblocking(true)
             .expect("Unable to set socket to nonblocking mode");
 
+        let before = GLOBAL.snapshot();
+
         'main: while !SHUTDOWN.load(Ordering::Relaxed) {
-            // print!("Loop it {it}\r");
-            it += 1;
+            let loop_usage = GLOBAL.usage_snapshot();
 
             if let Ok((mut stream, peer_addr)) = listener.accept() {
                 stream
@@ -544,75 +622,91 @@ impl HttpServer {
                         _ => {}
                     };
                 };
+
+                let mem_before = GLOBAL.usage_snapshot();
                 let start_timer = Instant::now();
-                let (header, body) = match HttpServer::parse_request(&buffer[..n]) {
+
+                let (res, alloc) = GLOBAL.measure(|| HttpServer::parse_request(&buffer[..n]));
+
+                let (header, body) = match res {
                     Ok(request) => request,
                     Err(err) => {
                         eprintln!("Failed to parse request: {err}");
                         continue;
                     }
                 };
+                // println!("Allocs request parsing {alloc}\t{}", header.path);
 
                 let mut is_ws = false;
 
-                match header.path.as_str() {
+                match header.path {
                     #[cfg(debug_assertions)]
                     "/ws" => {
                         // print!("[{peer_addr:?}] Upgrading websocket ... ");
-                        let response = HttpServer::upgrade_websocket(header);
-                        stream
-                            .write_all(&response)
-                            .expect("Failed to write to stream");
-                        stream.flush().expect("Failed to flush stream");
+                        self.upgrade_websocket(header, &mut stream)?;
+
                         is_ws = true;
                     }
                     path => {
-                        let res: Result<Cow<'_, AssetData>, HttpServerError> = if path
-                            .starts_with("/api")
-                        {
-                            router.serve_api(&header, body).map(Cow::Owned)
-                        } else {
-                            match router.content.assets.get_ref(&header.path) {
-                                Some(asset) if !asset.internal => Ok(Cow::Borrowed(&asset.data)),
-                                _ => router.serve_page(&header, body).map(Cow::Owned),
+                        if path.starts_with("/api") {
+                            match router.serve_api(&header, body) {
+                                Ok(content) => Self::build_response(
+                                    HttpResponseCode::Ok,
+                                    content.as_ref(),
+                                    &mut self.response_buffer,
+                                    &mut stream,
+                                ),
+                                Err(err) => self.build_error_response(&router, err, &mut stream),
                             }
-                        };
-
-                        let bytes = match res {
-                            Ok(content) => Self::build_response(HttpResponseCode::Ok, &content),
-                            Err(HttpServerError::Redirect(redirect_path)) => Self::build_response(
-                                HttpResponseCode::RedirectOther(redirect_path),
-                                &AssetData::Empty,
-                            ),
-                            Err(HttpServerError::TemplatingError(err)) => {
-                                let error_template = if let Some(error_page_path) =
-                                    &router.error_page
-                                    && let Some(Ok(template)) =
-                                        router.content.templates.get(error_page_path)
-                                {
-                                    Some(template)
-                                } else {
-                                    None
-                                };
-
+                        } else if let (Some(asset), alloc) =
+                            GLOBAL.measure(|| router.content.assets.get_ref(header.path))
+                            && !asset.internal
+                        {
+                            // println!("Allocs searching asset {alloc}\t{path}");
+                            let (t, alloc) = GLOBAL.measure(|| {
                                 Self::build_response(
                                     HttpResponseCode::Ok,
-                                    &AssetData::Html(err.render_error(error_template)),
+                                    asset.data.as_ref(),
+                                    &mut self.response_buffer,
+                                    &mut stream,
                                 )
-                            }
-                            Err(err) => {
-                                println!("Server error {err:#?}");
-                                Self::build_response(
-                                    HttpResponseCode::InternalServer,
-                                    &AssetData::Empty,
-                                )
+                            });
+                            // println!("Allocs building response {alloc}\t{path}");
+
+                            t
+                        } else {
+                            let (res, alloc) = GLOBAL.measure(|| {
+                                router.serve_page(&header, body, &mut self.render_buffer)
+                            });
+
+                            // println!("Allocs serving page {alloc}\t{path}");
+
+                            match res {
+                                Ok(content) => Self::build_response(
+                                    HttpResponseCode::Ok,
+                                    content,
+                                    &mut self.response_buffer,
+                                    &mut stream,
+                                ),
+                                Err(err) => self.build_error_response(&router, err, &mut stream),
                             }
                         };
-                        stream.write_all(&bytes).expect("Failed to write to stream");
+
                         let end_timer = Instant::now();
                         let duration = end_timer - start_timer;
+                        let mem_after = GLOBAL.usage_snapshot();
 
-                        router.db.save_page_hit(path, duration)?;
+                        let (_, alloc) = GLOBAL.measure(|| {
+                            router.db.save_page_hit(path, duration).expect("in measure");
+                        });
+                        // println!("Allocs saving page hit {alloc}\t{path}");
+
+                        let alloc_info = mem_after.diff(mem_before);
+                        // println!(
+                        //     "Total allocations: {} -> {}\t{path} ",
+                        //     alloc_info.count,
+                        //     Blob::pretty_bytes(alloc_info.bytes)
+                        // );
                     }
                 };
 
@@ -662,10 +756,23 @@ impl HttpServer {
                     });
                 }
             }
+            let allocs = GLOBAL.usage_snapshot().diff(loop_usage);
+
+            // if allocs.count != 0 && allocs.count != 259 {
+            //   println!("Loop it alloc: {allocs}");
+            // }
         }
 
         // Exit routine
-        router.db.sync()
+        let after = GLOBAL.snapshot();
+        let diff = after.diff(before);
+        println!("During serving");
+        println!("{diff}");
+        println!("Total");
+        println!("{after}");
+
+        router.db.sync()?;
+        Ok(())
     }
 }
 
@@ -674,6 +781,8 @@ enum HttpServerError {
     Redirect(String),
     TemplatingError(TemplateError),
     StreamWriteFailed,
+    MalformedRequest,
+    InvalidRequestType(String),
     Todo,
 }
 
@@ -685,7 +794,9 @@ impl Display for HttpServerError {
             Self::Redirect(location) => write!(f, "redirect to {location}"),
             Self::StreamWriteFailed => write!(f, "failed to write to stream"),
             Self::TemplatingError(error) => write!(f, "templating error: {error}"),
+            Self::InvalidRequestType(request) => write!(f, "invalid request type {request}"),
             Self::Todo => write!(f, "operation not implemented"),
+            Self::MalformedRequest => write!(f, "Malformed request"),
         }
     }
 }
@@ -703,19 +814,31 @@ impl From<TemplateError> for HttpServerError {
 }
 
 #[derive(Debug)]
-enum HttpResponseCode {
+enum HttpResponseCode<'a> {
     Ok,
-    RedirectOther(String),
+    Redirect(&'a str),
     BadRequest,
     NotFound,
     InternalServer,
 }
 
-impl fmt::Display for HttpResponseCode {
+impl HttpResponseCode<'_> {
+    const fn status_line(&self) -> &'static str {
+        match self {
+            Self::Ok => "200 OK",
+            Self::Redirect(_) => "303 See Other",
+            Self::BadRequest => "400 Bad Request",
+            Self::NotFound => "404 Not Found",
+            Self::InternalServer => "500 Internal Server Error",
+        }
+    }
+}
+
+impl fmt::Display for HttpResponseCode<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HttpResponseCode::Ok => write!(f, "200 OK"),
-            HttpResponseCode::RedirectOther(redirect) => {
+            HttpResponseCode::Redirect(redirect) => {
                 write!(f, "303 See Other\r\nLocation: {redirect}")
             }
             HttpResponseCode::NotFound => write!(f, "404 Not Found"),
@@ -733,14 +856,12 @@ struct DynamicRoute {
     _page_list_name: String,
     page_var_name: String,
     template_path: String,
-    cached_page: Option<String>,
     slug: String,
 }
 
 #[derive(Debug, Clone)]
 struct StaticRoute {
     path: String,
-    cached_page: Option<String>,
     hidden: bool,
 }
 
@@ -748,7 +869,6 @@ impl StaticRoute {
     fn new(path: &str, hidden: bool) -> Self {
         Self {
             path: path.to_owned(),
-            cached_page: None,
             hidden,
         }
     }
@@ -846,7 +966,6 @@ impl Router {
                     page_var_name: key.to_owned(),
                     template_path: base_template_path.to_owned(),
                     slug: slug.to_string(),
-                    cached_page: None,
                 };
 
                 self.dynamic_routes.insert(url, dyn_route);
@@ -895,54 +1014,56 @@ impl Router {
         self
     }
 
-    fn serve_page(
-        &mut self,
+    fn serve_page<'a>(
+        &self,
         header: &HttpRequestHeader,
         _body: AssetData,
-    ) -> Result<AssetData, HttpServerError> {
-        match self.static_routes.get(&header.path) {
-            Some(route) if let Some(cached) = &route.cached_page => {
-                println!("Serving cached page {}", header.path);
-
-                Ok(AssetData::Html(cached.to_string()))
-            }
-
+        render_buffer: &'a mut String,
+    ) -> Result<AssetDataRef<'a>, HttpServerError> {
+        match self.static_routes.get(header.path) {
             Some(route) if header.path == "/stats" => {
                 let stats = self
                     .db
                     .load_stats()
-                    .expect("TOPO improve error handeling to make this work");
-                let stats = stats.to_template_value();
+                    .expect("TOPO improve error handeling to make this work")
+                    .to_template_value();
                 let local_context = LocalContext::new(&self.context, "stats", &stats);
 
-                let page =
-                    Self::render_template(&self.content.templates, &local_context, &route.path)?;
+                let page = Self::render_template(
+                    &self.content.templates,
+                    &local_context,
+                    &route.path,
+                    render_buffer,
+                )?;
 
-                Ok(AssetData::Html(page))
+                Ok(AssetDataRef::Html(page))
             }
             Some(route) if header.path == "/rss" => {
-                let page =
-                    Self::render_template(&self.content.templates, &self.context, &route.path)?;
+                let page = Self::render_template(
+                    &self.content.templates,
+                    &self.context,
+                    &route.path,
+                    render_buffer,
+                )?;
 
-                Ok(AssetData::Text(page))
+                Ok(AssetDataRef::Text(page))
             }
             Some(route) => {
-                let page =
-                    Self::render_template(&self.content.templates, &self.context, &route.path)?;
-                Ok(AssetData::Html(page))
+                let page = Self::render_template(
+                    &self.content.templates,
+                    &self.context,
+                    &route.path,
+                    render_buffer,
+                )?;
+                Ok(AssetDataRef::Html(page))
             }
-            _ => match self.dynamic_routes.get(&header.path) {
-                Some(dyn_route) if let Some(cached) = &dyn_route.cached_page => {
-                    println!("Serving cached dynamic page {}", header.path);
-
-                    Ok(AssetData::Html(cached.to_string()))
-                }
+            _ => match self.dynamic_routes.get(header.path) {
                 Some(dyn_route) => {
                     // println!("Serving dynamic page {}", header.path);
 
                     let page_context_var = if let Some(TemplateValue::Object(posts_by_slug)) =
                         self.context.lookup("posts_by_slug")
-                        && let Some(template_value) = posts_by_slug.get(&dyn_route.slug).cloned()
+                        && let Some(template_value) = posts_by_slug.get(&dyn_route.slug)
                     {
                         template_value
                     } else {
@@ -951,16 +1072,17 @@ impl Router {
                     let local_context = LocalContext::new(
                         &self.context,
                         &dyn_route.page_var_name,
-                        &page_context_var,
+                        page_context_var,
                     );
 
                     let page = Self::render_template(
                         &self.content.templates,
                         &local_context,
                         &dyn_route.template_path,
+                        render_buffer,
                     )?;
 
-                    Ok(AssetData::Html(page))
+                    Ok(AssetDataRef::Html(page))
                 }
 
                 None if let Some(fallback) = &self.fallback => {
@@ -968,18 +1090,17 @@ impl Router {
 
                     Err(HttpServerError::Redirect(fallback.to_string()))
                 }
-                _ => Ok(AssetData::Text(
-                    HttpResponseCode::NotFound.to_string().to_owned(),
-                )),
+                _ => Ok(AssetDataRef::Text(HttpResponseCode::NotFound.status_line())),
             },
         }
     }
 
-    fn render_template(
+    fn render_template<'a>(
         templates: &HashMap<String, Result<Template, TemplateError>>,
         context: &dyn TemplateContext,
         path: &str,
-    ) -> Result<String, TemplateError> {
+        render_buffer: &'a mut String,
+    ) -> Result<&'a str, TemplateError> {
         //TODO unfuck
         let mut slug = path.strip_suffix(".html").unwrap_or(path);
         slug = slug.strip_prefix("pages").unwrap_or(slug);
@@ -987,7 +1108,7 @@ impl Router {
 
         let context = LocalContext::new(context, "current_page_url", url);
 
-        match templates.get(path).expect("template not found") {
+        match templates.get(path).expect("invariant because of router") {
             Ok(template) => {
                 if let Some(parent_path) = &template.parent {
                     match templates
@@ -998,13 +1119,17 @@ impl Router {
                             if parent_template.parent.is_some() {
                                 todo!("nested parents")
                             } else {
-                                template.render_with_parent(&context, parent_template)
+                                template.render_with_parent(
+                                    &context,
+                                    parent_template,
+                                    render_buffer,
+                                )
                             }
                         }
                         Err(err) => Err(template.enhance_error(err.clone())),
                     }
                 } else {
-                    template.render(&context)
+                    template.render(&context, render_buffer)
                 }
             }
             Err(template_error) => Err(template_error.clone()),
@@ -1058,20 +1183,25 @@ impl Template {
         };
     }
 
-    fn render(&self, context: &dyn TemplateContext) -> Result<String, TemplateError> {
-        let mut out = String::new();
-        Self::render_helper(&self.template, context, &HashMap::new(), &mut out)
+    fn render<'a>(
+        &self,
+        context: &dyn TemplateContext,
+        render_buffer: &'a mut String,
+    ) -> Result<&'a str, TemplateError> {
+        render_buffer.clear();
+        Self::render_helper(&self.template, context, &HashMap::new(), render_buffer)
             .map_err(|e| self.enhance_error(e))?;
-        Ok(out)
+        Ok(render_buffer)
     }
 
-    fn render_with_parent(
+    fn render_with_parent<'a>(
         &self,
         context: &dyn TemplateContext,
         parent: &Template,
-    ) -> Result<String, TemplateError> {
-        let mut out = String::new();
-        Self::render_helper(&parent.template, context, &self.blocks, &mut out).map_err(
+        render_buffer: &'a mut String,
+    ) -> Result<&'a str, TemplateError> {
+        render_buffer.clear();
+        Self::render_helper(&parent.template, context, &self.blocks, render_buffer).map_err(
             |e| match &e.pos {
                 Some(pos) => {
                     if pos.file == self.origin_file {
@@ -1085,7 +1215,7 @@ impl Template {
                 None => self.enhance_error(e),
             },
         )?;
-        Ok(out)
+        Ok(render_buffer)
     }
 
     fn render_helper(
@@ -1162,13 +1292,11 @@ impl Template {
                     if let TemplateValue::List(iter) =
                         Self::resolve_var(iter_src, context, &node.pos)?
                     {
-                        let mut for_res = String::new();
                         for it in iter {
                             let child_context = LocalContext::new(context, iter_bind, it);
 
-                            Self::render_helper(body, &child_context, blocks, &mut for_res)?;
+                            Self::render_helper(body, &child_context, blocks, out)?;
                         }
-                        out.push_str(&for_res);
                     } else {
                         return Err(TemplateError::new(
                             TemplateErrorMsg::VariableNotOfExpectedType(
@@ -1317,37 +1445,37 @@ impl TemplateValue {
 }
 
 trait ToTemplateValue {
-    fn to_template_value(&self) -> TemplateValue;
+    fn to_template_value(self) -> TemplateValue;
 }
 
 impl ToTemplateValue for &str {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         TemplateValue::Text((*self).to_string())
     }
 }
 
 impl ToTemplateValue for String {
-    fn to_template_value(&self) -> TemplateValue {
-        TemplateValue::Text((*self).to_string())
+    fn to_template_value(self) -> TemplateValue {
+        TemplateValue::Text(self)
     }
 }
 
 impl ToTemplateValue for bool {
-    fn to_template_value(&self) -> TemplateValue {
-        TemplateValue::Bool(*self)
+    fn to_template_value(self) -> TemplateValue {
+        TemplateValue::Bool(self)
     }
 }
 
 impl ToTemplateValue for SystemTime {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         TemplateValue::Text(format!("{:?}", self.duration_since(SystemTime::UNIX_EPOCH)))
     }
 }
 
 impl<T: ToTemplateValue> ToTemplateValue for Vec<T> {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         TemplateValue::List(
-            self.iter()
+            self.into_iter()
                 .map(ToTemplateValue::to_template_value)
                 .collect(),
         )
@@ -1355,18 +1483,18 @@ impl<T: ToTemplateValue> ToTemplateValue for Vec<T> {
 }
 
 impl ToTemplateValue for Duration {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         TemplateValue::Text(format!("{:.2?}", self))
     }
 }
-impl ToTemplateValue for u64 {
-    fn to_template_value(&self) -> TemplateValue {
+impl ToTemplateValue for i64 {
+    fn to_template_value(self) -> TemplateValue {
         TemplateValue::Text(format!("{:.2?}", self))
     }
 }
 
 impl ToTemplateValue for PageMetric {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         TemplateValue::Object(hash_map! {
           "path".to_string() => TemplateValue::Text(self.page.to_string()),
           "avg".to_string() =>  self.avg_loadtime.to_template_value(),
@@ -1376,7 +1504,7 @@ impl ToTemplateValue for PageMetric {
 }
 
 impl ToTemplateValue for Stats {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         TemplateValue::Object(hash_map! {
           "pages".to_string() => self.pages.to_template_value(),
           "start_time".to_string() => self.start_time.to_template_value(),
@@ -1385,7 +1513,7 @@ impl ToTemplateValue for Stats {
 }
 
 impl ToTemplateValue for SyntaxHighlightLang {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         use SyntaxHighlightLang::*;
         use TemplateValue::*;
         match self {
@@ -1396,7 +1524,7 @@ impl ToTemplateValue for SyntaxHighlightLang {
 }
 
 impl ToTemplateValue for AssetData {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         use AssetData::*;
         use TemplateValue::*;
         match self {
@@ -1413,7 +1541,7 @@ impl ToTemplateValue for AssetData {
 }
 
 impl ToTemplateValue for ParsedMarkdown {
-    fn to_template_value(&self) -> TemplateValue {
+    fn to_template_value(self) -> TemplateValue {
         let (published, published_rfc1123) = match &self.metadata.published {
             Ok(system_time) => match system_time_to_date(*system_time) {
                 Ok(date) => {
@@ -1753,7 +1881,12 @@ impl TemplateError {
         }
     }
 
-    fn render_error(&self, error_template: Option<&Template>) -> String {
+    fn render_error<'a>(
+        &self,
+        error_template: Option<&Template>,
+        render_buffer: &'a mut String,
+    ) -> Cow<'a, str> {
+        render_buffer.clear();
         let (file_info, code_snippet) = self.render_error_info();
 
         if let Some(error_template) = error_template {
@@ -1763,10 +1896,13 @@ impl TemplateError {
             context.insert_global("file", file_info.to_template_value());
             context.insert_global("code_snippet", code_snippet.to_template_value());
             context.insert_global("error_msg", self.typ.to_string().to_template_value());
-
-            error_template.render(&context).expect("needs to work")
+            Cow::Borrowed(
+                error_template
+                    .render(&context, render_buffer)
+                    .expect("needs to work"),
+            )
         } else {
-            format!("{file_info}\n{code_snippet}")
+            Cow::Owned(format!("{file_info}\n{code_snippet}"))
         }
     }
 
@@ -2160,7 +2296,7 @@ impl Content {
         let mut changed = false;
         for path in &paths {
             let last_modified = path.metadata()?.modified()?;
-            let path_str = path.to_string_lossy().to_string();
+            let path_str = path.to_string_lossy();
 
             for (key, template_res) in &mut self.templates {
                 match template_res {
@@ -2293,6 +2429,23 @@ enum AssetTyp {
     Ico,
     Woff2,
     Unknown,
+    Empty,
+}
+
+impl AssetTyp {
+    fn typ(&self) -> &str {
+        match self {
+            AssetTyp::Html => "text/html; charset=utf-8",
+            AssetTyp::Css => "text/css",
+            AssetTyp::Js => "text/javascript",
+            AssetTyp::Png => "image/png",
+            AssetTyp::Ico => "image/ico",
+            AssetTyp::Woff2 => "font/woff2",
+            AssetTyp::MdParsed => "text/html; charset=utf-8",
+            AssetTyp::Text | AssetTyp::MdRaw | AssetTyp::Unknown => "text/plain; charset=utf-8",
+            AssetTyp::Empty => "",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2309,21 +2462,66 @@ enum AssetData {
     Unknown(String),
     Empty,
 }
+#[derive(Clone, Debug)]
+enum AssetDataRef<'a> {
+    Text(&'a str),
+    Html(&'a str),
+    Css(&'a str),
+    Js(&'a str),
+    MdRaw(&'a str),
+    Unknown(&'a str),
+    Png(&'a [u8]),
+    Ico(&'a [u8]),
+    Woff2(&'a [u8]),
+    MdParsed(&'a ParsedMarkdown),
+    Empty,
+}
 
-impl AssetData {
-    fn len(&self) -> usize {
+impl AssetDataRef<'_> {
+    fn typ(&self) -> &str {
         match self {
-            AssetData::Text(s)
-            | AssetData::Html(s)
-            | AssetData::Css(s)
-            | AssetData::Js(s)
-            | AssetData::MdRaw(s)
-            | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
-            | AssetData::Unknown(s) => s.len(),
-            AssetData::Png(bytes) | AssetData::Ico(bytes) | AssetData::Woff2(bytes) => bytes.len(),
-            AssetData::Empty => 0,
+            AssetDataRef::Html(_) => "text/html; charset=utf-8",
+            AssetDataRef::Css(_) => "text/css",
+            AssetDataRef::Js(_) => "text/javascript",
+            AssetDataRef::Png(_) => "image/png",
+            AssetDataRef::Ico(_) => "image/ico",
+            AssetDataRef::Woff2(_) => "font/woff2",
+            AssetDataRef::MdParsed(_) => "text/html; charset=utf-8",
+            AssetDataRef::Text(_) | AssetDataRef::MdRaw(_) | AssetDataRef::Unknown(_) => {
+                "text/plain; charset=utf-8"
+            }
+            AssetDataRef::Empty => "",
         }
     }
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            AssetDataRef::Png(b) | AssetDataRef::Ico(b) | AssetDataRef::Woff2(b) => b,
+            AssetDataRef::Text(s)
+            | AssetDataRef::Html(s)
+            | AssetDataRef::Css(s)
+            | AssetDataRef::Js(s)
+            | AssetDataRef::MdRaw(s)
+            | AssetDataRef::Unknown(s) => s.as_bytes(),
+            AssetDataRef::MdParsed(ParsedMarkdown { html: s, .. }) => s.as_bytes(),
+            AssetDataRef::Empty => &[],
+        }
+    }
+}
+
+impl AssetData {
+    // fn len(&self) -> usize {
+    //     match self {
+    //         AssetData::Text(s)
+    //         | AssetData::Html(s)
+    //         | AssetData::Css(s)
+    //         | AssetData::Js(s)
+    //         | AssetData::MdRaw(s)
+    //         | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
+    //         | AssetData::Unknown(s) => s.len(),
+    //         AssetData::Png(bytes) | AssetData::Ico(bytes) | AssetData::Woff2(bytes) => bytes.len(),
+    //         AssetData::Empty => 0,
+    //     }
+    // }
     fn read_asset(path: &Path) -> Result<AssetData, io::Error> {
         let content = match path.extension().and_then(|s| s.to_str()) {
             Some("png") => AssetData::Png(fs::read(path)?),
@@ -2340,6 +2538,22 @@ impl AssetData {
             _ => AssetData::Unknown(fs::read_to_string(path)?),
         };
         Ok(content)
+    }
+
+    fn as_ref(&self) -> AssetDataRef<'_> {
+        match self {
+            AssetData::Text(text) => AssetDataRef::Text(text),
+            AssetData::Html(html) => AssetDataRef::Html(html),
+            AssetData::Css(css) => AssetDataRef::Css(css),
+            AssetData::Js(js) => AssetDataRef::Js(js),
+            AssetData::Png(bytes) => AssetDataRef::Png(bytes),
+            AssetData::Ico(bytes) => AssetDataRef::Ico(bytes),
+            AssetData::MdRaw(markdown) => AssetDataRef::MdRaw(markdown),
+            AssetData::MdParsed(parsed_markdown) => AssetDataRef::MdParsed(parsed_markdown),
+            AssetData::Woff2(bytes) => AssetDataRef::Woff2(bytes),
+            AssetData::Unknown(value) => AssetDataRef::Unknown(value),
+            AssetData::Empty => AssetDataRef::Empty,
+        }
     }
 
     fn typ(&self) -> &str {
@@ -2360,30 +2574,22 @@ impl AssetData {
 
     fn from_asset_type(buffer: &[u8], content_typ: &AssetTyp) -> AssetData {
         match content_typ {
-            AssetTyp::Png => AssetData::Png(buffer.to_vec()),
-            AssetTyp::Ico => AssetData::Ico(buffer.to_vec()),
-            AssetTyp::Woff2 => AssetData::Woff2(buffer.to_vec()),
-            AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).to_string()),
-            AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).to_string()),
-            AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).to_string()),
-            AssetTyp::MdRaw => AssetData::MdRaw(String::from_utf8_lossy(buffer).to_string()),
-            AssetTyp::Text => AssetData::Text(String::from_utf8_lossy(buffer).to_string()),
-            AssetTyp::Unknown => AssetData::Unknown(String::from_utf8_lossy(buffer).to_string()),
+            AssetTyp::Png => AssetData::Png(buffer.to_owned()),
+            AssetTyp::Ico => AssetData::Ico(buffer.to_owned()),
+            AssetTyp::Woff2 => AssetData::Woff2(buffer.to_owned()),
+            AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).into_owned()),
+            AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).into_owned()),
+            AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).into_owned()),
+            AssetTyp::MdRaw => AssetData::MdRaw(String::from_utf8_lossy(buffer).into_owned()),
+            AssetTyp::Text => AssetData::Text(String::from_utf8_lossy(buffer).into_owned()),
+            AssetTyp::Unknown
+                if let s = String::from_utf8_lossy(buffer)
+                    && !s.is_empty() =>
+            {
+                AssetData::Unknown(s.into_owned())
+            }
             AssetTyp::MdParsed => todo!(),
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            AssetData::Png(b) | AssetData::Ico(b) | AssetData::Woff2(b) => b,
-            AssetData::Text(s)
-            | AssetData::Html(s)
-            | AssetData::Css(s)
-            | AssetData::Js(s)
-            | AssetData::MdRaw(s)
-            | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
-            | AssetData::Unknown(s) => s.as_bytes(),
-            AssetData::Empty => &[],
+            AssetTyp::Empty | AssetTyp::Unknown => AssetData::Empty,
         }
     }
 }
@@ -2409,10 +2615,7 @@ struct Trie<T> {
     paths: HashSet<String>,
 }
 
-impl<T> Trie<T>
-where
-    T: Clone,
-{
+impl<T> Trie<T> {
     fn new() -> Self {
         Trie {
             root: TrieNode::default(),
@@ -2423,20 +2626,18 @@ where
     fn insert(&mut self, path: String, asset: T) {
         let mut current_node = &mut self.root;
 
-        for component in PathBuf::from(&path).components() {
-            let key = component.as_os_str().to_string_lossy().to_string();
-            current_node = current_node.children.entry(key).or_default();
+        for key in path.split('/').filter(|part| !part.is_empty()) {
+            current_node = current_node.children.entry(key.to_owned()).or_default();
         }
         current_node.asset = Some(asset);
         self.paths.insert(path);
     }
 
-    fn get_ref_mut(&mut self, path: &String) -> Option<&mut T> {
+    fn get_ref_mut(&mut self, path: &str) -> Option<&mut T> {
         let mut current_node = &mut self.root;
 
-        for component in PathBuf::from(path).components() {
-            let key = component.as_os_str().to_string_lossy().to_string();
-            match current_node.children.get_mut(&key) {
+        for key in path.split('/').filter(|part| !part.is_empty()) {
+            match current_node.children.get_mut(key) {
                 Some(node) => current_node = node,
                 None => return None,
             }
@@ -2445,12 +2646,11 @@ where
         current_node.asset.as_mut()
     }
 
-    fn get_ref(&self, path: &String) -> Option<&T> {
+    fn get_ref(&self, path: &str) -> Option<&T> {
         let mut current_node = &self.root;
 
-        for component in PathBuf::from(path).components() {
-            let key = component.as_os_str().to_string_lossy().to_string();
-            match current_node.children.get(&key) {
+        for path_component in path.split('/').filter(|part| !part.is_empty()) {
+            match current_node.children.get(path_component) {
                 Some(node) => current_node = node,
                 None => return None,
             }
@@ -2463,10 +2663,8 @@ where
     fn get_partial(&self, path: &str) -> Vec<&T> {
         let mut current_node = &self.root;
 
-        for component in PathBuf::from(path).components() {
-            let key = component.as_os_str().to_string_lossy();
-
-            match current_node.children.get(key.as_ref()) {
+        for key in path.split('/').filter(|part| !part.is_empty()) {
+            match current_node.children.get(key) {
                 Some(node) => current_node = node,
                 None => return vec![],
             }
@@ -2487,7 +2685,7 @@ where
     fn collect_kv_mut(&mut self) -> Vec<(PathBuf, &mut T)> {
         let mut result = Vec::new();
 
-        Self::dfs(&mut self.root, &mut PathBuf::new(), &mut result);
+        Self::dfs(&mut self.root, &mut PathBuf::with_capacity(16), &mut result);
 
         result
     }
@@ -2508,12 +2706,11 @@ where
         }
     }
 
-    fn contains(&self, path: &String) -> bool {
+    fn contains(&self, path: &str) -> bool {
         let mut current_node = &self.root;
 
-        for component in PathBuf::from(path).components() {
-            let key = component.as_os_str().to_string_lossy().to_string();
-            match current_node.children.get(&key) {
+        for key in path.split('/').filter(|part| !part.is_empty()) {
+            match current_node.children.get(key) {
                 Some(node) => current_node = node,
                 None => return false,
             }
@@ -2525,9 +2722,8 @@ where
     fn remove(&mut self, path: &String) -> bool {
         let mut current_node = &mut self.root;
 
-        for component in PathBuf::from(path).components() {
-            let key = component.as_os_str().to_string_lossy().to_string();
-            if let Some(node) = current_node.children.get_mut(&key) {
+        for key in path.split('/').filter(|part| !part.is_empty()) {
+            if let Some(node) = current_node.children.get_mut(key) {
                 current_node = node;
             } else {
                 return false;
@@ -4597,11 +4793,11 @@ struct SqlResult {
 }
 
 impl SqlResult {
-    fn get_text_column(&self, idx: usize) -> Result<Vec<&str>, Box<dyn Error>> {
+    fn get_text_column(&self, idx: usize) -> Result<Vec<String>, Box<dyn Error>> {
         self.inner[idx]
             .iter()
             .map(|v| match v {
-                ColumnValue::Text(s) => Ok(s.as_str()),
+                ColumnValue::Text(s) => Ok(s.into()),
                 ColumnValue::Null => Err("Null".into()),
                 _ => Err("wrong type".into()),
             })
@@ -5070,7 +5266,8 @@ struct Db {
     executable_bytes: Vec<u8>,
     executable_path: PathBuf,
     unsynced: bool,
-    metric_cache: Vec<CachedPageHit>,
+    metric_cache: HashMap<String, Vec<CachedPageHit>>,
+    current_cache_count: usize,
 }
 
 impl Db {
@@ -5116,7 +5313,8 @@ impl Db {
             executable_bytes,
             executable_path: current_executable_path,
             unsynced: true,
-            metric_cache: vec![],
+            metric_cache: HashMap::new(),
+            current_cache_count: 0,
         };
         db.sync()?;
         Ok(db)
@@ -5209,7 +5407,12 @@ impl Db {
         Ok(())
     }
 
-    fn save_page_hit(&mut self, page: &str, loadtime: Duration) -> Result<(), Box<dyn Error>> {
+    fn page_to_id(&self, page_url: &str) -> usize {
+        // self.page_pool.contin
+        todo!()
+    }
+
+    fn save_page_hit(&mut self, page_url: &str, loadtime: Duration) -> Result<(), Box<dyn Error>> {
         let timestamp = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs()
@@ -5217,14 +5420,23 @@ impl Db {
 
         let loadtime_nanos = i64::from(loadtime.subsec_nanos());
 
-        self.metric_cache.push(CachedPageHit {
-            page: page.to_string(),
+        let hit: CachedPageHit = CachedPageHit {
             loadtime: loadtime_nanos,
             timestamp,
-        });
-        self.unsynced = true;
+        };
 
-        if self.metric_cache.len() >= 1000 {
+        if let Some(hits) = self.metric_cache.get_mut(page_url) {
+            hits.push(hit);
+        } else {
+            let mut vec = Vec::with_capacity(16);
+            vec.push(hit);
+            self.metric_cache.insert(page_url.to_owned(), vec);
+        }
+
+        self.unsynced = true;
+        self.current_cache_count += 1;
+
+        if self.current_cache_count >= METRICS_CACHE_SIZE {
             self.sync_metric_cache()?;
         }
 
@@ -5236,36 +5448,30 @@ impl Db {
         let start = Instant::now();
         let conn = &self.connection;
 
-        let multi_binds_metrics = self
+        let aggregates: Vec<(&str, i64, i64)> = self
             .metric_cache
             .iter()
-            .map(|b| {
-                vec![
-                    Bind::Text(&b.page),
-                    Bind::Int(b.loadtime),
-                    Bind::Int(b.timestamp),
-                ]
+            .map(|(key, hits)| {
+                let total_loadtime = hits.iter().map(|hit| hit.loadtime).sum();
+                let count = hits.len() as i64;
+
+                (key.as_str(), total_loadtime, count)
             })
             .collect();
 
-        let mut sorted: Vec<_> = self.metric_cache.iter().collect();
-        sorted.sort_unstable_by(|a, b| a.page.cmp(&b.page));
-
-        let aggregates =
-            sorted
-                .into_iter()
-                .fold(Vec::<(&str, i64, i64)>::new(), |mut aggregates, hit| {
-                    match aggregates.last_mut() {
-                        Some((page, total_load_time, total_hits)) if *page == hit.page.as_str() => {
-                            *total_load_time += hit.loadtime;
-                            *total_hits += 1;
-                        }
-
-                        _ => aggregates.push((hit.page.as_str(), hit.loadtime, 1)),
-                    }
-
-                    aggregates
-                });
+        let multi_binds_metrics = self
+            .metric_cache
+            .iter()
+            .flat_map(|(key, hits)| {
+                hits.iter().map(|hit| {
+                    vec![
+                        Bind::Text(key),
+                        Bind::Int(hit.loadtime),
+                        Bind::Int(hit.timestamp),
+                    ]
+                })
+            })
+            .collect();
 
         let multi_binds_metrics_aggregate = aggregates
             .iter()
@@ -5293,11 +5499,14 @@ impl Db {
             )
         })?;
 
-        let metric_entries = self.metric_cache.len();
-        self.metric_cache = vec![];
+        self.metric_cache
+            .iter_mut()
+            .for_each(|(_, hits)| hits.clear());
+
         self.unsynced = true;
         let duration = start.elapsed();
-        // println!("Synced {metric_entries} entries in metric cache in {duration:?}",);
+        // println!("Synced {} entries in metric cache in {duration:?}",self.current_cache_count );
+        self.current_cache_count = 0;
 
         Ok(())
     }
@@ -5313,7 +5522,7 @@ impl Db {
             &[ColumnTyp::Text],
         )?;
         let col = res.get_text_column(0)?;
-        let start_time = (*col.first().ok_or("Start time not found")?).to_string();
+        let start_time = col.first().ok_or("Start time not found")?.to_owned();
 
         let res = conn.querry(
             "
@@ -5327,18 +5536,21 @@ impl Db {
         let total_loadtimes = res.get_int_column(1)?;
         let counts = res.get_int_column(2)?;
 
-        let mut metrics_by_page: HashMap<&str, (i64, i64)> = HashMap::new();
+        let mut metrics_by_page: HashMap<String, (i64, i64)> = HashMap::with_capacity(pages.len());
 
         for (page, (total_loadtime, count)) in zip(pages, zip(total_loadtimes, counts)) {
             metrics_by_page.insert(page, (total_loadtime, count));
         }
 
-        for hit in &self.metric_cache {
-            if let Some(entry) = metrics_by_page.get_mut(hit.page.as_str()) {
-                entry.0 += hit.loadtime;
-                entry.1 += 1;
+        for (page, hits) in &self.metric_cache {
+            let cached_total = hits.iter().map(|hit| hit.loadtime).sum();
+            let cached_count = hits.len() as i64;
+
+            if let Some(entry) = metrics_by_page.get_mut(page) {
+                entry.0 += cached_total;
+                entry.1 += cached_count;
             } else {
-                metrics_by_page.insert(&hit.page, (hit.loadtime, 1));
+                metrics_by_page.insert(page.to_string(), (cached_total, cached_count));
             }
         }
 
@@ -5348,9 +5560,9 @@ impl Db {
                 let average_nanos = total_loadtime / count;
 
                 PageMetric {
-                    page: page.to_owned(),
+                    page,
                     avg_loadtime: Duration::from_nanos(average_nanos as u64),
-                    count: count as u64,
+                    count,
                 }
             })
             .collect();
@@ -5373,7 +5585,8 @@ impl Db {
             executable_bytes,
             executable_path,
             unsynced: true,
-            metric_cache: vec![],
+            metric_cache: HashMap::new(),
+            current_cache_count: 0,
         };
 
         db.sync()?;
@@ -5396,7 +5609,6 @@ impl Db {
 
 #[derive(Debug, Clone)]
 struct CachedPageHit {
-    page: String,
     loadtime: i64,
     timestamp: i64,
 }
@@ -5411,7 +5623,165 @@ struct Stats {
 struct PageMetric {
     page: String,
     avg_loadtime: Duration,
-    count: u64,
+    count: i64,
+}
+
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator::new();
+
+#[derive(Debug, Clone, Copy)]
+struct AllocationInfo {
+    count_total: usize,
+    count_current: usize,
+    count_max: usize,
+    bytes_total: usize,
+    bytes_current: usize,
+    bytes_max: usize,
+}
+
+impl Display for AllocationInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "  total_count = {},\ttotal_bytes={}",
+            self.count_total,
+            Blob::pretty_bytes(self.bytes_total),
+        )?;
+        writeln!(
+            f,
+            "  current_count = {},\tcurrent_bytes={}",
+            self.count_current,
+            Blob::pretty_bytes(self.bytes_current),
+        )?;
+        write!(
+            f,
+            "  peak_count = {},\tpeak_bytes={}",
+            self.count_max,
+            Blob::pretty_bytes(self.bytes_max),
+        )
+    }
+}
+
+impl AllocationInfo {
+    const fn new() -> Self {
+        Self {
+            count_total: 0,
+            count_current: 0,
+            count_max: 0,
+            bytes_total: 0,
+            bytes_current: 0,
+            bytes_max: 0,
+        }
+    }
+    fn track_alloc(&mut self, bytes: usize) {
+        self.count_total += 1;
+        self.count_current += 1;
+        self.count_max = self.count_max.max(self.count_current);
+
+        self.bytes_total += bytes;
+        self.bytes_current += bytes;
+        self.bytes_max = self.bytes_max.max(self.bytes_current);
+    }
+
+    fn track_dealloc(&mut self, bytes: usize) {
+        debug_assert!(self.count_current > 0);
+        debug_assert!(self.bytes_current >= bytes);
+
+        self.count_current -= 1;
+        self.bytes_current -= bytes;
+    }
+
+    fn diff(&self, previous: Self) -> AllocationInfo {
+        AllocationInfo {
+            count_total: self.count_total - previous.count_total,
+            count_current: 0,
+            count_max: self.count_max - previous.count_max,
+            bytes_total: self.bytes_total - previous.bytes_total,
+            bytes_current: 0,
+            bytes_max: self.bytes_max - previous.bytes_max,
+        }
+    }
+}
+
+struct AllocationUsage {
+    bytes: usize,
+    count: usize,
+}
+
+impl fmt::Display for AllocationUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} -> {}", self.count, Blob::pretty_bytes(self.bytes))
+    }
+}
+
+impl AllocationUsage {
+    fn diff(&self, previous: Self) -> AllocationUsage {
+        AllocationUsage {
+            bytes: self.bytes - previous.bytes,
+            count: self.count - previous.count,
+        }
+    }
+}
+
+struct CountingAllocator {
+    info: UnsafeCell<AllocationInfo>,
+}
+
+impl CountingAllocator {
+    const fn new() -> Self {
+        Self {
+            info: UnsafeCell::new(AllocationInfo::new()),
+        }
+    }
+
+    fn snapshot(&self) -> AllocationInfo {
+        unsafe { *self.info.get() }
+    }
+
+    fn usage_snapshot(&self) -> AllocationUsage {
+        let info = unsafe { *self.info.get() };
+
+        AllocationUsage {
+            bytes: info.bytes_total,
+            count: info.count_total,
+        }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn info_mut(&self) -> &mut AllocationInfo {
+        unsafe { &mut *self.info.get() }
+    }
+
+    fn measure<F, R>(&self, f: F) -> (R, AllocationUsage)
+    where
+        F: FnOnce() -> R,
+    {
+        let before = self.usage_snapshot();
+        let result = f();
+        let after = self.usage_snapshot();
+
+        (result, after.diff(before))
+    }
+}
+
+unsafe impl Sync for CountingAllocator {}
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+
+        if !ptr.is_null() {
+            unsafe { self.info_mut().track_alloc(layout.size()) };
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe {
+            self.info_mut().track_dealloc(layout.size());
+            System.dealloc(ptr, layout)
+        }
+    }
 }
 
 // === Utils ===

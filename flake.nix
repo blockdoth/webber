@@ -34,6 +34,7 @@
               sqlite
 
               wrk # for benchmarking
+              hey # for benchmarking
             ];
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
           };
