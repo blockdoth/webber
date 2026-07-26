@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <head>
-
+  <title>Blockdoth</title>
   {{block meta}} 
       
   {{endBlock}}    
@@ -26,28 +26,29 @@
 
       body {
         background-color: #101214;
-        font-family: Arial, sans-serif;
         color: white;
         height: 100%;    
       }
       
+
+
+      h1, h2, h3 {
+        padding-top: 1rem;
+        padding-bottom: 0.2rem;
+      }
+
       .container {
         min-height: 100%;
         display: grid;
         grid-template-rows: auto 1fr auto;
+        
       }
-
-      h1 {
-        text-align: center;
-      }
-
 
       .logo {
-
         height: 100%;
       }
       .logo_placeholder {
-        height: 2rem;
+        height: 4rem;
       }      
 
       .nav {
@@ -63,26 +64,40 @@
       .nav_button {
         color: white;
         text-decoration:none;
-        align-items: center;      
-        padding-inline:10px;   
+        align-content: center;      
+        margin: 5px;   
+        padding: 5px;
       }
       
-      .nav_button:hover {
+      .nav_pages {
+        align-content: end;      
+        /* background-color: red; */
+        padding-bottom: 5px;
+      }
+      
+      .nav_button:hover, .blockdoth:hover {
         color: black;
         background-color: white;
       }     
       
+
+      .blockdoth {
+        font-size: 50px;
+        color: white;
+        text-decoration:none;        
+        padding-inline:10px;   
+
+      }      
       .logo_container {
         display: inline-flex;
-        /* align-items: center; */
-        /* gap: 0.5rem; */
         text-decoration: none;
-        color: inherit;     
-        margin-left: 10px;
+             
+        /* margin-left: 10px; */
       }
 
       .content {
-        padding: 5px;
+        width: 50em;    
+        margin-inline: auto
       }
 
       .footer {
@@ -96,6 +111,15 @@
         background-color: white;
       }
 
+
+
+      a {
+        color: #738d82;
+      }
+
+      ul {
+        padding-left: 2rem;
+      }
 
     </style>
     <!-- local css -->
@@ -126,8 +150,8 @@
 <body>
     <div class="container">
     
+      
       <div class="nav">
-
         <a href="/home" class="logo_container">
           <div class = "logo_placeholder">
             <img 
@@ -138,18 +162,20 @@
               >
           </div>
           
-          <div class="nav_button {{if current_page_url == "/home" }} active {{endIf}}">
+          <div class="blockdoth {{if current_page_url == "/home" }} active {{endIf}}">
             blockdoth
           </div>
 
         </a>
+        <div class="nav_pages">
 
-        {{for page in pages-static}}
-
-
-        <a href="{{page.url}}" class="nav_button {{if page.url == current_page_url }} active {{endIf}}" >~/{{page.name}}</a>
-        
-        {{endFor}}
+          {{for page in pages-static}}
+          
+          
+          <a href="{{page.url}}" class="nav_button {{if page.url == current_page_url }} active {{endIf}}" >~/{{page.name}}</a>
+          
+          {{endFor}}
+        </div>
       </div>
 
       <div class="content">
@@ -163,7 +189,7 @@
         <p>
           Copyright {{copyright_start}}-{{copyright_end}} 
           blockdoth
-          Served by <a href="https://github.com/blockdoth/webber/">webber</a> version: <a href="https://github.com/blockdoth/webber/commit/{{git_hash_long}}">{{git_hash_short}}</a>
+          Powered by <a href="https://github.com/blockdoth/webber/">webber</a>, version: <a href="https://github.com/blockdoth/webber/commit/{{git_hash_long}}">{{git_hash_short}}</a>
         </p>
       </div>
     </div>

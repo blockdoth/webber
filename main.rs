@@ -115,13 +115,13 @@ fn comptime() -> Result<(), Box<dyn Error>> {
             }
             Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
             Some("md") => &format!(
-                "AssetData::MdParsed(MarkdownParser::parse(include_str!({global_path:?})))"
+                "AssetData::Markdown(MarkdownParser::parse(&include_str!({global_path:?})))"
             ),
             Some("html") => &format!("AssetData::Html(include_str!({global_path:?}))"),
             Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
             Some("css") => &format!("AssetData::Css(include_str!({global_path:?}).to_string())"),
             Some("js") => &format!("AssetData::Js(include_str!({global_path:?}).to_string())"),
-            _ => &format!("AssetData::Unknown(include_str!({global_path:?}))"),
+            _ => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
         };
 
         out.push_str(&format!(
@@ -305,7 +305,7 @@ impl Context {
             .expect("failed to parse date")
             .to_rfc1123();
 
-        context.update_posts(content);
+        content.update_asset_content(&mut context);
         context.insert_global("copyright_start", "2026".to_string());
         context.insert_global("copyright_end", "2026".to_string()); // TODO make dynamic
         context.insert_global("domain", DOMAIN.to_string()); // TODO make dynamic
@@ -517,7 +517,7 @@ impl HttpServer {
                         if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
                             if reload {
                                 let _ = HttpServer::send_ws_message(stream, "reload");
-                                println!("[{peer_addr:?}] Reloaded");
+                                // println!("[{peer_addr:?}] Reloaded");
                             }
                             true
                         } else {
@@ -1390,6 +1390,7 @@ impl Template {
         match Self::resolve_var(condition, context, &node.pos)? {
             Bool(cond) => Ok(*cond),
             List(template_values) => Ok(!template_values.is_empty()),
+            Text(text) => Ok(!text.is_empty()),
             _ => Err(TemplateError::new(
                 TemplateErrorMsg::VariableNotOfExpectedType(
                     condition.concat(),
@@ -1497,31 +1498,44 @@ where
 
 impl ToTemplateValue for Duration {
     fn to_template_value(self) -> TemplateValue {
-        TemplateValue::Text(format!("{:.2?}", self))
+        format!("{:.2?}", self).to_template_value()
     }
 }
 impl ToTemplateValue for i64 {
     fn to_template_value(self) -> TemplateValue {
-        TemplateValue::Text(format!("{:.2?}", self))
+        format!("{:.2?}", self).to_template_value()
     }
 }
 
 impl ToTemplateValue for PageMetric {
     fn to_template_value(self) -> TemplateValue {
-        TemplateValue::Object(hash_map! {
-          "path".to_string() => TemplateValue::Text(self.page.to_string()),
+        hash_map! {
+          "path".to_string() => self.page.to_string().to_template_value(),
           "avg".to_string() =>  self.avg_loadtime.to_template_value(),
           "count".to_string() => self.count.to_template_value(),
-        })
+        }
+        .to_template_value()
+    }
+}
+
+impl ToTemplateValue for Quote {
+    fn to_template_value(self) -> TemplateValue {
+        hash_map! {
+          "quote".to_string() => self.quote.to_template_value(),
+          "author".to_string() =>  self.author.to_template_value(),
+          "description".to_string() => self.description.to_template_value(),
+        }
+        .to_template_value()
     }
 }
 
 impl ToTemplateValue for Stats {
     fn to_template_value(self) -> TemplateValue {
-        TemplateValue::Object(hash_map! {
+        hash_map! {
           "pages".to_string() => self.pages.to_template_value(),
           "start_time".to_string() => self.start_time.to_template_value(),
-        })
+        }
+        .to_template_value()
     }
 }
 
@@ -1531,7 +1545,7 @@ impl ToTemplateValue for SyntaxHighlightLang {
         use TemplateValue::*;
         match self {
             Bash | C | Clike | Css | Haskell | Nix | Rust | Markdown | Markup | Elixir | Html
-            | Javascript | Typescript => Text(self.to_str().to_string()),
+            | Javascript | Typescript => self.to_str().to_owned().to_template_value(),
         }
     }
 }
@@ -1541,38 +1555,36 @@ impl ToTemplateValue for AssetData {
         use AssetData::*;
         match self {
             Png(_) | Ico(_) | Woff2(_) => {
-                todo!("Cant isnert binary assets into context yet")
+                todo!("Cant insert binary assets into context yet")
             }
             Empty => todo!("not sure what to do with this"),
-            AssetData::Text(s) | Html(s) | Css(s) | Js(s) | MdRaw(s) | Unknown(s) => {
-                TemplateValue::Text(s.to_string())
-            }
-            MdParsed(parsed) => parsed.to_template_value(),
+            AssetData::Text(s) | Html(s) | Css(s) | Js(s) | Unknown(s) => s.to_template_value(),
+            Markdown(parsed) => parsed.to_template_value(),
         }
     }
 }
 
-impl ToTemplateValue for ParsedMarkdown {
+impl ToTemplateValue for MarkdownPost {
     fn to_template_value(self) -> TemplateValue {
         let (published, published_rfc1123) = match &self.metadata.published {
             Ok(system_time) => match system_time_to_date(*system_time) {
                 Ok(date) => {
-                    let published = TemplateValue::Text(date.to_rfc_idk());
+                    let published = date.to_rfc_idk().to_template_value();
 
-                    let published_rfc1123 = TemplateValue::Text(date.to_rfc1123());
+                    let published_rfc1123 = date.to_rfc1123().to_template_value();
 
                     (published, published_rfc1123)
                 }
 
                 Err(err) => {
                     let error =
-                        TemplateValue::Text(format!("Failed to convert publish SystemTime: {err}"));
+                        format!("Failed to convert publish SystemTime: {err}").to_template_value();
                     (error.clone(), error)
                 }
             },
 
             Err(err) => {
-                let error = TemplateValue::Text((*err).to_owned());
+                let error = (*err).to_owned().to_template_value();
                 (error.clone(), error)
             }
         };
@@ -1586,22 +1598,38 @@ impl ToTemplateValue for ParsedMarkdown {
 
         let highlighted_langs = SyntaxHighlightLang::include_dependencies(&self.highlighted_langs);
 
-        TemplateValue::Object(
-            [
-                ("title", self.metadata.title.to_template_value()),
-                ("slug", self.metadata.slug.to_template_value()),
-                ("published", published),
-                ("published_rfc1123", published_rfc1123),
-                ("tags", self.metadata.tags.to_template_value()),
-                ("summary", summary),
-                ("draft", self.metadata.draft.to_template_value()),
-                ("content", self.html.to_template_value()),
-                ("highlighted_langs", highlighted_langs.to_template_value()),
-            ]
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
-            .collect(),
-        )
+        hash_map! {
+          "title" => self.metadata.title.to_template_value(),
+          "slug" => self.metadata.slug.to_template_value(),
+          "published" => published,
+          "published_rfc1123" => published_rfc1123,
+          "tags" => self.metadata.tags.to_template_value(),
+          "summary" => summary,
+          "draft" => self.metadata.draft.to_template_value(),
+          "content" => self.html.to_template_value(),
+          "highlighted_langs" => highlighted_langs.to_template_value(),
+        }
+        .to_template_value()
+    }
+}
+
+impl ToTemplateValue for MarkdownFile {
+    fn to_template_value(self) -> TemplateValue {
+        let highlighted_langs = SyntaxHighlightLang::include_dependencies(&self.highlighted_langs);
+        hash_map! {
+          "content" => self.html.to_template_value(),
+          "highlighted_langs" => highlighted_langs.to_template_value(),
+        }
+        .to_template_value()
+    }
+}
+
+impl ToTemplateValue for ParsedMarkdown {
+    fn to_template_value(self) -> TemplateValue {
+        match self {
+            ParsedMarkdown::Post(markdown_post) => markdown_post.to_template_value(),
+            ParsedMarkdown::File(markdown_file) => markdown_file.to_template_value(),
+        }
     }
 }
 
@@ -2198,37 +2226,13 @@ impl Context {
     fn lookup_mut(&mut self, key: &str) -> Option<&mut TemplateValue> {
         self.global_context.get_mut(key)
     }
+}
 
-    fn update_posts(&mut self, content: &Content) {
-        let posts: Vec<AssetData> = content
-            .assets
-            .get_partial("/posts/")
-            .into_iter()
-            .cloned()
-            .map(|p| p.data)
-            .collect();
-
-        let post_values = posts.to_template_value();
-
-        let mut posts_by_slug = HashMap::new();
-
-        if let TemplateValue::List(list) = &post_values {
-            for post in list {
-                if let TemplateValue::Object(object) = post
-                    && let Some(TemplateValue::Text(slug)) = object.get("slug")
-                {
-                    posts_by_slug.insert(slug.clone(), post.clone());
-                }
-            }
-        }
-
-        self.global_context.insert("posts".to_string(), post_values);
-
-        self.global_context.insert(
-            "posts_by_slug".to_string(),
-            TemplateValue::Object(posts_by_slug),
-        );
-    }
+#[derive(Debug, Clone)]
+struct Quote {
+    quote: String,
+    author: String,
+    description: String,
 }
 
 trait TemplateContext {
@@ -2285,12 +2289,17 @@ impl Content {
         // assets
         Self { assets, templates }
     }
-
+    fn update_asset_content(&self, context: &mut Context) {
+        self.update_posts(context);
+        self.update_quotes(context);
+        self.update_pages(context);
+        self.update_blogs(context);
+    }
     fn check_update(&mut self, context: &mut Context) -> Result<bool, TemplateError> {
         let assets_changed = match self.update_assets() {
             Ok(assets_changed) => {
                 if assets_changed {
-                    context.update_posts(self);
+                    self.update_asset_content(context);
                 }
                 assets_changed
             }
@@ -2409,6 +2418,125 @@ impl Content {
         }
         Ok(changed)
     }
+
+    fn update_posts(&self, context: &mut Context) {
+        let posts: Vec<AssetData> = self
+            .assets
+            .get_partial("/posts/")
+            .into_iter()
+            .map(|(_, p)| p.data.clone())
+            .collect();
+
+        let post_values = posts.to_template_value();
+
+        let mut posts_by_slug = HashMap::new();
+
+        if let TemplateValue::List(list) = &post_values {
+            for post in list {
+                if let TemplateValue::Object(object) = post
+                    && let Some(TemplateValue::Text(slug)) = object.get("slug")
+                {
+                    posts_by_slug.insert(slug.clone(), post.clone());
+                }
+            }
+        }
+
+        context
+            .global_context
+            .insert("posts".to_string(), post_values);
+
+        context.global_context.insert(
+            "posts_by_slug".to_string(),
+            TemplateValue::Object(posts_by_slug),
+        );
+    }
+
+    fn update_quotes(&self, context: &mut Context) {
+        let quotes_asset = self
+            .assets
+            .get_ref("/quotes_collection")
+            .expect("quotes asset must exist")
+            .data
+            .as_ref();
+
+        let quotes_str = quotes_asset
+            .as_str()
+            .expect("quotes asset must contain text");
+
+        let mut quotes = vec![];
+
+        let mut rest = quotes_str;
+
+        while let Some(quote_start) = rest.find('"') {
+            rest = &rest[quote_start + 1..];
+
+            let Some(quote_end) = rest.find('"') else {
+                break;
+            };
+
+            let quote = rest[..quote_end].trim();
+            rest = &rest[quote_end + 1..];
+
+            let metadata = rest.trim_start();
+
+            let Some(metadata) = metadata.trim_start().strip_prefix('~') else {
+                continue;
+            };
+
+            let metadata_end = metadata.find('\n').unwrap_or(metadata.len());
+            let metadata_line = metadata[..metadata_end].trim();
+
+            let author;
+            let description;
+
+            if let Some((parsed_author, parsed_description)) = metadata_line.split_once(',') {
+                author = parsed_author.trim();
+                description = parsed_description.trim();
+            } else {
+                author = metadata_line.trim();
+                description = "";
+            }
+
+            quotes.push(Quote {
+                quote: quote.to_string(),
+                author: author.to_string(),
+                description: description.to_string(),
+            });
+
+            rest = &metadata[metadata_end..];
+        }
+
+        context
+            .global_context
+            .insert("quotes".to_owned(), quotes.to_template_value());
+    }
+
+    fn update_pages(&self, context: &mut Context) {
+        let pages = self.assets.get_partial("/pages/");
+
+        for (path, page) in pages {
+            if let AssetData::Markdown(..) = page.data
+                && let Some(stripped_path) = path.strip_suffix(".md")
+                && let Some(stripped_path) = stripped_path.strip_prefix("/")
+            {
+                println!("{stripped_path}");
+                let page_value = page.data.clone().to_template_value();
+                context
+                    .global_context
+                    .insert(stripped_path.to_owned(), page_value);
+            }
+        }
+    }
+    fn update_blogs(&self, context: &mut Context) {
+        if let Some(blogs) = self.assets.get_ref("cool_blogs")
+            && let AssetData::Text(blogs) = &blogs.data
+        {
+            let blogs: Vec<String> = blogs.lines().map(str::to_owned).collect();
+            context
+                .global_context
+                .insert("cool_blogs".to_owned(), blogs.to_template_value());
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2437,8 +2565,7 @@ enum AssetTyp {
     Css,
     Js,
     Png,
-    MdRaw,
-    MdParsed,
+    Md,
     Ico,
     Woff2,
     Unknown,
@@ -2453,8 +2580,7 @@ enum AssetData {
     Js(String),
     Png(Vec<u8>),
     Ico(Vec<u8>),
-    MdRaw(String),
-    MdParsed(ParsedMarkdown),
+    Markdown(ParsedMarkdown),
     Woff2(Vec<u8>),
     Unknown(String),
     Empty,
@@ -2470,7 +2596,7 @@ enum AssetDataRef<'a> {
     Png(&'a [u8]),
     Ico(&'a [u8]),
     Woff2(&'a [u8]),
-    MdParsed(&'a ParsedMarkdown),
+    Markdown(&'a ParsedMarkdown),
     Empty,
 }
 
@@ -2483,7 +2609,7 @@ impl AssetDataRef<'_> {
             AssetDataRef::Png(_) => "image/png",
             AssetDataRef::Ico(_) => "image/ico",
             AssetDataRef::Woff2(_) => "font/woff2",
-            AssetDataRef::MdParsed(_) => "text/html; charset=utf-8",
+            AssetDataRef::Markdown(_) => "text/html; charset=utf-8",
             AssetDataRef::Text(_) | AssetDataRef::MdRaw(_) | AssetDataRef::Unknown(_) => {
                 "text/plain; charset=utf-8"
             }
@@ -2499,40 +2625,36 @@ impl AssetDataRef<'_> {
             | AssetDataRef::Js(s)
             | AssetDataRef::MdRaw(s)
             | AssetDataRef::Unknown(s) => s.as_bytes(),
-            AssetDataRef::MdParsed(ParsedMarkdown { html: s, .. }) => s.as_bytes(),
+            AssetDataRef::Markdown(m) => m.as_bytes(),
             AssetDataRef::Empty => &[],
+        }
+    }
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            AssetDataRef::Png(_) | AssetDataRef::Ico(_) | AssetDataRef::Woff2(_) => None,
+            AssetDataRef::Text(s)
+            | AssetDataRef::Html(s)
+            | AssetDataRef::Css(s)
+            | AssetDataRef::Js(s)
+            | AssetDataRef::MdRaw(s)
+            | AssetDataRef::Unknown(s) => Some(s),
+            AssetDataRef::Markdown(m) => Some(m.as_str()),
+            AssetDataRef::Empty => None,
         }
     }
 }
 
 impl AssetData {
-    // fn len(&self) -> usize {
-    //     match self {
-    //         AssetData::Text(s)
-    //         | AssetData::Html(s)
-    //         | AssetData::Css(s)
-    //         | AssetData::Js(s)
-    //         | AssetData::MdRaw(s)
-    //         | AssetData::MdParsed(ParsedMarkdown { html: s, .. })
-    //         | AssetData::Unknown(s) => s.len(),
-    //         AssetData::Png(bytes) | AssetData::Ico(bytes) | AssetData::Woff2(bytes) => bytes.len(),
-    //         AssetData::Empty => 0,
-    //     }
-    // }
     fn read_asset(path: &Path) -> Result<AssetData, io::Error> {
         let content = match path.extension().and_then(|s| s.to_str()) {
             Some("png") => AssetData::Png(fs::read(path)?),
             Some("ico") => AssetData::Ico(fs::read(path)?),
-            Some("md") => {
-                let markdown = fs::read_to_string(path)?;
-                let parsed = MarkdownParser::parse(&markdown);
-                AssetData::MdParsed(parsed)
-            }
+            Some("md") => AssetData::Markdown(MarkdownParser::parse(&fs::read_to_string(path)?)),
             Some("html") => AssetData::Html(fs::read_to_string(path)?),
             Some("txt") => AssetData::Text(fs::read_to_string(path)?),
             Some("css") => AssetData::Css(fs::read_to_string(path)?),
             Some("js") => AssetData::Js(fs::read_to_string(path)?),
-            _ => AssetData::Unknown(fs::read_to_string(path)?),
+            _ => AssetData::Text(fs::read_to_string(path)?),
         };
         Ok(content)
     }
@@ -2545,8 +2667,7 @@ impl AssetData {
             AssetData::Js(js) => AssetDataRef::Js(js),
             AssetData::Png(bytes) => AssetDataRef::Png(bytes),
             AssetData::Ico(bytes) => AssetDataRef::Ico(bytes),
-            AssetData::MdRaw(markdown) => AssetDataRef::MdRaw(markdown),
-            AssetData::MdParsed(parsed_markdown) => AssetDataRef::MdParsed(parsed_markdown),
+            AssetData::Markdown(parsed_markdown) => AssetDataRef::Markdown(parsed_markdown),
             AssetData::Woff2(bytes) => AssetDataRef::Woff2(bytes),
             AssetData::Unknown(value) => AssetDataRef::Unknown(value),
             AssetData::Empty => AssetDataRef::Empty,
@@ -2561,10 +2682,8 @@ impl AssetData {
             AssetData::Png(_) => "image/png",
             AssetData::Ico(_) => "image/ico",
             AssetData::Woff2(_) => "font/woff2",
-            AssetData::MdParsed(_) => "text/html; charset=utf-8",
-            AssetData::Text(_) | AssetData::MdRaw(_) | AssetData::Unknown(_) => {
-                "text/plain; charset=utf-8"
-            }
+            AssetData::Markdown(_) => "text/html; charset=utf-8",
+            AssetData::Text(_) | AssetData::Unknown(_) => "text/plain; charset=utf-8",
             AssetData::Empty => "",
         }
     }
@@ -2577,7 +2696,6 @@ impl AssetData {
             AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).into_owned()),
             AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).into_owned()),
             AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).into_owned()),
-            AssetTyp::MdRaw => AssetData::MdRaw(String::from_utf8_lossy(buffer).into_owned()),
             AssetTyp::Text => AssetData::Text(String::from_utf8_lossy(buffer).into_owned()),
             AssetTyp::Unknown
                 if let s = String::from_utf8_lossy(buffer)
@@ -2585,7 +2703,7 @@ impl AssetData {
             {
                 AssetData::Unknown(s.into_owned())
             }
-            AssetTyp::MdParsed => todo!(),
+            AssetTyp::Md => todo!(),
             AssetTyp::Empty | AssetTyp::Unknown => AssetData::Empty,
         }
     }
@@ -2657,7 +2775,7 @@ impl<T> Trie<T> {
     }
 
     // gets everything from path downwards
-    fn get_partial(&self, path: &str) -> Vec<&T> {
+    fn get_partial(&self, path: &str) -> Vec<(String, &T)> {
         let mut current_node = &self.root;
 
         for key in path.split('/').filter(|part| !part.is_empty()) {
@@ -2668,14 +2786,19 @@ impl<T> Trie<T> {
         }
 
         let mut result = Vec::new();
-        let mut stack = vec![current_node];
 
-        while let Some(node) = stack.pop() {
+        let mut stack = vec![(path.trim_end_matches('/').to_owned(), current_node)];
+
+        while let Some((current_path, node)) = stack.pop() {
             if let Some(asset) = &node.asset {
-                result.push(asset);
+                result.push((current_path.clone(), asset));
             }
-            stack.extend(node.children.values());
+
+            for (name, child) in &node.children {
+                stack.push((format!("{current_path}/{name}"), child));
+            }
         }
+
         result
     }
     // TODO less dirty
@@ -3378,14 +3501,41 @@ impl TemplateParser<'_> {
 // Markdown parser
 
 #[derive(Clone, Debug)]
-struct ParsedMarkdown {
+enum ParsedMarkdown {
+    Post(MarkdownPost),
+    File(MarkdownFile),
+}
+
+impl ParsedMarkdown {
+    fn as_str(&self) -> &str {
+        match self {
+            ParsedMarkdown::Post(markdown_post) => &markdown_post.html,
+            ParsedMarkdown::File(markdown_file) => &markdown_file.html,
+        }
+    }
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            ParsedMarkdown::Post(markdown_post) => markdown_post.html.as_bytes(),
+            ParsedMarkdown::File(markdown_file) => markdown_file.html.as_bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MarkdownPost {
     html: String,
-    metadata: MarkdownMetadata,
+    metadata: PostMetadata,
     highlighted_langs: Vec<SyntaxHighlightLang>,
 }
 
 #[derive(Clone, Debug)]
-struct MarkdownMetadata {
+struct MarkdownFile {
+    html: String,
+    highlighted_langs: Vec<SyntaxHighlightLang>,
+}
+
+#[derive(Clone, Debug)]
+struct PostMetadata {
     title: String,
     slug: String,
     published: Result<SystemTime, &'static str>,
@@ -3394,8 +3544,8 @@ struct MarkdownMetadata {
     draft: bool,
 }
 
-impl MarkdownMetadata {
-    fn parse_metadata(input: &str) -> (Self, &str) {
+impl PostMetadata {
+    fn parse_metadata(input: &str) -> Option<(Self, &str)> {
         let mut cursor: usize = 0;
 
         let first_line_end = input[cursor..]
@@ -3404,10 +3554,9 @@ impl MarkdownMetadata {
 
         let first_line = &input[cursor..first_line_end];
 
-        assert!(
-            first_line.starts_with("::::"),
-            "markdown must have metadata"
-        );
+        if !first_line.starts_with("::::") {
+            return None;
+        }
 
         cursor = if first_line_end < input.len() {
             first_line_end + 1
@@ -3435,21 +3584,18 @@ impl MarkdownMetadata {
             }
             metadata_lines.push(line);
             if line_end == input.len() {
-                return (
-                    MarkdownMetadata::parse_metadata_content(metadata_lines),
-                    input,
-                );
+                return Some((PostMetadata::parse_metadata_content(metadata_lines), input));
             }
 
             cursor = line_end + 1;
         }
-        (
-            MarkdownMetadata::parse_metadata_content(metadata_lines),
+        Some((
+            PostMetadata::parse_metadata_content(metadata_lines),
             &input[cursor..],
-        )
+        ))
     }
 
-    fn parse_metadata_content(lines: Vec<&str>) -> MarkdownMetadata {
+    fn parse_metadata_content(lines: Vec<&str>) -> PostMetadata {
         let mut title: Option<String> = None;
         let mut slug: Option<String> = None;
         let mut published: Option<Result<SystemTime, &'static str>> = None;
@@ -3485,7 +3631,7 @@ impl MarkdownMetadata {
         }
 
         let title_str = title.unwrap_or("untitled".to_owned());
-        MarkdownMetadata {
+        PostMetadata {
             slug: slug.unwrap_or(title_str.replace(' ', "-").to_lowercase()),
             title: title_str,
             published: published.unwrap_or(Err("no publish date specified")),
@@ -3812,18 +3958,29 @@ struct MarkdownParser {}
 
 impl MarkdownParser {
     fn parse(input: &str) -> ParsedMarkdown {
-        let (metadata, markdown_input) = MarkdownMetadata::parse_metadata(input);
+        let (metadata, markdown_input) = PostMetadata::parse_metadata(input)
+            .map_or((None, input), |(metadata, markdown_input)| {
+                (Some(metadata), markdown_input)
+            });
 
         let lex = Self::lex(markdown_input);
 
-        let blocks: Vec<MarkdownBlock<'_>> = Self::parse_blocks(&lex, markdown_input);
+        let blocks = Self::parse_blocks(&lex, markdown_input);
         let ast = Self::parse_block_content(&blocks, markdown_input);
         let highlighted_langs = Self::get_highlighted_langs(&blocks);
         let html = Self::to_html(ast);
-        ParsedMarkdown {
-            html,
-            metadata,
-            highlighted_langs,
+
+        if let Some(metadata) = metadata {
+            ParsedMarkdown::Post(MarkdownPost {
+                html,
+                metadata,
+                highlighted_langs,
+            })
+        } else {
+            ParsedMarkdown::File(MarkdownFile {
+                html,
+                highlighted_langs,
+            })
         }
     }
 

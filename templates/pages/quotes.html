@@ -1,7 +1,59 @@
 {{extends "layout.html"}}
 
-{{block body}}
+{{block css}}
+<style>
+  .quote_quote {
+    background-color: #282828;
+    margin: 0px;    
+    padding: 10px;
+    /* border: 1px solid white; */
+    font-size: 16px;
+  }  
+  .quote_container {
+    color: white;
+    margin-bottom: 15px;
+  }  
+  .quote_container_container {
+    margin-top: 10px;
+  }  
+  
+  .quote_author {
+    font-size: 15px;
+    text-align: right;
+    padding-top: 5px;
+    font-style: italic;
+  }  
+  .quotes_top_level {
+    font-size: 15px;
+    margin-top: 10px;
+    /* margin-bottom: 10px; */
+    padding-bottom: 10px;
+  }  
 
-quotes
+</style>
+{{endBlock}}
+
+{{block body}}
+    <div class ="quotes_top_level">
+      Quotes I like in no particulair order
+
+    </div>
+    <hr>    
+
+  <div class="quote_container_container">
+    {{for quote in quotes}}
+      <div class="quote_container">
+        <div class="quote_quote">
+          "{{quote.quote}}"
+        </div>
+
+        <div class="quote_author">
+          ~ {{quote.author}}{{if quote.description }},{{endIf}} {{quote.description}}
+        </div>
+      </div>
+    {{endFor}}
+  </div>
+    
+
 
 {{endBlock}}
