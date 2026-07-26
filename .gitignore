@@ -2,6 +2,5 @@
 .direnv/
 result/ 
 target/
-state/
-node_modules
 Cargo.lock
+profile.json.gz

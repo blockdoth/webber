@@ -11,21 +11,20 @@
 // #![allow(clippy::cast_possible_wrap)]
 // #![allow(clippy::enum_glob_use)]
 
-use std::alloc::{Allocator, Global, GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
-use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt::Write as FmtWrite;
 use std::fmt::{Debug, Display};
-use std::hash::Hash;
-use std::io::{self, ErrorKind, IoSlice, Read, Write};
+use std::hash::BuildHasher;
+use std::io::{self, ErrorKind, Read, Write};
 use std::iter::{Peekable, zip};
-use std::mem::MaybeUninit;
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf, StripPrefixError};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::slice;
@@ -72,7 +71,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         comptime()
     } else {
         // println!("Running normally");
-        #[cfg(generated)] // Marks everything deadcode during build time
+        // #[cfg(generated)] // Marks everything deadcode during build time
         runtime()?;
 
         Ok(())
@@ -307,24 +306,18 @@ impl Context {
             .to_rfc1123();
 
         context.update_posts(content);
-        context.insert_global("copyright_start", TemplateValue::Text("2026".to_string()));
-        context.insert_global("copyright_end", TemplateValue::Text("2026".to_string())); // TODO make dynamic
-        context.insert_global("domain", TemplateValue::Text(DOMAIN.to_string())); // TODO make dynamic
-        context.insert_global("last_build_date", TemplateValue::Text(last_build_date)); // TODO make dynamic
+        context.insert_global("copyright_start", "2026".to_string());
+        context.insert_global("copyright_end", "2026".to_string()); // TODO make dynamic
+        context.insert_global("domain", DOMAIN.to_string()); // TODO make dynamic
+        context.insert_global("last_build_date", last_build_date); // TODO make dynamic
 
         #[cfg(generated)]
         {
-            context.insert_global(
-                "git_hash_short",
-                TemplateValue::Text(GIT_HASH_SHORT.to_string()),
-            );
-            context.insert_global(
-                "git_hash_long",
-                TemplateValue::Text(GIT_HASH_LONG.to_string()),
-            );
+            context.insert_global("git_hash_short", GIT_HASH_SHORT.to_string());
+            context.insert_global("git_hash_long", GIT_HASH_LONG.to_string());
         }
 
-        context.insert_global("hotreload", cfg!(debug_assertions).to_template_value());
+        context.insert_global("hotreload", cfg!(debug_assertions));
 
         context
     }
@@ -369,6 +362,7 @@ impl HttpServer {
 
     fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), Box<dyn Error>> {
         let mut read_buffer: [u8; 8192] = [0; 8192]; // 8kb buffer,
+        let mut template_cache: HashMap<String, String> = HashMap::new();
 
         #[cfg(debug_assertions)]
         let mut check_alive_timer = Instant::now();
@@ -417,7 +411,10 @@ impl HttpServer {
                                 continue 'main;
                             }
                             Ok(n) => break n,
-                            _ => {}
+                            Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
+                                std::hint::spin_loop();
+                            }
+                            Err(error) => return Err(error.into()),
                         };
                     };
 
@@ -431,21 +428,19 @@ impl HttpServer {
                         }
                     };
                     // println!("Allocs request parsing {alloc}\t{}", header.path);
-
+                    // println!("{:?}", header.path);
                     let mut is_ws = false;
-
                     match header.path {
                         #[cfg(debug_assertions)]
                         "/ws" => {
                             // print!("[{peer_addr:?}] Upgrading websocket ... ");
                             self.upgrade_websocket(header, &mut stream)?;
-
                             is_ws = true;
                         }
                         path => {
                             if path.starts_with("/api") {
                                 match router.serve_api(&header, body) {
-                                    Ok(content) => Self::build_response(
+                                    Ok(content) => Self::send_response(
                                         HttpResponseCode::Ok,
                                         content.as_ref(),
                                         &mut self.response_buffer,
@@ -458,15 +453,20 @@ impl HttpServer {
                             } else if let Some(asset) = router.content.assets.get_ref(header.path)
                                 && !asset.internal
                             {
-                                Self::build_response(
+                                Self::send_response(
                                     HttpResponseCode::Ok,
                                     asset.data.as_ref(),
                                     &mut self.response_buffer,
                                     &mut stream,
                                 )
                             } else {
-                                match router.serve_page(&header, body, &mut self.render_buffer) {
-                                    Ok(content) => Self::build_response(
+                                match router.serve_page(
+                                    &header,
+                                    body,
+                                    &mut self.render_buffer,
+                                    &mut template_cache,
+                                ) {
+                                    Ok(content) => Self::send_response(
                                         HttpResponseCode::Ok,
                                         content,
                                         &mut self.response_buffer,
@@ -476,7 +476,7 @@ impl HttpServer {
                                         self.build_error_response(&router, err, &mut stream)
                                     }
                                 }
-                            };
+                            }?;
 
                             let end_timer = Instant::now();
                             let duration = end_timer - start_timer;
@@ -499,6 +499,7 @@ impl HttpServer {
                 let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
                     check_fs_timer = Instant::now();
 
+                    template_cache.clear();
                     router.content.check_update(&mut router.context)?
                 } else {
                     false
@@ -527,6 +528,7 @@ impl HttpServer {
                     });
                 }
             }
+            std::hint::spin_loop();
         }
 
         // Exit routine
@@ -550,17 +552,19 @@ impl HttpServer {
                 sec_websocket_key.trim()
             )));
 
+            self.response_buffer.clear();
             write!(self.response_buffer,
                 "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {websocket_accept}\r\n\r\n"
             ).expect("writing in a Vec<u8> can not fail");
+            stream.write_all(&self.response_buffer)?;
         } else {
             println!("Failed");
-            Self::build_response(
+            Self::send_response(
                 HttpResponseCode::BadRequest,
                 AssetDataRef::Text("Invalid websocket upgrade request"),
                 &mut self.response_buffer,
                 stream,
-            );
+            )?;
         }
         Ok(())
     }
@@ -593,7 +597,7 @@ impl HttpServer {
         }
     }
 
-    fn build_response<'a>(
+    fn send_response<'a>(
         code: HttpResponseCode,
         content: AssetDataRef<'a>,
         response_buffer: &'a mut Vec<u8>,
@@ -634,7 +638,7 @@ impl HttpServer {
         stream: &mut TcpStream,
     ) -> Result<(), HttpServerError> {
         match err {
-            HttpServerError::Redirect(redirect_path) => Self::build_response(
+            HttpServerError::Redirect(redirect_path) => Self::send_response(
                 HttpResponseCode::Redirect(&redirect_path),
                 AssetDataRef::Empty,
                 &mut self.response_buffer,
@@ -649,7 +653,7 @@ impl HttpServer {
                     .and_then(|result| result.as_ref().ok());
                 let err_str = err.render_error(error_template, &mut self.render_buffer);
 
-                Self::build_response(
+                Self::send_response(
                     HttpResponseCode::Ok,
                     AssetDataRef::Html(&err_str),
                     &mut self.response_buffer,
@@ -660,7 +664,7 @@ impl HttpServer {
             err => {
                 println!("Server error {err:#?}");
 
-                Self::build_response(
+                Self::send_response(
                     HttpResponseCode::InternalServer,
                     AssetDataRef::Empty,
                     &mut self.response_buffer,
@@ -878,15 +882,12 @@ impl Router {
 
     fn add_to_static_pages(context: &mut Context, obj: TemplateValue) {
         if let Some(pages) = context.lookup_mut("pages-static") {
-            if let TemplateValue::List(list) = pages {
-                list.push(obj);
-            } else {
-                panic!("overwrote \"pages-static\" with something")
+            match pages {
+                TemplateValue::List(list) => list.push(obj),
+                _ => panic!("\"pages-static\" overwrote by wrong type"),
             }
         } else {
-            let page_list = TemplateValue::List(vec![obj]);
-
-            context.insert_global("pages-static", page_list);
+            context.insert_global("pages-static", vec![obj]);
         }
     }
 
@@ -895,12 +896,13 @@ impl Router {
         self.static_routes.insert(path.into(), route.clone());
         let name = path.split('/').next_back().expect("valid path");
 
-        let obj = TemplateValue::Object(hash_map! {
-          "url".to_string() => TemplateValue::Text(path.to_string()),
-          "hidden".to_string() => TemplateValue::Bool(route.hidden),
-          "name".to_string() => TemplateValue::Text(name.to_string()),
-        });
-        Self::add_to_static_pages(&mut self.context, obj);
+        let obj = hash_map! {
+          "url".to_string() => path.to_string().to_template_value(),
+          "hidden".to_string() => route.hidden.to_template_value(),
+          "name".to_string() => name.to_string().to_template_value(),
+        };
+
+        Self::add_to_static_pages(&mut self.context, obj.to_template_value());
 
         self
     }
@@ -994,6 +996,7 @@ impl Router {
         header: &HttpRequestHeader,
         _body: AssetData,
         render_buffer: &'a mut String,
+        template_cache: &'a mut HashMap<String, String>,
     ) -> Result<AssetDataRef<'a>, HttpServerError> {
         match self.static_routes.get(header.path) {
             Some(route) if header.path == "/stats" => {
@@ -1014,21 +1017,23 @@ impl Router {
                 Ok(AssetDataRef::Html(page))
             }
             Some(route) if header.path == "/rss" => {
-                let page = Self::render_template(
+                let page = Self::render_template_cacheable(
                     &self.content.templates,
                     &self.context,
                     &route.path,
                     render_buffer,
+                    template_cache,
                 )?;
 
                 Ok(AssetDataRef::Text(page))
             }
             Some(route) => {
-                let page = Self::render_template(
+                let page = Self::render_template_cacheable(
                     &self.content.templates,
                     &self.context,
                     &route.path,
                     render_buffer,
+                    template_cache,
                 )?;
                 Ok(AssetDataRef::Html(page))
             }
@@ -1050,11 +1055,12 @@ impl Router {
                         page_context_var,
                     );
 
-                    let page = Self::render_template(
+                    let page = Self::render_template_cacheable(
                         &self.content.templates,
                         &local_context,
                         &dyn_route.template_path,
                         render_buffer,
+                        template_cache,
                     )?;
 
                     Ok(AssetDataRef::Html(page))
@@ -1070,6 +1076,26 @@ impl Router {
         }
     }
 
+    fn render_template_cacheable<'a>(
+        templates: &HashMap<String, Result<Template, TemplateError>>,
+        context: &dyn TemplateContext,
+        path: &str,
+        render_buffer: &mut String,
+        path_cache: &'a mut HashMap<String, String>,
+    ) -> Result<&'a str, TemplateError> {
+        if !path_cache.contains_key(path) {
+            let rendered = Self::render_template(templates, context, path, render_buffer)?;
+
+            path_cache.insert(path.to_owned(), rendered.to_owned());
+        }
+
+        let (_, rendered) = path_cache
+            .get_key_value(path)
+            .expect("value was just cached");
+
+        Ok(rendered)
+    }
+
     fn render_template<'a>(
         templates: &HashMap<String, Result<Template, TemplateError>>,
         context: &dyn TemplateContext,
@@ -1079,7 +1105,7 @@ impl Router {
         //TODO unfuck
         let mut slug = path.strip_suffix(".html").unwrap_or(path);
         slug = slug.strip_prefix("pages").unwrap_or(slug);
-        let url = &slug.to_template_value();
+        let url = &slug.to_string().to_template_value();
 
         let context = LocalContext::new(context, "current_page_url", url);
 
@@ -1127,7 +1153,6 @@ struct Template {
     template: Vec<TemplateNode>,
     parent: Option<String>,
     blocks: HashMap<String, Vec<TemplateNode>>,
-    required_variables: Vec<Vec<String>>,
     origin_file: String,
     last_modified: SystemTime,
     input: String,
@@ -1176,6 +1201,7 @@ impl Template {
         render_buffer: &'a mut String,
     ) -> Result<&'a str, TemplateError> {
         render_buffer.clear();
+
         Self::render_helper(&parent.template, context, &self.blocks, render_buffer).map_err(
             |e| match &e.pos {
                 Some(pos) => {
@@ -1199,19 +1225,19 @@ impl Template {
         blocks: &HashMap<String, Vec<TemplateNode>>,
         out: &mut String,
     ) -> Result<(), TemplateError> {
-        use TemplateNodeData::*;
+        use TemplateValue::*;
         for node in template {
             match &node.data {
-                Text(text) => out.push_str(text),
-                Variable(ident_fields) => {
+                TemplateNodeData::Text(text) => out.push_str(text),
+                TemplateNodeData::Variable(ident_fields) => {
                     match Self::resolve_var(ident_fields, context, &node.pos)? {
-                        TemplateValue::Text(text) => out.push_str(text),
-                        TemplateValue::Bool(bool_val) => write!(out, "{bool_val}")?,
-                        TemplateValue::List(list) => write!(out, "{list:?}")?,
-                        TemplateValue::Object(object) => write!(out, "{object:?}")?,
+                        Text(text) => out.push_str(text),
+                        Bool(bool_val) => write!(out, "{bool_val}")?,
+                        List(list) => write!(out, "{list:?}")?,
+                        Object(object) => write!(out, "{object:?}")?,
                     }
                 }
-                If {
+                TemplateNodeData::If {
                     condition,
                     then_branch,
                     else_branch,
@@ -1224,9 +1250,7 @@ impl Template {
                             let var_2 = Self::resolve_var(var_2, context, &node.pos)?;
 
                             match (var_1, var_2) {
-                                (TemplateValue::Text(text_1), TemplateValue::Text(text_2)) => {
-                                    text_1 == text_2
-                                }
+                                (Text(text_1), Text(text_2)) => text_1 == text_2,
                                 _ => {
                                     return Err(TemplateError::new(
                                         TemplateErrorMsg::CantCompareTemplateValues(
@@ -1241,7 +1265,7 @@ impl Template {
                         ConditionExpr::LiteralComp(var, literal) => {
                             let var = Self::resolve_var(var, context, &node.pos)?;
                             match var {
-                                TemplateValue::Text(var_text) => var_text == literal,
+                                Text(var_text) => var_text == literal,
                                 _ => {
                                     return Err(TemplateError::new(
                                         TemplateErrorMsg::CantCompareWithLiteral(var.kind()),
@@ -1258,15 +1282,13 @@ impl Template {
                         Self::render_helper(else_branch, context, blocks, out)?
                     };
                 }
-                For {
+                TemplateNodeData::For {
                     iter_bind,
                     iter_src,
                     body,
                 } => {
                     // Todo remove clone
-                    if let TemplateValue::List(iter) =
-                        Self::resolve_var(iter_src, context, &node.pos)?
-                    {
+                    if let List(iter) = Self::resolve_var(iter_src, context, &node.pos)? {
                         for it in iter {
                             let child_context = LocalContext::new(context, iter_bind, it);
 
@@ -1282,7 +1304,7 @@ impl Template {
                         ));
                     }
                 }
-                Block { ident, body } => {
+                TemplateNodeData::Block { ident, body } => {
                     if let Some(override_body) = blocks.get(ident) {
                         Self::render_helper(override_body, context, blocks, out)?;
                     } else {
@@ -1364,9 +1386,10 @@ impl Template {
         context: &dyn TemplateContext,
         node: &TemplateNode,
     ) -> Result<bool, TemplateError> {
+        use TemplateValue::*;
         match Self::resolve_var(condition, context, &node.pos)? {
-            TemplateValue::Bool(cond) => Ok(*cond),
-            TemplateValue::List(template_values) => Ok(!template_values.is_empty()),
+            Bool(cond) => Ok(*cond),
+            List(template_values) => Ok(!template_values.is_empty()),
             _ => Err(TemplateError::new(
                 TemplateErrorMsg::VariableNotOfExpectedType(
                     condition.concat(),
@@ -1419,13 +1442,13 @@ impl TemplateValue {
     }
 }
 
-trait ToTemplateValue {
+trait ToTemplateValue: Sized {
     fn to_template_value(self) -> TemplateValue;
 }
 
-impl ToTemplateValue for &str {
+impl ToTemplateValue for TemplateValue {
     fn to_template_value(self) -> TemplateValue {
-        TemplateValue::Text((*self).to_string())
+        self
     }
 }
 
@@ -1452,6 +1475,21 @@ impl<T: ToTemplateValue> ToTemplateValue for Vec<T> {
         TemplateValue::List(
             self.into_iter()
                 .map(ToTemplateValue::to_template_value)
+                .collect(),
+        )
+    }
+}
+
+impl<K, V, S> ToTemplateValue for HashMap<K, V, S>
+where
+    K: Into<String>,
+    V: ToTemplateValue,
+    S: BuildHasher,
+{
+    fn to_template_value(self) -> TemplateValue {
+        TemplateValue::Object(
+            self.into_iter()
+                .map(|(key, value)| (key.into(), value.to_template_value()))
                 .collect(),
         )
     }
@@ -1501,7 +1539,6 @@ impl ToTemplateValue for SyntaxHighlightLang {
 impl ToTemplateValue for AssetData {
     fn to_template_value(self) -> TemplateValue {
         use AssetData::*;
-        use TemplateValue::*;
         match self {
             Png(_) | Ico(_) | Woff2(_) => {
                 todo!("Cant isnert binary assets into context yet")
@@ -1867,10 +1904,10 @@ impl TemplateError {
         if let Some(error_template) = error_template {
             let mut context = Context::new();
 
-            context.insert_global("hotreload", cfg!(debug_assertions).to_template_value());
-            context.insert_global("file", file_info.to_template_value());
-            context.insert_global("code_snippet", code_snippet.to_template_value());
-            context.insert_global("error_msg", self.typ.to_string().to_template_value());
+            context.insert_global("hotreload", cfg!(debug_assertions));
+            context.insert_global("file", file_info);
+            context.insert_global("code_snippet", code_snippet);
+            context.insert_global("error_msg", self.typ.to_string());
             Cow::Borrowed(
                 error_template
                     .render(&context, render_buffer)
@@ -2153,8 +2190,9 @@ impl Context {
         }
     }
 
-    fn insert_global(&mut self, key: &str, value: TemplateValue) {
-        self.global_context.insert(key.to_owned(), value);
+    fn insert_global(&mut self, key: impl Into<String>, value: impl ToTemplateValue) {
+        self.global_context
+            .insert(key.into(), value.to_template_value());
     }
 
     fn lookup_mut(&mut self, key: &str) -> Option<&mut TemplateValue> {
@@ -2405,22 +2443,6 @@ enum AssetTyp {
     Woff2,
     Unknown,
     Empty,
-}
-
-impl AssetTyp {
-    fn typ(&self) -> &str {
-        match self {
-            AssetTyp::Html => "text/html; charset=utf-8",
-            AssetTyp::Css => "text/css",
-            AssetTyp::Js => "text/javascript",
-            AssetTyp::Png => "image/png",
-            AssetTyp::Ico => "image/ico",
-            AssetTyp::Woff2 => "font/woff2",
-            AssetTyp::MdParsed => "text/html; charset=utf-8",
-            AssetTyp::Text | AssetTyp::MdRaw | AssetTyp::Unknown => "text/plain; charset=utf-8",
-            AssetTyp::Empty => "",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2800,7 +2822,6 @@ impl<'a> TemplateLexer<'a> {
             input: lexer.input,
             newlines: lexer.newlines,
             blocks: HashMap::new(),
-            required_variables: vec![],
             tokens,
             cursor: 0,
         }
@@ -2938,7 +2959,6 @@ struct TemplateParser<'a> {
     input: &'a str,
     newlines: Vec<usize>,
     blocks: HashMap<String, Vec<TemplateNode>>,
-    required_variables: Vec<Vec<String>>,
     tokens: Vec<TemplateToken>,
     cursor: usize,
 }
@@ -2953,7 +2973,6 @@ impl TemplateParser<'_> {
             template,
             parent,
             blocks: parser.blocks,
-            required_variables: parser.required_variables,
             origin_file: file_path.to_string(),
             last_modified: SystemTime::now(),
             input: input.to_owned(),
@@ -3244,7 +3263,6 @@ impl TemplateParser<'_> {
             if let Some(Dot(_)) = self.tokens.get(self.cursor) {
                 self.consume(TemplateTokenTyp::Dot)?;
             } else {
-                self.required_variables.push(ident.clone());
                 return Ok(TemplateNode {
                     data: TemplateNodeData::Variable(ident),
                     pos: self.span_to_position(&Span::from_double(start_span, end_span)),
@@ -4968,9 +4986,9 @@ impl Connection {
         }
     }
 
-    fn insert_rows(&self, sql: &str, multi_binds: Vec<Vec<Bind>>) -> Result<(), Box<dyn Error>> {
-        self.transaction(|| self.insert_rows_unchecked(sql, multi_binds))
-    }
+    // fn insert_rows(&self, sql: &str, multi_binds: Vec<Vec<Bind>>) -> Result<(), Box<dyn Error>> {
+    //     self.transaction(|| self.insert_rows_unchecked(sql, multi_binds))
+    // }
 
     fn insert_rows_unchecked(
         &self,
@@ -5382,11 +5400,6 @@ impl Db {
         Ok(())
     }
 
-    fn page_to_id(&self, page_url: &str) -> usize {
-        // self.page_pool.contin
-        todo!()
-    }
-
     fn save_page_hit(&mut self, page_url: &str, loadtime: Duration) -> Result<(), Box<dyn Error>> {
         let timestamp = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -5420,7 +5433,7 @@ impl Db {
 
     // TODO wrap both inserts into transaction
     fn sync_metric_cache(&mut self) -> Result<(), Box<dyn Error>> {
-        let start = Instant::now();
+        // let start = Instant::now();
         let conn = &self.connection;
 
         let aggregates: Vec<(&str, i64, i64)> = self
@@ -5479,7 +5492,7 @@ impl Db {
             .for_each(|(_, hits)| hits.clear());
 
         self.unsynced = true;
-        let duration = start.elapsed();
+        // let duration = start.elapsed();
         // println!("Synced {} entries in metric cache in {duration:?}",self.current_cache_count );
         self.current_cache_count = 0;
 
