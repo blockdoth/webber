@@ -17,12 +17,13 @@ use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
 use std::fmt::Write as FmtWrite;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
-use std::io::{self, IoSlice, Read, Write};
+use std::io::{self, ErrorKind, IoSlice, Read, Write};
 use std::iter::{Peekable, zip};
+use std::mem::MaybeUninit;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf, StripPrefixError};
 use std::process::Command;
@@ -42,18 +43,17 @@ const DEBUG_BIN_PATH: &str = "./target/debug/webber";
 const RELEASE_BIN_PATH: &str = "./target/release/webber";
 const METRICS_CACHE_SIZE: usize = 1000;
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
-const SIG_ERR: usize = usize::MAX;
+const SIG_ERR: c_int = -1;
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_signal(_: c_int) {
     SHUTDOWN.store(true, Ordering::Relaxed);
 }
-
 unsafe extern "C" {
-    fn signal(signal: c_int, handler: extern "C" fn(c_int)) -> usize;
+    fn signal(signal: c_int, handler: extern "C" fn(c_int)) -> c_int;
 }
 
 fn register_signal_handlers() {
@@ -353,6 +353,8 @@ enum HttpRequestType {
 struct HttpServer {
     response_buffer: Vec<u8>,
     render_buffer: String,
+    #[cfg(debug_assertions)]
+    active_streams: Vec<TcpStream>,
 }
 
 impl HttpServer {
@@ -360,7 +362,177 @@ impl HttpServer {
         Self {
             response_buffer: Vec::with_capacity(64 * 1024),
             render_buffer: String::with_capacity(64 * 1024),
+            #[cfg(debug_assertions)]
+            active_streams: vec![],
         }
+    }
+
+    fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), Box<dyn Error>> {
+        let mut read_buffer: [u8; 8192] = [0; 8192]; // 8kb buffer,
+
+        #[cfg(debug_assertions)]
+        let mut check_alive_timer = Instant::now();
+        #[cfg(debug_assertions)]
+        let mut check_fs_timer = Instant::now();
+
+        let mut check_db_sync_timer = Instant::now();
+
+        println!("Static Routes:");
+        for (route, page) in &router.static_routes {
+            println!(" {route}\t\t->\t{}", page.path);
+        }
+        println!("Dynamic Routes:");
+        for (route, page) in &router.dynamic_routes {
+            println!(" {route}\t\t->\t{}", page.template_path);
+        }
+        println!("Assets");
+        for (route, asset) in &router.content.assets.collect_kv_mut() {
+            println!(" {route:?}\t\t->\t{}", asset.data.typ());
+        }
+
+        println!(" Fallback\t->\t{:?}", router.fallback);
+
+        listener
+            .set_nonblocking(true)
+            .expect("Unable to set socket to nonblocking mode");
+
+        'main: while !SHUTDOWN.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if check_db_sync_timer.elapsed() > Duration::from_secs(60) {
+                        router.db.sync()?;
+                        check_db_sync_timer = Instant::now();
+                    }
+                }
+                Err(e) => return Err(e.into()),
+                Ok((mut stream, peer_addr)) => {
+                    stream
+                        .set_nonblocking(true)
+                        .expect("Failed to change blocking of stream");
+
+                    let n = loop {
+                        match stream.read(&mut read_buffer) {
+                            Ok(0) => {
+                                println!("[{peer_addr}] Disconnected");
+                                continue 'main;
+                            }
+                            Ok(n) => break n,
+                            _ => {}
+                        };
+                    };
+
+                    let start_timer = Instant::now();
+
+                    let (header, body) = match HttpServer::parse_request(&read_buffer[..n]) {
+                        Ok(request) => request,
+                        Err(err) => {
+                            eprintln!("Failed to parse request: {err}");
+                            continue;
+                        }
+                    };
+                    // println!("Allocs request parsing {alloc}\t{}", header.path);
+
+                    let mut is_ws = false;
+
+                    match header.path {
+                        #[cfg(debug_assertions)]
+                        "/ws" => {
+                            // print!("[{peer_addr:?}] Upgrading websocket ... ");
+                            self.upgrade_websocket(header, &mut stream)?;
+
+                            is_ws = true;
+                        }
+                        path => {
+                            if path.starts_with("/api") {
+                                match router.serve_api(&header, body) {
+                                    Ok(content) => Self::build_response(
+                                        HttpResponseCode::Ok,
+                                        content.as_ref(),
+                                        &mut self.response_buffer,
+                                        &mut stream,
+                                    ),
+                                    Err(err) => {
+                                        self.build_error_response(&router, err, &mut stream)
+                                    }
+                                }
+                            } else if let Some(asset) = router.content.assets.get_ref(header.path)
+                                && !asset.internal
+                            {
+                                Self::build_response(
+                                    HttpResponseCode::Ok,
+                                    asset.data.as_ref(),
+                                    &mut self.response_buffer,
+                                    &mut stream,
+                                )
+                            } else {
+                                match router.serve_page(&header, body, &mut self.render_buffer) {
+                                    Ok(content) => Self::build_response(
+                                        HttpResponseCode::Ok,
+                                        content,
+                                        &mut self.response_buffer,
+                                        &mut stream,
+                                    ),
+                                    Err(err) => {
+                                        self.build_error_response(&router, err, &mut stream)
+                                    }
+                                }
+                            };
+
+                            let end_timer = Instant::now();
+                            let duration = end_timer - start_timer;
+
+                            router.db.save_page_hit(path, duration).expect("in measure");
+                        }
+                    };
+
+                    #[cfg(debug_assertions)]
+                    {
+                        if is_ws {
+                            self.active_streams.push(stream);
+                        }
+                    }
+                }
+            };
+
+            #[cfg(debug_assertions)]
+            {
+                let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
+                    check_fs_timer = Instant::now();
+
+                    router.content.check_update(&mut router.context)?
+                } else {
+                    false
+                };
+
+                if reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
+                    check_alive_timer = Instant::now();
+                    self.active_streams.retain(|mut stream| {
+                        let connection_is_alive = match stream.read(&mut [0]) {
+                            Ok(0) => false,
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
+                            _ => false,
+                        };
+
+                        if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
+                            if reload {
+                                let _ = HttpServer::send_ws_message(stream, "reload");
+                                println!("[{peer_addr:?}] Reloaded");
+                            }
+                            true
+                        } else {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+
+                            false
+                        }
+                    });
+                }
+            }
+        }
+
+        // Exit routine
+
+        router.db.sync()?;
+        Ok(())
     }
 
     fn upgrade_websocket(
@@ -407,11 +579,10 @@ impl HttpServer {
         buffer: &'a [u8],
     ) -> Result<(HttpRequestHeader<'a>, AssetData), HttpServerError> {
         if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-
             let header_str = str::from_utf8(&buffer[..pos])
                 .map_err(|_| HttpServerError::MalformedRequest)
                 .expect("fix after 0 alloc");
-            
+
             let header = Self::parse_header(header_str).expect("Unable to parse header");
 
             let content = AssetData::from_asset_type(&buffer[pos + 4..], &header.content_typ);
@@ -449,7 +620,7 @@ impl HttpServer {
             body.len(),
         )
         .expect("writing to Vec<u8> cannot fail");
-      
+
         response_buffer.extend_from_slice(body);
         stream.write_all(response_buffer)?;
 
@@ -525,18 +696,15 @@ impl HttpServer {
         let mut content_typ = AssetTyp::Unknown;
 
         for line in lines {
-            if let Some((key, value)) = line.split_once(':') {
-                if key.eq_ignore_ascii_case("origin") {
-                    origin = Some(value);
-                } else if key.eq_ignore_ascii_case("sec-websocket-key") {
-                    sec_websocket_key = Some(value);
-                } else if key.eq_ignore_ascii_case("sec-websocket-version") {
-                    sec_websocket_version = Some(value);
-                } else if key.eq_ignore_ascii_case("user-agent") {
-                    user_agent = Some(value);
-                } else if key.eq_ignore_ascii_case("upgrade") {
-                    upgrade = Some(value);
-                } else if key.eq_ignore_ascii_case("content-type") {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+
+            let value = value.trim_ascii_start();
+            match key {
+                k if k.eq_ignore_ascii_case("origin") => origin = Some(value),
+                k if k.eq_ignore_ascii_case("user-agent") => user_agent = Some(value),
+                k if k.eq_ignore_ascii_case("content-type") => {
                     content_typ = match value {
                         "text/plain" => AssetTyp::Text,
                         "text/html" => AssetTyp::Html,
@@ -544,8 +712,19 @@ impl HttpServer {
                         "text/javascript" => AssetTyp::Js,
                         "image/png" => AssetTyp::Png,
                         _ => AssetTyp::Unknown,
-                    };
+                    }
                 }
+
+                #[cfg(debug_assertions)]
+                k if k.eq_ignore_ascii_case("sec-websocket-key") => sec_websocket_key = Some(value),
+                #[cfg(debug_assertions)]
+                k if k.eq_ignore_ascii_case("sec-websocket-version") => {
+                    sec_websocket_version = Some(value)
+                }
+                #[cfg(debug_assertions)]
+                k if k.eq_ignore_ascii_case("upgrade") => upgrade = Some(value),
+
+                _ => {}
             }
         }
 
@@ -569,174 +748,6 @@ impl HttpServer {
             .unwrap_or(path.len());
 
         &path[..end]
-    }
-
-    fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), Box<dyn Error>> {
-        let mut buffer: [u8; 8192] = [0; 8192]; // 8kb buffer
-
-        #[cfg(debug_assertions)]
-        let mut active_streams: Vec<TcpStream> = vec![];
-
-        let mut check_alive_timer = Instant::now();
-        let mut check_fs_timer = Instant::now();
-        let mut check_db_sync_timer = Instant::now();
-
-        println!("Static Routes:");
-        for (route, page) in &router.static_routes {
-            println!(" {route}\t\t->\t{}", page.path);
-        }
-        println!("Dynamic Routes:");
-        for (route, page) in &router.dynamic_routes {
-            println!(" {route}\t\t->\t{}", page.template_path);
-        }
-        println!("Assets");
-        for (route, asset) in &router.content.assets.collect_kv_mut() {
-            println!(" {route:?}\t\t->\t{}", asset.data.typ());
-        }
-
-        println!(" Fallback\t->\t{:?}", router.fallback);
-
-        listener
-            .set_nonblocking(true)
-            .expect("Unable to set socket to nonblocking mode");
-
-
-        'main: while !SHUTDOWN.load(Ordering::Relaxed) {
-
-            if let Ok((mut stream, peer_addr)) = listener.accept() {
-                stream
-                    .set_nonblocking(true)
-                    .expect("Failed to change blocking of stream");
-
-                let n = loop {
-                    match stream.read(&mut buffer) {
-                        Ok(0) => {
-                            println!("[{peer_addr}] Disconnected");
-                            continue 'main;
-                        }
-                        Ok(n) => break n,
-                        _ => {}
-                    };
-                };
-
-                let start_timer = Instant::now();
-
-
-                let (header, body) = match HttpServer::parse_request(&buffer[..n]) {
-                    Ok(request) => request,
-                    Err(err) => {
-                        eprintln!("Failed to parse request: {err}");
-                        continue;
-                    }
-                };
-                // println!("Allocs request parsing {alloc}\t{}", header.path);
-
-                let mut is_ws = false;
-
-                match header.path {
-                    #[cfg(debug_assertions)]
-                    "/ws" => {
-                        // print!("[{peer_addr:?}] Upgrading websocket ... ");
-                        self.upgrade_websocket(header, &mut stream)?;
-
-                        is_ws = true;
-                    }
-                    path => {
-                        if path.starts_with("/api") {
-                            match router.serve_api(&header, body) {
-                                Ok(content) => Self::build_response(
-                                    HttpResponseCode::Ok,
-                                    content.as_ref(),
-                                    &mut self.response_buffer,
-                                    &mut stream,
-                                ),
-                                Err(err) => self.build_error_response(&router, err, &mut stream),
-                            }
-                        } else if let Some(asset) = router.content.assets.get_ref(header.path)
-                            && !asset.internal
-                        {
-
-                            Self::build_response(
-                                HttpResponseCode::Ok,
-                                asset.data.as_ref(),
-                                &mut self.response_buffer,
-                                &mut stream,
-                            )
-
-                        } else {
-
-                            match router.serve_page(&header, body, &mut self.render_buffer) {
-                                Ok(content) => Self::build_response(
-                                    HttpResponseCode::Ok,
-                                    content,
-                                    &mut self.response_buffer,
-                                    &mut stream,
-                                ),
-                                Err(err) => self.build_error_response(&router, err, &mut stream),
-                            }
-                        };
-
-                        let end_timer = Instant::now();
-                        let duration = end_timer - start_timer;
-
-                        router.db.save_page_hit(path, duration).expect("in measure");
-
-                    }
-                };
-
-                #[cfg(debug_assertions)]
-                {
-                    if is_ws {
-                        active_streams.push(stream);
-                    }
-                }
-            }
-
-            if check_db_sync_timer.elapsed() > Duration::from_secs(60) {
-                router.db.sync()?;
-                check_db_sync_timer = Instant::now();
-            }
-
-            #[cfg(debug_assertions)]
-            {
-                let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
-                    check_fs_timer = Instant::now();
-
-                    router.content.check_update(&mut router.context)?
-                } else {
-                    false
-                };
-
-                if reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
-                    check_alive_timer = Instant::now();
-                    active_streams.retain(|mut stream| {
-                        let connection_is_alive = match stream.read(&mut [0]) {
-                            Ok(0) => false,
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                            _ => false,
-                        };
-
-                        if connection_is_alive && let Ok(peer_addr) = stream.peer_addr() {
-                            if reload {
-                                let _ = HttpServer::send_ws_message(stream, "reload");
-                                println!("[{peer_addr:?}] Reloaded");
-                            }
-                            true
-                        } else {
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-
-                            false
-                        }
-                    });
-                }
-            }
-
-        }
-
-        // Exit routine
-
-        router.db.sync()?;
-        Ok(())
     }
 }
 
