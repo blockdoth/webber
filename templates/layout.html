@@ -12,7 +12,10 @@
         font-family: 'JetBrains Mono';
         src: url('/fonts/JetBrainsMono-Regular.woff2') format('woff2');
       }
-
+      @font-face {
+        font-family: 'Future Mono';
+        src: url('/fonts/TestTheFutureMono-Black.otf') format('opentype');
+      }
       * {
         margin: 0px;
         padding: 0px;
@@ -30,18 +33,26 @@
         height: 100%;    
       }
       
+      a {
+        text-decoration:none;
+        color: #738d82;
+      }
 
 
       h1, h2, h3 {
         padding-top: 1rem;
         padding-bottom: 0.2rem;
+        font-family: 'Future Mono', monospace;
+      }
+
+      ul {
+        padding-left: 2rem;
       }
 
       .container {
         min-height: 100%;
         display: grid;
-        grid-template-rows: auto 1fr auto;
-        
+        grid-template-rows: auto 1fr auto;  
       }
 
       .logo {
@@ -49,6 +60,8 @@
       }
       .logo_placeholder {
         height: 4rem;
+        aspect-ratio: 1;
+        padding-inline: 5px;
       }      
 
       .nav {
@@ -63,7 +76,6 @@
       
       .nav_button {
         color: white;
-        text-decoration:none;
         align-content: center;      
         margin: 5px;   
         padding: 5px;
@@ -74,51 +86,42 @@
         /* background-color: red; */
         padding-bottom: 5px;
       }
-      
-      .nav_button:hover, .blockdoth:hover {
-        color: black;
-        background-color: white;
-      }     
-      
+
 
       .blockdoth {
         font-size: 50px;
         color: white;
         text-decoration:none;        
         padding-inline:10px;   
+        font-family: 'Future Mono', monospace;
 
-      }      
+      }  
+      .nav_button:hover, .blockdoth:hover {
+        color: black;
+        background-color: white;
+      }     
+      
+      .active {
+        color: black;
+        background-color: white;
+      }
+
       .logo_container {
         display: inline-flex;
         text-decoration: none;
-             
-        /* margin-left: 10px; */
+
       }
 
       .content {
         width: 50em;    
-        margin-inline: auto
+        margin-inline: auto;
+        margin-top: 10px;
       }
 
       .footer {
         font-size: 12px;
         color: gray;
         text-align: center;
-      }
-
-      .active {
-        color: black;
-        background-color: white;
-      }
-
-
-
-      a {
-        color: #738d82;
-      }
-
-      ul {
-        padding-left: 2rem;
       }
 
     </style>
@@ -155,7 +158,7 @@
         <a href="/home" class="logo_container">
           <div class = "logo_placeholder">
             <img 
-              src="/images/image.png" 
+              src="/images/faxger.png" 
               class="logo"
               decoding="async"
               fetchpriority="low"              

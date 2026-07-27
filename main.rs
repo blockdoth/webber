@@ -114,6 +114,7 @@ fn comptime() -> Result<(), Box<dyn Error>> {
                 &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())")
             }
             Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
+            Some("otf") => &format!("AssetData::Otf(include_bytes!({global_path:?}).to_vec())"),
             Some("md") => &format!(
                 "AssetData::Markdown(MarkdownParser::parse(&include_str!({global_path:?})))"
             ),
@@ -381,7 +382,7 @@ impl HttpServer {
         }
         println!("Assets");
         for (route, asset) in &router.content.assets.collect_kv_mut() {
-            println!(" {route:?}\t\t->\t{}", asset.data.typ());
+            println!(" {route:?}\t\t->\t{}", asset.data.html_typ_string());
         }
 
         println!(" Fallback\t->\t{:?}", router.fallback);
@@ -620,7 +621,7 @@ impl HttpServer {
             Content-Length: {}\r\n\
             {cache_control}\
             Connection: close\r\n\r\n",
-            content.typ(),
+            content.html_typ_string(),
             body.len(),
         )
         .expect("writing to Vec<u8> cannot fail");
@@ -1554,11 +1555,11 @@ impl ToTemplateValue for AssetData {
     fn to_template_value(self) -> TemplateValue {
         use AssetData::*;
         match self {
-            Png(_) | Ico(_) | Woff2(_) => {
+            Png(_) | Ico(_) | Woff2(_) | Otf(_)| Unknown(_)=> {
                 todo!("Cant insert binary assets into context yet")
             }
             Empty => todo!("not sure what to do with this"),
-            AssetData::Text(s) | Html(s) | Css(s) | Js(s) | Unknown(s) => s.to_template_value(),
+            AssetData::Text(s) | Html(s) | Css(s) | Js(s) | UnknownText(s) => s.to_template_value(),
             Markdown(parsed) => parsed.to_template_value(),
         }
     }
@@ -2568,7 +2569,9 @@ enum AssetTyp {
     Md,
     Ico,
     Woff2,
+    Otf,
     Unknown,
+    UnknownText,
     Empty,
 }
 
@@ -2582,7 +2585,9 @@ enum AssetData {
     Ico(Vec<u8>),
     Markdown(ParsedMarkdown),
     Woff2(Vec<u8>),
-    Unknown(String),
+    Otf(Vec<u8>),
+    UnknownText(String),
+    Unknown(Vec<u8>),
     Empty,
 }
 #[derive(Clone, Debug)]
@@ -2592,16 +2597,18 @@ enum AssetDataRef<'a> {
     Css(&'a str),
     Js(&'a str),
     MdRaw(&'a str),
-    Unknown(&'a str),
+    Unknown(&'a [u8]),
+    UnknownText(&'a str),
     Png(&'a [u8]),
     Ico(&'a [u8]),
     Woff2(&'a [u8]),
+    Otf(&'a [u8]),
     Markdown(&'a ParsedMarkdown),
     Empty,
 }
 
 impl AssetDataRef<'_> {
-    fn typ(&self) -> &str {
+    fn html_typ_string(&self) -> &str {
         match self {
             AssetDataRef::Html(_) => "text/html; charset=utf-8",
             AssetDataRef::Css(_) => "text/css",
@@ -2609,35 +2616,45 @@ impl AssetDataRef<'_> {
             AssetDataRef::Png(_) => "image/png",
             AssetDataRef::Ico(_) => "image/ico",
             AssetDataRef::Woff2(_) => "font/woff2",
+            AssetDataRef::Otf(_) => "font/otf",
             AssetDataRef::Markdown(_) => "text/html; charset=utf-8",
-            AssetDataRef::Text(_) | AssetDataRef::MdRaw(_) | AssetDataRef::Unknown(_) => {
+            AssetDataRef::Text(_) | AssetDataRef::MdRaw(_) | AssetDataRef::UnknownText(_) => {
                 "text/plain; charset=utf-8"
             }
+            AssetDataRef::Unknown(_) => todo!(),
             AssetDataRef::Empty => "",
         }
     }
     fn as_bytes(&self) -> &[u8] {
         match self {
-            AssetDataRef::Png(b) | AssetDataRef::Ico(b) | AssetDataRef::Woff2(b) => b,
+            AssetDataRef::Png(b) 
+            | AssetDataRef::Ico(b)
+            | AssetDataRef::Woff2(b)
+            | AssetDataRef::Otf(b)
+            | AssetDataRef::Unknown(b) => b,
             AssetDataRef::Text(s)
             | AssetDataRef::Html(s)
             | AssetDataRef::Css(s)
             | AssetDataRef::Js(s)
             | AssetDataRef::MdRaw(s)
-            | AssetDataRef::Unknown(s) => s.as_bytes(),
+            | AssetDataRef::UnknownText(s) => s.as_bytes(),
             AssetDataRef::Markdown(m) => m.as_bytes(),
             AssetDataRef::Empty => &[],
         }
     }
     fn as_str(&self) -> Option<&str> {
         match self {
-            AssetDataRef::Png(_) | AssetDataRef::Ico(_) | AssetDataRef::Woff2(_) => None,
+            AssetDataRef::Png(_)
+            | AssetDataRef::Ico(_)
+            | AssetDataRef::Woff2(_)
+            | AssetDataRef::Otf(_)
+            | AssetDataRef::Unknown(_) => None,
             AssetDataRef::Text(s)
             | AssetDataRef::Html(s)
             | AssetDataRef::Css(s)
             | AssetDataRef::Js(s)
             | AssetDataRef::MdRaw(s)
-            | AssetDataRef::Unknown(s) => Some(s),
+            | AssetDataRef::UnknownText(s) => Some(s),
             AssetDataRef::Markdown(m) => Some(m.as_str()),
             AssetDataRef::Empty => None,
         }
@@ -2652,9 +2669,17 @@ impl AssetData {
             Some("md") => AssetData::Markdown(MarkdownParser::parse(&fs::read_to_string(path)?)),
             Some("html") => AssetData::Html(fs::read_to_string(path)?),
             Some("txt") => AssetData::Text(fs::read_to_string(path)?),
+            Some("otf") => AssetData::Otf(fs::read(path)?),
+            Some("woff2") => AssetData::Woff2(fs::read(path)?),
             Some("css") => AssetData::Css(fs::read_to_string(path)?),
             Some("js") => AssetData::Js(fs::read_to_string(path)?),
-            _ => AssetData::Text(fs::read_to_string(path)?),
+            _ => {
+                if let Ok(text) = fs::read_to_string(path) {
+                    AssetData::Text(text)
+                } else {
+                    AssetData::Unknown(fs::read(path)?)
+                }
+            }
         };
         Ok(content)
     }
@@ -2669,12 +2694,14 @@ impl AssetData {
             AssetData::Ico(bytes) => AssetDataRef::Ico(bytes),
             AssetData::Markdown(parsed_markdown) => AssetDataRef::Markdown(parsed_markdown),
             AssetData::Woff2(bytes) => AssetDataRef::Woff2(bytes),
+            AssetData::Otf(bytes) => AssetDataRef::Otf(bytes),
             AssetData::Unknown(value) => AssetDataRef::Unknown(value),
+            AssetData::UnknownText(value) => AssetDataRef::UnknownText(value),
             AssetData::Empty => AssetDataRef::Empty,
         }
     }
 
-    fn typ(&self) -> &str {
+    fn html_typ_string(&self) -> &str {
         match self {
             AssetData::Html(_) => "text/html; charset=utf-8",
             AssetData::Css(_) => "text/css",
@@ -2682,8 +2709,10 @@ impl AssetData {
             AssetData::Png(_) => "image/png",
             AssetData::Ico(_) => "image/ico",
             AssetData::Woff2(_) => "font/woff2",
+            AssetData::Otf(_) => "font/otf",
             AssetData::Markdown(_) => "text/html; charset=utf-8",
             AssetData::Text(_) | AssetData::Unknown(_) => "text/plain; charset=utf-8",
+            AssetData::UnknownText(_) => todo!(),
             AssetData::Empty => "",
         }
     }
@@ -2693,18 +2722,20 @@ impl AssetData {
             AssetTyp::Png => AssetData::Png(buffer.to_owned()),
             AssetTyp::Ico => AssetData::Ico(buffer.to_owned()),
             AssetTyp::Woff2 => AssetData::Woff2(buffer.to_owned()),
+            AssetTyp::Otf => AssetData::Otf(buffer.to_owned()),
             AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).into_owned()),
             AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).into_owned()),
             AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).into_owned()),
             AssetTyp::Text => AssetData::Text(String::from_utf8_lossy(buffer).into_owned()),
-            AssetTyp::Unknown
+            AssetTyp::UnknownText
                 if let s = String::from_utf8_lossy(buffer)
                     && !s.is_empty() =>
             {
-                AssetData::Unknown(s.into_owned())
+                AssetData::UnknownText(s.into_owned())
             }
+            AssetTyp::UnknownText | AssetTyp::Unknown => AssetData::Unknown(buffer.to_vec()),
             AssetTyp::Md => todo!(),
-            AssetTyp::Empty | AssetTyp::Unknown => AssetData::Empty,
+            AssetTyp::Empty => AssetData::Empty,
         }
     }
 }

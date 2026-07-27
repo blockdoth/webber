@@ -3,9 +3,11 @@
 
 
 {{ block body }}
-<h1>Blockdoth</h1>
 
-<h4>Recent posts</h1>
+
+WIP
+
+<h3>Recent posts</h3>
   {{for post in posts}}
   <ul>
     <li>{{post.published}} - <a href="{{post.slug}}"> {{post.title}} </a></li> 
@@ -16,7 +18,7 @@
 
 <br>
 
-<h4>Sites I like</h1>
+<h3>Sites I like</h3>
 {{for blog in cool_blogs}}
   <ul>
     <li> <a href="https://{{blog}}">{{blog}}</a> </li> 

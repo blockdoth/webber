@@ -6,33 +6,37 @@
     border: 1px solid white;
     color: white;
     padding: 10px;
-    margin: 20px;
-    margin-left: 10px; 
+    margin-top: 20px;
+
     display: flex;     
-    gap: 2;           
   }  
 
   .url {
     font-style: italic;
     color: gray;
-
+    
   }  
 
   .stats {
     margin-left: auto;
     padding-right: 10px;
   }
+  
+  .stats_description {
+    margin-top: 10px;
+  }
+
 </style>
 {{endBlock}}
 
 {{block body}}
-<p> 
+<div class="stats_description"> 
   Start time: {{stats.start_time}}
-</p>
+</div>
 {{for page in stats.pages}}
 
 <div class="stat_entry">
-  <p class="url">{{page.path}}</p>
+  <a class="url" href="{{page.path}}">{{page.path}}</a>
   
   <div class="stats">
     <p>Total hits:&nbsp{{page.count}}</p>

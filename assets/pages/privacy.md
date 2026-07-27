@@ -1,4 +1,10 @@
 
+###Me 
+
+Computer science student. Nix and fp appriciator. Currently on a rust streak.
+
+Browse my [flake](https://github.com/blockdoth/nixos)
+
 
 ### Links
 - [Discord](https://discord.gg/Ej9qdzyW)
