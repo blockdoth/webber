@@ -33,8 +33,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{char, fmt, fs, vec};
 
-const SOCKET_ADDR: &str = "127.0.0.1:4000";
-const DOMAIN: &str = "127.0.0.1:4000";
 const ASSETS_PATH: &str = "./assets/";
 const TEMPLATES_PATH: &str = "./templates/";
 
@@ -59,6 +57,35 @@ fn register_signal_handlers() {
     unsafe {
         assert_ne!(signal(SIGINT, handle_signal), SIG_ERR);
         assert_ne!(signal(SIGTERM, handle_signal), SIG_ERR);
+    }
+}
+
+struct Config {
+    host: String,
+    port: String,
+    domain: String,
+}
+
+impl Config {
+    fn from_env() -> Self {
+        let host = env::var("WEBBER_HOST")
+            .unwrap_or_else(|_| "127.0.0.1".to_owned());
+
+        let port = env::var("WEBBER_PORT")
+            .unwrap_or_else(|_| "4000".to_owned());
+
+        let domain = env::var("WEBBER_DOMAIN")
+            .unwrap_or_else(|_| format!("{host}:{port}"));
+
+        Self {
+            host,
+            port,
+            domain,
+        }
+    }
+
+    fn bind_address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
     }
 }
 
@@ -264,11 +291,12 @@ fn runtime() -> Result<(), Box<dyn Error>> {
             _ => return Err(format!("unknown arg: {}", first_arg).into()),
         }
     }
+    let config = Config::from_env();
 
-    run_server()
+    run_server(config.bind_address(), config.domain)
 }
 
-fn run_server() -> Result<(), Box<dyn Error>> {
+fn run_server(socket_addr:String, domain:String) -> Result<(), Box<dyn Error>> {
     register_signal_handlers();
 
     let mut db = Db::init()?;
@@ -278,7 +306,7 @@ fn run_server() -> Result<(), Box<dyn Error>> {
 
     let content = Content::load_embedded();
 
-    let context = Context::load_intial(&content);
+    let context = Context::load_intial(&content,domain);
 
     let router = Router::new(content, context, db)
         .route_static_hidden("/layout", "layout.html")
@@ -292,14 +320,15 @@ fn run_server() -> Result<(), Box<dyn Error>> {
         .error_page("error.html")
         .rss("rss.html");
 
-    let listener: TcpListener = TcpListener::bind(SOCKET_ADDR).expect("Unable to bind to socket");
-    println!("Started listening on socket http://{SOCKET_ADDR}");
+
+    let listener: TcpListener = TcpListener::bind(&socket_addr).expect("Unable to bind to socket");
+    println!("Started listening on socket http://{socket_addr}");
 
     HttpServer::new().serve(listener, router)
 }
 
 impl Context {
-    fn load_intial(content: &Content) -> Context {
+    fn load_intial(content: &Content, domain:String) -> Context {
         let mut context = Context::new();
 
         let last_build_date = system_time_to_date(SystemTime::now())
@@ -309,7 +338,7 @@ impl Context {
         content.update_asset_content(&mut context);
         context.insert_global("copyright_start", "2026".to_string());
         context.insert_global("copyright_end", "2026".to_string()); // TODO make dynamic
-        context.insert_global("domain", DOMAIN.to_string()); // TODO make dynamic
+        context.insert_global("domain", domain); 
         context.insert_global("last_build_date", last_build_date); // TODO make dynamic
 
         #[cfg(generated)]
@@ -387,6 +416,7 @@ impl HttpServer {
 
         println!(" Fallback\t->\t{:?}", router.fallback);
 
+        #[cfg(debug_assertions)]
         listener
             .set_nonblocking(true)
             .expect("Unable to set socket to nonblocking mode");
@@ -4810,7 +4840,7 @@ struct sqlite3_handle {
 #[allow(non_camel_case_types)]
 type sqlite3_destructor = Option<unsafe extern "C" fn(*mut c_void)>;
 
-#[link(name = "sqlite3")]
+#[link(name = "sqlite3", kind = "static")]
 unsafe extern "C" {
     fn sqlite3_open(
         filename: *const c_char,         /* Database filename (UTF-8) */
@@ -5963,22 +5993,21 @@ unsafe impl GlobalAlloc for CountingAllocator {
 // === Utils ===
 
 fn get_commit_hash() -> (String, String) {
-    let short = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .expect("unable to get git hash");
 
-    let long = Command::new("git")
+    let long = if let Ok(hash) = env::var("WEBBER_GIT_REV") {
+      hash
+    } else {
+      Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_string())
-        .expect("unable to get git hash");
+        .expect("unable to get git hash")
+    };
 
+    let short = long.chars().take(7).collect();
+    
     (short, long)
 }
 

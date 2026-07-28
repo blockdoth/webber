@@ -1,7 +1,7 @@
 
 ###Me 
 
-Computer science student. Nix and fp appriciator. Currently on a rust streak.
+Computer science student. Nix and fp appreciator. Currently on a rust streak.
 
 Browse my [flake](https://github.com/blockdoth/nixos)
 
