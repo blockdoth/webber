@@ -68,20 +68,13 @@ struct Config {
 
 impl Config {
     fn from_env() -> Self {
-        let host = env::var("WEBBER_HOST")
-            .unwrap_or_else(|_| "127.0.0.1".to_owned());
+        let host = env::var("WEBBER_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
 
-        let port = env::var("WEBBER_PORT")
-            .unwrap_or_else(|_| "4000".to_owned());
+        let port = env::var("WEBBER_PORT").unwrap_or_else(|_| "4000".to_owned());
 
-        let domain = env::var("WEBBER_DOMAIN")
-            .unwrap_or_else(|_| format!("{host}:{port}"));
+        let domain = env::var("WEBBER_DOMAIN").unwrap_or_else(|_| format!("{host}:{port}"));
 
-        Self {
-            host,
-            port,
-            domain,
-        }
+        Self { host, port, domain }
     }
 
     fn bind_address(&self) -> String {
@@ -296,7 +289,7 @@ fn runtime() -> Result<(), Box<dyn Error>> {
     run_server(config.bind_address(), config.domain)
 }
 
-fn run_server(socket_addr:String, domain:String) -> Result<(), Box<dyn Error>> {
+fn run_server(socket_addr: String, domain: String) -> Result<(), Box<dyn Error>> {
     register_signal_handlers();
 
     let mut db = Db::init()?;
@@ -306,20 +299,20 @@ fn run_server(socket_addr:String, domain:String) -> Result<(), Box<dyn Error>> {
 
     let content = Content::load_embedded();
 
-    let context = Context::load_intial(&content,domain);
+    let context = Context::load_intial(&content, domain);
 
     let router = Router::new(content, context, db)
         .route_static_hidden("/layout", "layout.html")
         .route_static_hidden("/home", "pages/home.html")
         .route_static_page("/posts", "pages/posts.html")
         .route_static_page("/quotes", "pages/quotes.html")
+        .route_static_page("/gallery", "pages/gallery.html")
         .route_static_page("/stats", "pages/stats.html")
         .route_static_page("/about", "pages/about.html")
         .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")
         .fallback("/home")
         .error_page("error.html")
         .rss("rss.html");
-
 
     let listener: TcpListener = TcpListener::bind(&socket_addr).expect("Unable to bind to socket");
     println!("Started listening on socket http://{socket_addr}");
@@ -328,7 +321,7 @@ fn run_server(socket_addr:String, domain:String) -> Result<(), Box<dyn Error>> {
 }
 
 impl Context {
-    fn load_intial(content: &Content, domain:String) -> Context {
+    fn load_intial(content: &Content, domain: String) -> Context {
         let mut context = Context::new();
 
         let last_build_date = system_time_to_date(SystemTime::now())
@@ -338,7 +331,7 @@ impl Context {
         content.update_asset_content(&mut context);
         context.insert_global("copyright_start", "2026".to_string());
         context.insert_global("copyright_end", "2026".to_string()); // TODO make dynamic
-        context.insert_global("domain", domain); 
+        context.insert_global("domain", domain);
         context.insert_global("last_build_date", last_build_date); // TODO make dynamic
 
         #[cfg(generated)]
@@ -1585,7 +1578,7 @@ impl ToTemplateValue for AssetData {
     fn to_template_value(self) -> TemplateValue {
         use AssetData::*;
         match self {
-            Png(_) | Ico(_) | Woff2(_) | Otf(_)| Unknown(_)=> {
+            Png(_) | Ico(_) | Woff2(_) | Otf(_) | Unknown(_) => {
                 todo!("Cant insert binary assets into context yet")
             }
             Empty => todo!("not sure what to do with this"),
@@ -2657,7 +2650,7 @@ impl AssetDataRef<'_> {
     }
     fn as_bytes(&self) -> &[u8] {
         match self {
-            AssetDataRef::Png(b) 
+            AssetDataRef::Png(b)
             | AssetDataRef::Ico(b)
             | AssetDataRef::Woff2(b)
             | AssetDataRef::Otf(b)
@@ -5993,21 +5986,20 @@ unsafe impl GlobalAlloc for CountingAllocator {
 // === Utils ===
 
 fn get_commit_hash() -> (String, String) {
-
     let long = if let Ok(hash) = env::var("WEBBER_GIT_REV") {
-      hash
+        hash
     } else {
-      Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .expect("unable to get git hash")
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .expect("unable to get git hash")
     };
 
     let short = long.chars().take(7).collect();
-    
+
     (short, long)
 }
 

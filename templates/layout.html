@@ -24,23 +24,28 @@
 
       html {
         height: 100%;
+        --white: white;
+        --black: #101214;
+        --light-black: #282828;
+        --gray: gray;
+        --blue: #738d82;
       }
 
 
       body {
-        background-color: #101214;
-        color: white;
+        background-color: var(--black);
+        color: var(--white);
         height: 100%;    
       }
       
       a {
         text-decoration:none;
-        color: #738d82;
+        color: var(--blue);
       }
 
 
       h1, h2, h3 {
-        padding-top: 1rem;
+        /* padding-top: 1rem; */
         padding-bottom: 0.2rem;
         font-family: 'Future Mono', monospace;
       }
@@ -65,8 +70,8 @@
       }      
 
       .nav {
-        border-color: white;
-        border-bottom: 2px solid white;
+        border-color: var(--white);
+        border-bottom: 2px solid var(--white);
         font-size: 20px;
         display: flex;
         margin-top: 10px;
@@ -75,7 +80,7 @@
       }
       
       .nav_button {
-        color: white;
+        color: var(--white);
         align-content: center;      
         margin: 5px;   
         padding: 5px;
@@ -90,20 +95,20 @@
 
       .blockdoth {
         font-size: 50px;
-        color: white;
+        color: var(--white);
         text-decoration:none;        
         padding-inline:10px;   
         font-family: 'Future Mono', monospace;
 
       }  
       .nav_button:hover, .blockdoth:hover {
-        color: black;
-        background-color: white;
+        color: var(--black);
+        background-color: var(--white);
       }     
       
       .active {
-        color: black;
-        background-color: white;
+        color: var(--black);
+        background-color: var(--white);
       }
 
       .logo_container {
@@ -115,13 +120,23 @@
       .content {
         width: 50em;    
         margin-inline: auto;
-        margin-top: 10px;
+        margin-top: 20px;
+      }
+
+      .background {
+        background-image: radial-gradient( var(--light-black) 1.1px, transparent 1.2px);
+        background-size: 15px 15px;     
       }
 
       .footer {
+        display: flex;
+        justify-content: center;
+        align-items: center;        
+        gap: 5rem;
+        
         font-size: 12px;
-        color: gray;
-        text-align: center;
+        color: var(--gray);
+        padding-top: 5px;
       }
 
     </style>
@@ -181,19 +196,22 @@
         </div>
       </div>
 
-      <div class="content">
-        {{block body}} 
-        
-        {{endBlock}}
-      </div>
+      <div class="background">
+        <div class="content">
+          {{block body}} 
 
+          {{endBlock}}
+        </div>
+      </div>
+      
+      <hr>
       <div class="footer">
-        <hr>
-        <p>
-          Copyright {{copyright_start}}-{{copyright_end}} 
-          blockdoth
-          Powered by <a href="https://github.com/blockdoth/webber/">webber</a>, version: <a href="https://github.com/blockdoth/webber/commit/{{git_hash_long}}">{{git_hash_short}}</a>
-        </p>
+        <span>Copyright {{copyright_start}}-{{copyright_end}} blockdoth</span>
+
+        <span>
+          Powered by <a href="https://github.com/blockdoth/webber/">webber</a>,
+          version: <a href="https://github.com/blockdoth/webber/commit/{{git_hash_long}}">{{git_hash_short}}</a>
+        </span>
       </div>
     </div>
 </body>

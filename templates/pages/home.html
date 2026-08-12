@@ -1,29 +1,63 @@
 {{extends "layout.html"}}
 
 
+{{block css}}
+<style>
+  .left-column {
+    display: inline-block;
+    flex: 2;
+    border: 1px solid var(--white);
+    background-color: var(--black);
+    
+    padding: 10px;
+  }
+  .right-column {
+    display: inline-block;
+    flex: 1;
+    border: 1px solid var(--white);
+    background-color: var(--black);
+    
+    margin-left: 20px;
+    padding: 10px;
+  }
+
+  .home-container {
+
+    display: flex;
+
+  }
+  
+
+</style>
+{{endBlock}}
+
 
 {{ block body }}
 
-
-WIP
-
-<h3>Recent posts</h3>
-  {{for post in posts}}
-  <ul>
-    <li>{{post.published}} - <a href="{{post.slug}}"> {{post.title}} </a></li> 
-  </ul>
-  
-  {{endFor}}
-  
+<div class="home-container">
+  <div class="left-column">
+    Wip personal site
+  </div>
+  <div class="right-column">
+    <h3>Recent posts</h3>
+    {{for post in posts}}
+    <ul>
+      <li>{{post.published}} - <a href="{{post.slug}}"> {{post.title}} </a></li> 
+    </ul>
+    
+    {{endFor}}
+      
+    <h3>Sites I like</h3>
+    {{for blog in cool_blogs}}
+      <ul>
+        <li> <a href="https://{{blog}}">{{blog}}</a> </li> 
+      </ul>
+    {{endFor}}
+  </div>
+</div>
 
 <br>
 
-<h3>Sites I like</h3>
-{{for blog in cool_blogs}}
-  <ul>
-    <li> <a href="https://{{blog}}">{{blog}}</a> </li> 
-  </ul>
-{{endFor}}
   
 
 {{ endBlock }}
