@@ -12,7 +12,7 @@
       <link>https://{{ domain }}/posts/{{ post.slug }}</link>
       <guid isPermaLink="true">https://{{ domain }}/posts/{{ post.slug }}</guid>
       <description>{{ post.summary }}</description>
-      <pubDate>{{ post.published_rfc1123 }}</pubDate>
+      <pubDate>{{ date post.published "rfc1123" }}</pubDate>
     </item>
     {{ endFor }}
   </channel>

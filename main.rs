@@ -330,7 +330,7 @@ impl Context {
         content.update_asset_content(&mut context);
         context.insert_global("basedate", Date::default());
         context.insert_global("copyright_start", "2026".to_string());
-        context.insert_global("copyright_end", "2026".to_string()); // TODO make dynamic
+        context.insert_global("copyright_end", Date::from_systemtime(SystemTime::now()).expect("invariant")); // TODO make dynamic
         context.insert_global("domain", domain);
         context.insert_global("last_build_date", last_build_date); // TODO make dynamic
 
@@ -3017,7 +3017,7 @@ impl<'a> TemplateLexer<'a> {
                     lexer.newlines.push(cursor + 1);
                 }
 
-                cursor += 1;
+                cursor += c.len_utf8();
             }
         }
 
@@ -6247,6 +6247,8 @@ enum DateFormat {
     Day,
     Weekday,
     WeekdayShort,
+    MonthNameYearDay,
+    MonthNameShortYearDay,
     Unix,
 }
 
@@ -6274,6 +6276,9 @@ impl DateFormat {
 
             "weekday" => Some(Weekday),
             "weekday-short" => Some(WeekdayShort),
+
+            "month-name-day-year" => Some(MonthNameYearDay),
+            "month-name-short-day-year" => Some(MonthNameShortYearDay),
 
             "unix" => Some(Unix),
 
@@ -6365,7 +6370,9 @@ impl Date {
             Day => format!("{day:02}"),
             Weekday => weekday.to_string(),
             WeekdayShort => weekday_short.to_string(),
-
+            MonthNameYearDay => format!("{month_name} {day:02}, {year:04}"),
+            #[allow(non_snake_case)]
+            MonthNameShortDayYear => format!("{month_short} {day:02}, {year:04}"),
             Unix => {
                 let seconds =
                     self.day * 86_400 + self.hour * 3_600 + self.minute * 60 + self.second;

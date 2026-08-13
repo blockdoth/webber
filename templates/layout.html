@@ -88,10 +88,8 @@
       
       .nav_pages {
         align-content: end;      
-        /* background-color: red; */
-        padding-bottom: 5px;
+        padding-bottom: 5px;   
       }
-
 
       .blockdoth {
         font-size: 50px;
@@ -114,11 +112,13 @@
       .logo_container {
         display: inline-flex;
         text-decoration: none;
+        align-content: end;      
+        align-items: bottom;         
 
       }
 
       .content {
-        width: 50em;    
+        width: min(50em, calc(100% - 2rem));
         margin-inline: auto;
         margin-top: 20px;
       }
@@ -206,7 +206,7 @@
       
       <hr>
       <div class="footer">
-        <span>Copyright {{copyright_start}}-{{copyright_end}} blockdoth</span>
+        <span>© {{copyright_start}}-{{date copyright_end "year"}} blockdoth</span>
 
         <span>
           Powered by <a href="https://github.com/blockdoth/webber/">webber</a>,
