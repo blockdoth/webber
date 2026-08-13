@@ -36,13 +36,13 @@
 
 <div class="home-container">
   <div class="left-column">
-    Wip personal site
+    WIP personal site
   </div>
   <div class="right-column">
     <h3>Recent posts</h3>
     {{for post in posts}}
     <ul>
-      <li>{{post.published}} - <a href="{{post.slug}}"> {{post.title}} </a></li> 
+      <li>{{date post.published "date"}} - <a href="{{post.slug}}"> {{post.title}} </a></li> 
     </ul>
     
     {{endFor}}

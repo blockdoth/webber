@@ -324,11 +324,11 @@ impl Context {
     fn load_intial(content: &Content, domain: String) -> Context {
         let mut context = Context::new();
 
-        let last_build_date = system_time_to_date(SystemTime::now())
-            .expect("failed to parse date")
-            .to_rfc1123();
+        let last_build_date =
+            Date::from_systemtime(SystemTime::now()).expect("failed to parse date");
 
         content.update_asset_content(&mut context);
+        context.insert_global("basedate", Date::default());
         context.insert_global("copyright_start", "2026".to_string());
         context.insert_global("copyright_end", "2026".to_string()); // TODO make dynamic
         context.insert_global("domain", domain);
@@ -1259,6 +1259,7 @@ impl Template {
                         Bool(bool_val) => write!(out, "{bool_val}")?,
                         List(list) => write!(out, "{list:?}")?,
                         Object(object) => write!(out, "{object:?}")?,
+                        Date(date) => write!(out, "{date}")?,
                     }
                 }
                 TemplateNodeData::If {
@@ -1333,6 +1334,27 @@ impl Template {
                         Self::render_helper(override_body, context, blocks, out)?;
                     } else {
                         Self::render_helper(body, context, blocks, out)?;
+                    }
+                }
+                TemplateNodeData::Date { date_var, format } => {
+                    if let Date(date) = Self::resolve_var(date_var, context, &node.pos)? {
+                        if let Some(dateformat) = DateFormat::parse(format) {
+                            let date = date.format(&dateformat);
+                            out.push_str(&date)
+                        } else {
+                            return Err(TemplateError::new(
+                                TemplateErrorMsg::UnknownDateFormat(format.to_string()),
+                                node.pos.clone(),
+                            ));
+                        };
+                    } else {
+                        return Err(TemplateError::new(
+                            TemplateErrorMsg::VariableNotOfExpectedType(
+                                date_var.concat(),
+                                TemplateValueKind::Date,
+                            ),
+                            node.pos.clone(),
+                        ));
                     }
                 }
             };
@@ -1443,6 +1465,7 @@ impl Template {
 #[derive(Clone, Debug)]
 enum TemplateValue {
     Text(String),
+    Date(Date),
     Bool(bool),
     List(Vec<TemplateValue>),
     Object(HashMap<String, TemplateValue>),
@@ -1452,6 +1475,7 @@ enum TemplateValue {
 enum TemplateValueKind {
     Text,
     Bool,
+    Date,
     List,
     Object,
 }
@@ -1461,6 +1485,7 @@ impl TemplateValue {
         match self {
             TemplateValue::Text(_) => TemplateValueKind::Text,
             TemplateValue::Bool(_) => TemplateValueKind::Bool,
+            TemplateValue::Date(_) => TemplateValueKind::Date,
             TemplateValue::List(_) => TemplateValueKind::List,
             TemplateValue::Object(_) => TemplateValueKind::Object,
         }
@@ -1590,26 +1615,11 @@ impl ToTemplateValue for AssetData {
 
 impl ToTemplateValue for MarkdownPost {
     fn to_template_value(self) -> TemplateValue {
-        let (published, published_rfc1123) = match &self.metadata.published {
-            Ok(system_time) => match system_time_to_date(*system_time) {
-                Ok(date) => {
-                    let published = date.to_rfc_idk().to_template_value();
-
-                    let published_rfc1123 = date.to_rfc1123().to_template_value();
-
-                    (published, published_rfc1123)
-                }
-
-                Err(err) => {
-                    let error =
-                        format!("Failed to convert publish SystemTime: {err}").to_template_value();
-                    (error.clone(), error)
-                }
-            },
-
+        let published = match self.metadata.published {
+            Ok(date) => date.to_template_value(),
             Err(err) => {
-                let error = (*err).to_owned().to_template_value();
-                (error.clone(), error)
+                
+                (*err).to_owned().to_template_value()
             }
         };
 
@@ -1626,7 +1636,6 @@ impl ToTemplateValue for MarkdownPost {
           "title" => self.metadata.title.to_template_value(),
           "slug" => self.metadata.slug.to_template_value(),
           "published" => published,
-          "published_rfc1123" => published_rfc1123,
           "tags" => self.metadata.tags.to_template_value(),
           "summary" => summary,
           "draft" => self.metadata.draft.to_template_value(),
@@ -1656,6 +1665,11 @@ impl ToTemplateValue for ParsedMarkdown {
         }
     }
 }
+impl ToTemplateValue for Date {
+    fn to_template_value(self) -> TemplateValue {
+        TemplateValue::Date(self)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct TemplateNode {
@@ -1667,6 +1681,10 @@ struct TemplateNode {
 enum TemplateNodeData {
     Text(String),
     Variable(Vec<String>),
+    Date {
+        date_var: Vec<String>,
+        format: String,
+    },
     If {
         condition: ConditionExpr,
         then_branch: Vec<TemplateNode>,
@@ -1694,6 +1712,7 @@ enum ConditionExpr {
 #[derive(Clone, Debug)]
 enum TemplateNodeKind {
     Text,
+    Date,
     Variable,
     If,
     For,
@@ -1705,6 +1724,7 @@ impl TemplateNodeData {
         match self {
             TemplateNodeData::Text(_) => TemplateNodeKind::Text,
             TemplateNodeData::Variable(_) => TemplateNodeKind::Variable,
+            TemplateNodeData::Date { .. } => TemplateNodeKind::Date,
             TemplateNodeData::If { .. } => TemplateNodeKind::If,
             TemplateNodeData::For { .. } => TemplateNodeKind::For,
             TemplateNodeData::Block { .. } => TemplateNodeKind::Block,
@@ -1788,6 +1808,9 @@ impl fmt::Display for TemplateNodeData {
                     .join("\n");
                 write!(f, "block {ident} {{\n{body_str}\n}}")
             }
+            TemplateNodeData::Date { date_var, format } => {
+                write!(f, "block {} {format:?}", date_var.join("."))
+            }
         }
     }
 }
@@ -1811,6 +1834,7 @@ enum TemplateToken {
     Block(Span),
     EndBlock(Span),
     Extends(Span),
+    Date(Span),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1828,10 +1852,10 @@ enum TemplateTokenTyp {
     Block,
     EndBlock,
     Extends,
-
     NewLine,
     Whitespace,
     Dot,
+    Date,
     Equals,
 }
 
@@ -1856,6 +1880,7 @@ impl TemplateToken {
             Token::NewLine(_) => Typ::NewLine,
             Token::Whitespace(_) => Typ::Whitespace,
             Token::Dot(_) => Typ::Dot,
+            Token::Date(_) => Typ::Date,
             Token::Equals(_) => Typ::Equals,
             Token::Literal(_) => Typ::Literal,
         }
@@ -1878,6 +1903,7 @@ impl TemplateToken {
             | Self::NewLine(span)
             | Self::Block(span)
             | Self::EndBlock(span)
+            | Self::Date(span)
             | Self::Extends(span)
             | Self::Literal(span) => span,
         }
@@ -1980,7 +2006,7 @@ impl TemplateError {
                 let start_pos = TemplateError::compute_line_col(&info.newlines, span.start);
                 let end_pos = TemplateError::compute_line_col(&info.newlines, span.end);
 
-                let file_str = format!("{}:{}:{}", pos.file, start_pos.line, start_pos.column,);
+                let file_str = format!("{}:{}:{}", pos.file, start_pos.line, start_pos.column);
                 let code_snippet = TemplateError::format_code_snippet(
                     code_str,
                     start_pos.line,
@@ -2019,7 +2045,7 @@ impl TemplateError {
             line,
             code_snippet,
             "",
-            " ".repeat(start_col),
+            " ".repeat(start_col + 1),
             "^".repeat(end.saturating_sub(start_col).max(1)),
             width = gutter_width,
         )
@@ -2066,6 +2092,7 @@ enum TemplateErrorMsg {
     DidNotExpectToken(TemplateTokenTyp),
     UnexpectedTokenOptions(TemplateTokenTyp, Vec<TemplateTokenTyp>),
     GenericError(String),
+    UnknownDateFormat(String),
     MultiLevelForLoopBind(Vec<String>),
     UnexpectedTemplateValueType(TemplateNodeKind, TemplateNodeKind),
     CantCompareTemplateValues(TemplateValueKind, TemplateValueKind),
@@ -2098,6 +2125,7 @@ impl TemplateErrorMsg {
 
         match self {
             VariableNotFound(_)
+            | UnknownDateFormat(_)
             | FieldNotFoundOnVariable(_, _)
             | NodeNotOfExpectedType(_, _)
             | VariableNotOfExpectedType(_, _)
@@ -2149,6 +2177,9 @@ impl Display for TemplateErrorMsg {
                     f,
                     "{error_kind}: Unexpected token: {found:?}, expected: {expected:?}"
                 )
+            }
+            UnknownDateFormat(format) => {
+                write!(f, "{error_kind}: Unknown date format {format:?}")
             }
             DidNotExpectToken(tok) => {
                 write!(f, "{error_kind}: Did not expect token {tok:?}")
@@ -3014,6 +3045,7 @@ impl<'a> TemplateLexer<'a> {
             ("endFor", EndFor),
             ("endIf", EndIf),
             ("block", Block),
+            ("date", Date),
             ("else", Else),
             ("for", For),
             ("if", If),
@@ -3244,6 +3276,7 @@ impl TemplateParser<'_> {
                         self.span_to_position(span),
                     ));
                 }
+                Date(_) => self.parse_date()?,
                 Identifier(_) => self.parse_var()?,
                 Text(span) => {
                     let text = TemplateNode {
@@ -3448,6 +3481,38 @@ impl TemplateParser<'_> {
         }
     }
 
+    fn parse_date(&mut self) -> Result<TemplateNode, TemplateError> {
+        use TemplateTokenTyp::*;
+
+        let start_tok = self.consume(Date)?;
+        let whitespace_tok = self.consume(Whitespace)?;
+
+        let node = self.parse_var()?;
+        let node_span = node.pos.span.expect("msg");
+        let date_var = if let TemplateNodeData::Variable(var) = node.data {
+            var
+        } else {
+            return Err(self.error(
+                TemplateErrorMsg::UnexpectedTemplateValueType(
+                    TemplateNodeKind::Variable,
+                    node.data.kind(),
+                ),
+                self.range_to_position(whitespace_tok.end, node_span.end),
+            ));
+        };
+
+        self.consume(Whitespace)?;
+        let format_span = self.consume(Literal)?;
+
+        Ok(TemplateNode {
+            data: TemplateNodeData::Date {
+                date_var,
+                format: format_span.to_str(self.input).to_owned(),
+            },
+            pos: self.range_to_position(start_tok.start - 1, format_span.end),
+        })
+    }
+
     fn parse_for(&mut self) -> Result<TemplateNode, TemplateError> {
         use TemplateTokenTyp::*;
         let start_tok = self.consume(For)?;
@@ -3592,7 +3657,7 @@ struct MarkdownFile {
 struct PostMetadata {
     title: String,
     slug: String,
-    published: Result<SystemTime, &'static str>,
+    published: Result<Date, &'static str>,
     tags: Vec<String>,
     summary: Option<String>,
     draft: bool,
@@ -3652,7 +3717,7 @@ impl PostMetadata {
     fn parse_metadata_content(lines: Vec<&str>) -> PostMetadata {
         let mut title: Option<String> = None;
         let mut slug: Option<String> = None;
-        let mut published: Option<Result<SystemTime, &'static str>> = None;
+        let mut published: Option<Result<Date, &'static str>> = None;
         let mut tags: Vec<String> = Vec::new();
         let mut draft: bool = true;
         let mut summary: Option<String> = None;
@@ -3704,7 +3769,7 @@ impl PostMetadata {
         }
     }
 
-    fn parse_date(date: &str) -> Result<SystemTime, &'static str> {
+    fn parse_date(date: &str) -> Result<Date, &'static str> {
         let mut parts = date.split('-');
 
         let year: i32 = parts
@@ -3727,8 +3792,14 @@ impl PostMetadata {
             return Err("too many components");
         }
 
-        let days = days_from_civil(year, month, day);
-        Ok(UNIX_EPOCH + Duration::from_secs((days as u64) * 86_400))
+        let days = Date::days_from_civil(year, month, day);
+
+        Ok(Date {
+            day: days,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        })
     }
 
     fn parse_tags(value: &str) -> Vec<String> {
@@ -3946,7 +4017,7 @@ impl Span {
     fn to_line<'a>(&self, input: &'a str, newlines: &[usize]) -> &'a str {
         let line_start = match newlines.partition_point(|&newline| newline < self.start) {
             0 => 0,
-            index => newlines[index - 1] + 1,
+            index => newlines[index - 1],
         };
 
         let line_end = match newlines.partition_point(|&newline| newline < self.end) {
@@ -6161,6 +6232,57 @@ fn sha1(input: &str) -> [u8; 20] {
     digest
 }
 
+#[derive(Debug, Clone)]
+enum DateFormat {
+    Rfc1123,
+    Iso8601,
+    IsoDate,
+    DateTime,
+    Date,
+    Time,
+    Year,
+    Month,
+    MonthName,
+    MonthShort,
+    Day,
+    Weekday,
+    WeekdayShort,
+    Unix,
+}
+
+impl DateFormat {
+    fn parse(input: &str) -> Option<DateFormat> {
+        use DateFormat::*;
+
+        match input {
+            "rfc1123" => Some(Rfc1123),
+
+            "iso8601" => Some(Iso8601),
+            "iso-date" => Some(IsoDate),
+
+            "datetime" => Some(DateTime),
+            "date" => Some(Date),
+            "time" => Some(Time),
+
+            "year" => Some(Year),
+
+            "month" => Some(Month),
+            "month-name" => Some(MonthName),
+            "month-short" => Some(MonthShort),
+
+            "day" => Some(Day),
+
+            "weekday" => Some(Weekday),
+            "weekday-short" => Some(WeekdayShort),
+
+            "unix" => Some(Unix),
+
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Date {
     day: i64,
     hour: i64,
@@ -6168,83 +6290,143 @@ struct Date {
     second: i64,
 }
 
-impl Date {
-    fn to_rfc_idk(&self) -> String {
-        let (year, month, day) = civil_from_days(self.day);
+impl Display for Date {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.format(&DateFormat::Rfc1123))
+    }
+}
 
-        format!("{year}/{month:02}/{day:02}")
+impl Date {
+    fn default() -> Self {
+        Self {
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        }
     }
 
-    fn to_rfc1123(&self) -> String {
-        let weekday =
-            ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][self.day.rem_euclid(7) as usize];
+    fn format(&self, format: &DateFormat) -> String {
+        use DateFormat::*;
 
-        let (year, month, day) = civil_from_days(self.day);
+        let (year, month, day) = Self::civil_from_days(self.day);
 
-        let month = [
+        let month_name = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ][month as usize - 1];
+
+        let month_short = [
             "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
         ][month as usize - 1];
+
+        let weekday_idx = self.day.rem_euclid(7) as usize;
+
+        // 1970-01-01 was Thursday
+        let weekday = [
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+        ][weekday_idx];
+
+        let weekday_short = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][weekday_idx];
 
         let hour = self.hour;
         let minute = self.minute;
         let second = self.second;
 
-        format!("{weekday}, {day:02} {month} {year:04} {hour:02}:{minute:02}:{second:02} GMT")
+        match format {
+            Rfc1123 => format!(
+                "{weekday_short}, {day:02} {month_short} {year:04} {hour:02}:{minute:02}:{second:02} GMT"
+            ),
+            Iso8601 => format!("{year:04}-{month:02}-{day:02}T {hour:02}:{minute:02}:{second:02}Z"),
+            IsoDate => format!("{year:04}-{month:02}-{day:02}"),
+            DateTime => format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}"),
+            Date => format!("{year:04}/{month:02}/{day:02}"),
+            Time => format!("{hour:02}:{minute:02}:{second:02}"),
+            Year => year.to_string(),
+            Month => format!("{month:02}"),
+            MonthName => month_name.to_string(),
+            MonthShort => month_short.to_string(),
+            Day => format!("{day:02}"),
+            Weekday => weekday.to_string(),
+            WeekdayShort => weekday_short.to_string(),
+
+            Unix => {
+                let seconds =
+                    self.day * 86_400 + self.hour * 3_600 + self.minute * 60 + self.second;
+
+                seconds.to_string()
+            }
+        }
     }
-}
 
-fn system_time_to_date(time: SystemTime) -> Result<Date, SystemTimeError> {
-    let unix_seconds = time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    fn from_systemtime(time: SystemTime) -> Result<Date, SystemTimeError> {
+        let unix_seconds = time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
-    let day = unix_seconds.div_euclid(86_400);
-    let seconds_today = unix_seconds.rem_euclid(86_400);
+        let day = unix_seconds.div_euclid(86_400);
+        let seconds_today = unix_seconds.rem_euclid(86_400);
 
-    let hour = seconds_today / 3_600;
-    let minute = (seconds_today % 3_600) / 60;
-    let second = seconds_today % 60;
+        let hour = seconds_today / 3_600;
+        let minute = (seconds_today % 3_600) / 60;
+        let second = seconds_today % 60;
 
-    Ok(Date {
-        day,
-        hour,
-        minute,
-        second,
-    })
-}
+        Ok(Date {
+            day,
+            hour,
+            minute,
+            second,
+        })
+    }
+    // Inspired by this posts and rewriten in rust by clanker
+    // https://howardhinnant.github.io/date_algorithms.html
+    fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+        let z = days_since_epoch + 719_468;
+        let era = z.div_euclid(146_097);
+        let day_of_era = z - era * 146_097;
 
-// Inspired by this posts and rewriten in rust by clanker
-// https://howardhinnant.github.io/date_algorithms.html
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
 
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let mut year = year_of_era + era * 400;
 
-    let mut year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
 
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_prime = (5 * day_of_year + 2) / 153;
+        let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+        let month = month_prime + if month_prime < 10 { 3 } else { -9 };
 
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+        year += i64::from(month <= 2);
 
-    year += i64::from(month <= 2);
+        (year, month as u32, day as u32)
+    }
 
-    (year, month as u32, day as u32)
-}
+    fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+        let mut year = year as i64;
+        let month = month as i64;
+        let day = day as i64;
 
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let mut year = year as i64;
-    let month = month as i64;
-    let day = day as i64;
+        year -= if month <= 2 { 1 } else { 0 };
 
-    year -= if month <= 2 { 1 } else { 0 };
+        let era = if year >= 0 { year } else { year - 399 } / 400;
+        let yoe = year - era * 400;
+        let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
 
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-
-    era * 146_097 + doe - 719_468
+        era * 146_097 + doe - 719_468
+    }
 }
