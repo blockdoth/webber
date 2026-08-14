@@ -4,12 +4,32 @@
 {{block css}}
 
 <style>
-  .photo {
-    height: 100%;
+  .gallery_section {
+    display: flex;
+    flex-wrap: wrap;
+  }
+  .gallery_section::after {
+    content: '';
+    flex-grow: 999999999;
+  }
+  
+  .gallery {
+    margin: 3px;
+    background-color: violet;
+    position: relative;
+  }
+
+  .gallery_padding {
+    display: block;
+  }
+  .gallery_photo {
+    position: absolute;
+    top: 0;
     width: 100%;
-  }  
-  .photo_holder {
-    max-width: 100%;    
+    vertical-align: bottom;
+  }
+  .content {
+    width: 100%;
   }
 </style>
 {{endBlock}}
@@ -20,12 +40,16 @@
   Some foto's I like
 </div>
 
+<!-- Inspired by: https://github.com/xieranmaya/blog/issues/6 -->
+<section class="gallery_section panel">
 {{for photo in gallery}}
-<div class="photo_holder panel">
 
-  <img class="photo" src="{{photo}}"></img>
-</div>
+  <div class="gallery" style="--w: {{photo.width}}; --h: {{photo.height}}; flex-basis: calc(150px * var(--w) / var(--h)); flex-grow: calc(var(--w) / var(--h))">
+    <i class="gallery_padding" style="padding-bottom: calc(var(--h) / var(--w) * 100%)"></i>
+    <img class="gallery_photo" src="{{photo.path}}">
+  </div>
 
-{{endFor}}
+  {{endFor}}
+</section>
 
 {{endBlock}}

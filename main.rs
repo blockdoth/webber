@@ -1783,6 +1783,16 @@ impl ToTemplateValue for Date {
         TemplateValue::Date(self)
     }
 }
+impl ToTemplateValue for GalleryImage {
+    fn to_template_value(self) -> TemplateValue {
+        hash_map! {
+          "path" =>  self.path.to_template_value(),
+          "height" => (self.height as i64).to_template_value(),
+          "width" => (self.width as i64).to_template_value(),
+        }
+        .to_template_value()
+    }
+}
 
 #[derive(Debug, Clone)]
 struct TemplateNode {
@@ -2814,9 +2824,12 @@ impl Content {
         let mut images = vec![];
 
         for (path, image) in gallery {
-            match image.data {
-                AssetData::Png(_) | AssetData::Jpeg(_) => {
-                    images.push(path);
+            match &image.data {
+                AssetData::Png(bin) => {
+                    images.push(GalleryImage::from_png(&path, bin).expect("todo"))
+                }
+                AssetData::Jpeg(bin) => {
+                    images.push(GalleryImage::from_jpg(&path, bin).expect("todo"))
                 }
                 _ => {}
             }
@@ -6860,5 +6873,48 @@ impl Date {
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
 
         era * 146_097 + doe - 719_468
+    }
+}
+struct GalleryImage {
+    path: String,
+    width: u64,
+    height: u64,
+}
+
+impl GalleryImage {
+    fn from_png(path: &str, bin: &[u8]) -> Result<Self, &'static str> {
+        // println!("{:?}", &bin[..32]);
+        if bin.len() < 24 {
+            return Err("PNG too short");
+        }
+
+        if &bin[0..8] != b"\x89PNG\r\n\x1a\n" {
+            return Err("Invalid PNG signature");
+        }
+
+        if &bin[12..16] != b"IHDR" {
+            return Err("Missing IHDR chunk");
+        }
+
+        let width = u32::from_be_bytes(bin[16..20].try_into().expect("invariant")) as u64;
+
+        let height = u32::from_be_bytes(bin[20..24].try_into().expect("invariant")) as u64;
+
+        Ok(Self {
+            path: path.to_owned(),
+            width,
+            height,
+        })
+    }
+
+    fn from_jpg(path: &str, bin: &[u8]) -> Result<Self, &'static str> {
+        let width = 0;
+        let height = 0;
+
+        Ok(Self {
+            path: path.to_owned(),
+            width,
+            height,
+        })
     }
 }
