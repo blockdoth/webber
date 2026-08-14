@@ -8,3 +8,4 @@ published = 2026-07-07
 
 test
 # title
+![image](/images/image.png)

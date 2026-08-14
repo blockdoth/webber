@@ -1,6 +1,6 @@
 ::::
 title = "Title 1"
-published = 2026-07-07
+published = 2026-07-02
 summary = "whole lot about nothing"
 ::::
 

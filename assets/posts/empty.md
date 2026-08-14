@@ -1,6 +1,6 @@
 ::::
 title = "empty"
-published = 2026-07-07
+published = 2026-07-01
 ::::
 
 ```rust

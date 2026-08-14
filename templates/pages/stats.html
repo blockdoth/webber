@@ -3,11 +3,7 @@
 {{block css}}
 <style>
   .stat_entry {
-    border: 1px solid var(--white);
     color: var(--white);
-    padding: 10px;
-    margin-top: 20px;
-    background-color: var(--black);
     display: flex;     
   }  
 
@@ -30,12 +26,12 @@
 {{endBlock}}
 
 {{block body}}
-<div class="stats_description"> 
+<div class="stats_description panel"> 
   Start time: {{stats.start_time}}
 </div>
 {{for page in stats.pages}}
 
-<div class="stat_entry">
+<div class="stat_entry panel">
   <a class="url" href="{{page.path}}">{{page.path}}</a>
   
   <div class="stats">

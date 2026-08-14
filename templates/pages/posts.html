@@ -7,14 +7,9 @@
 
 <style>
   .post_entry {
-    border: 1px solid var(--white);
     color: var(--white);
-    background-color: var(--black);
-    padding: 10px;
-    margin: 20px;
-    margin-left: 0px;
     display: flex;     
-    gap: 2;           
+    gap: 2;       
   }  
 
   .post_title {
@@ -32,6 +27,7 @@
     color: var(--gray);
 
   }
+
 </style>
 {{endBlock}}
 
@@ -39,13 +35,16 @@
 {{block body}}
 
 {{for post in posts}}
-<div class="post_entry">
-  <div>
-    <a href="/posts/{{post.slug}}" class="post_title">{{post.title}}</a>
-    <p class="post_summary">{{post.summary}}</p>
+<a href="/posts/{{post.slug}}">
+
+  <div class="post_entry panel">
+    <div>
+      <p class="post_title">{{post.title}}</p>
+      <p class="post_summary">{{post.summary}}</p>
+    </div>
+    <p class="post_date">{{date post.published "month-name-short-day-year"}}</p>
   </div>
-  <p class="post_date">{{date post.published "month-name-short-day-year"}}</p>
-</div>
+</a>
 
 
 {{endFor}}

@@ -31,7 +31,6 @@
         --blue: #738d82;
       }
 
-
       body {
         background-color: var(--black);
         color: var(--white);
@@ -40,20 +39,27 @@
       
       a {
         text-decoration:none;
+        color: var(--white);
+      }
+
+      .link {
         color: var(--blue);
       }
 
-
       h1, h2, h3 {
         /* padding-top: 1rem; */
+        margin-top: -0.4rem;
         padding-bottom: 0.2rem;
         font-family: 'Future Mono', monospace;
       }
 
       ul {
-        padding-left: 2rem;
+        padding-left: 1rem;
+        list-style: none;
       }
-
+      ul li:before {
+        content: '> ';
+      }
       .container {
         min-height: 100%;
         display: grid;
@@ -72,7 +78,7 @@
       .nav {
         border-color: var(--white);
         border-bottom: 2px solid var(--white);
-        font-size: 20px;
+        font-size: 1.2rem;
         display: flex;
         margin-top: 10px;
         gap: 1.5rem;       
@@ -139,6 +145,13 @@
         padding-top: 5px;
       }
 
+      .panel {
+        background-color: var(--black);
+        margin: 10px;
+        padding: 15px;
+        border: 1px solid var(--white);
+      }
+
     </style>
     <!-- local css -->
     {{block css}} 
@@ -158,11 +171,23 @@
       }
       </script>
     {{endIf}}  
-
+    
+    <script>
+      function prefetch(a) {
+        console.log("prefetch", a.href);        
+        let l = document.createElement("link");
+        l.rel = "prefetch";
+        l.href = a.href;
+        document.head.appendChild(l);
+        a.onmouseenter = null;
+      }
+    </script>
+    
     <!-- local js -->
     {{block js}} 
       
     {{endBlock}}    
+    
 </head>
 
 <body>
@@ -190,7 +215,7 @@
           {{for page in pages-static}}
           
           
-          <a href="{{page.url}}" class="nav_button {{if page.url == current_page_url }} active {{endIf}}" >~/{{page.name}}</a>
+          <a href="{{page.url}}" onmouseenter="prefetch(this)" class="nav_button {{if page.url == current_page_url }} active {{endIf}}" >~/{{page.name}}</a>
           
           {{endFor}}
         </div>
@@ -209,8 +234,8 @@
         <span>© {{copyright_start}}-{{date copyright_end "year"}} blockdoth</span>
 
         <span>
-          Powered by <a href="https://github.com/blockdoth/webber/">webber</a>,
-          version: <a href="https://github.com/blockdoth/webber/commit/{{git_hash_long}}">{{git_hash_short}}</a>
+          Powered by <a class="link" href="https://github.com/blockdoth/webber/">webber</a>,
+          version: <a class="link" href="https://github.com/blockdoth/webber/commit/{{git_hash_long}}">{{git_hash_short}}</a>
         </span>
       </div>
     </div>

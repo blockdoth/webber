@@ -31,6 +31,7 @@ use std::slice;
 use std::str::{CharIndices, FromStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
+use std::vec::IntoIter;
 use std::{char, fmt, fs, vec};
 
 const ASSETS_PATH: &str = "./assets/";
@@ -132,6 +133,9 @@ fn comptime() -> Result<(), Box<dyn Error>> {
         let content_str = match asset_path.extension().and_then(|s| s.to_str()) {
             Some("png") | Some("ico") => {
                 &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())")
+            }
+            Some("jpg") | Some("jpeg") => {
+                &format!("AssetData::Jpeg(include_bytes!({global_path:?}).to_vec())")
             }
             Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
             Some("otf") => &format!("AssetData::Otf(include_bytes!({global_path:?}).to_vec())"),
@@ -328,9 +332,13 @@ impl Context {
             Date::from_systemtime(SystemTime::now()).expect("failed to parse date");
 
         content.update_asset_content(&mut context);
+        context.insert_global("random_quote_index", 0);
         context.insert_global("basedate", Date::default());
         context.insert_global("copyright_start", "2026".to_string());
-        context.insert_global("copyright_end", Date::from_systemtime(SystemTime::now()).expect("invariant")); // TODO make dynamic
+        context.insert_global(
+            "copyright_end",
+            Date::from_systemtime(SystemTime::now()).expect("invariant"),
+        ); // TODO make dynamic
         context.insert_global("domain", domain);
         context.insert_global("last_build_date", last_build_date); // TODO make dynamic
 
@@ -386,6 +394,7 @@ impl HttpServer {
     fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), Box<dyn Error>> {
         let mut read_buffer: [u8; 8192] = [0; 8192]; // 8kb buffer,
         let mut template_cache: HashMap<String, String> = HashMap::new();
+        let mut current_day = Date::days();
 
         #[cfg(debug_assertions)]
         let mut check_alive_timer = Instant::now();
@@ -393,6 +402,8 @@ impl HttpServer {
         let mut check_fs_timer = Instant::now();
 
         let mut check_db_sync_timer = Instant::now();
+        let mut check_day_timer = Instant::now();
+        let mut last_day = 0;
 
         println!("Static Routes:");
         for (route, page) in &router.static_routes {
@@ -517,6 +528,12 @@ impl HttpServer {
                     }
                 }
             };
+
+            let day = Date::days();
+            if day != last_day {
+                last_day = day;
+                router.content.update_random_quote(&mut router.context, day);
+            }
 
             #[cfg(debug_assertions)]
             {
@@ -650,11 +667,30 @@ impl HttpServer {
         .expect("writing to Vec<u8> cannot fail");
 
         response_buffer.extend_from_slice(body);
-        stream.write_all(response_buffer)?;
-
+        Self::write_all_nonblocking(stream, response_buffer)?;
         Ok(())
     }
 
+    // Required to transmit larger payloads that dont fit into the kernel buffer
+    fn write_all_nonblocking(stream: &mut TcpStream, mut buffer: &[u8]) -> io::Result<()> {
+        while !buffer.is_empty() {
+            match stream.write(buffer) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write response",
+                    ));
+                }
+                Ok(n) => buffer = &buffer[n..],
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::hint::spin_loop();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
     fn build_error_response(
         &mut self,
         router: &Router,
@@ -1253,9 +1289,10 @@ impl Template {
         for node in template {
             match &node.data {
                 TemplateNodeData::Text(text) => out.push_str(text),
-                TemplateNodeData::Variable(ident_fields) => {
-                    match Self::resolve_var(ident_fields, context, &node.pos)? {
+                TemplateNodeData::Variable(var) => {
+                    match Self::resolve_var(var, context, &node.pos)? {
                         Text(text) => out.push_str(text),
+                        Number(number) => out.push_str(&number.to_string()),
                         Bool(bool_val) => write!(out, "{bool_val}")?,
                         List(list) => write!(out, "{list:?}")?,
                         Object(object) => write!(out, "{object:?}")?,
@@ -1311,22 +1348,26 @@ impl Template {
                     iter_bind,
                     iter_src,
                     body,
+                    skip,
                 } => {
                     // Todo remove clone
-                    if let List(iter) = Self::resolve_var(iter_src, context, &node.pos)? {
-                        for it in iter {
-                            let child_context = LocalContext::new(context, iter_bind, it);
+                    match Self::resolve_var(iter_src, context, &node.pos)? {
+                        List(iter) => {
+                            for it in iter.iter().skip(*skip) {
+                                let child_context = LocalContext::new(context, iter_bind, it);
 
-                            Self::render_helper(body, &child_context, blocks, out)?;
+                                Self::render_helper(body, &child_context, blocks, out)?;
+                            }
                         }
-                    } else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::VariableNotOfExpectedType(
-                                iter_src.concat(),
-                                TemplateValueKind::List,
-                            ),
-                            node.pos.clone(),
-                        ));
+                        other => {
+                            return Err(TemplateError::new(
+                                TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                    other.kind(),
+                                    TemplateValueKind::List,
+                                ),
+                                node.pos.clone(),
+                            ));
+                        }
                     }
                 }
                 TemplateNodeData::Block { ident, body } => {
@@ -1337,24 +1378,27 @@ impl Template {
                     }
                 }
                 TemplateNodeData::Date { date_var, format } => {
-                    if let Date(date) = Self::resolve_var(date_var, context, &node.pos)? {
-                        if let Some(dateformat) = DateFormat::parse(format) {
-                            let date = date.format(&dateformat);
-                            out.push_str(&date)
-                        } else {
+                    match Self::resolve_var(date_var, context, &node.pos)? {
+                        Date(date) => {
+                            if let Some(dateformat) = DateFormat::parse(format) {
+                                let date = date.format(&dateformat);
+                                out.push_str(&date)
+                            } else {
+                                return Err(TemplateError::new(
+                                    TemplateErrorMsg::UnknownDateFormat(format.to_string()),
+                                    node.pos.clone(),
+                                ));
+                            }
+                        }
+                        other => {
                             return Err(TemplateError::new(
-                                TemplateErrorMsg::UnknownDateFormat(format.to_string()),
+                                TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                    other.kind(),
+                                    TemplateValueKind::Date,
+                                ),
                                 node.pos.clone(),
                             ));
-                        };
-                    } else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::VariableNotOfExpectedType(
-                                date_var.concat(),
-                                TemplateValueKind::Date,
-                            ),
-                            node.pos.clone(),
-                        ));
+                        }
                     }
                 }
             };
@@ -1363,87 +1407,155 @@ impl Template {
     }
 
     fn resolve_var<'a>(
-        ident_fields: &[String],
+        var: &Var,
         context: &'a dyn TemplateContext,
         pos: &TemplatePositionData,
     ) -> Result<&'a TemplateValue, TemplateError> {
-        let Some(mut current) = context.lookup(&ident_fields[0]) else {
-            let field = ident_fields[0].to_string();
+        let Some(mut current) = context.lookup(&var.base) else {
             let mut pos = pos.clone();
 
             if let Some(span) = &mut pos.span {
-                span.end = span.start + field.len();
+                span.end = span.start + var.base.len();
             }
 
             return Err(TemplateError::new(
-                TemplateErrorMsg::VariableNotFound(field),
+                TemplateErrorMsg::VariableNotFound(var.base.clone()),
                 pos,
             ));
         };
 
-        let mut field_idx = 1;
+        let node_span = pos.span.as_ref().expect("variable must have span");
+        let mut access_start = node_span.start + var.base.len();
 
-        let node_span = pos.span.as_ref().expect("pretty sure this is always true");
-        let mut start_field = node_span.start
-            + ident_fields
-                .first()
-                .expect("pretty sure this is always true")
-                .len();
+        for access in &var.indices {
+            access_start += 1;
 
-        for field in &ident_fields[1..] {
-            start_field += 1;
-            current = match current {
-                TemplateValue::Object(map) => {
-                    if let Some(obj) = map.get(field.as_str()) {
-                        obj
-                    } else {
+            current = match access {
+                VarIndex::Field { field, span } => {
+                    let TemplateValue::Object(map) = current else {
                         return Err(TemplateError::new(
+                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                current.kind(),
+                                TemplateValueKind::Object,
+                            ),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
+                            },
+                        ));
+                    };
+
+                    map.get(field).ok_or_else(|| {
+                        TemplateError::new(
                             TemplateErrorMsg::FieldNotFoundOnVariable(
-                                ident_fields[0..field_idx].concat(),
+                                Box::new(var.clone()),
                                 field.to_string(),
                             ),
                             TemplatePositionData {
                                 file: pos.file.clone(),
-                                span: Some(Span::from_double(start_field, node_span.end)),
+                                span: Some(span.clone()),
+                            },
+                        )
+                    })?
+                }
+
+                VarIndex::Index { idx, span } => {
+                    let TemplateValue::List(list) = current else {
+                        return Err(TemplateError::new(
+                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                current.kind(),
+                                TemplateValueKind::List,
+                            ),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
+                            },
+                        ));
+                    };
+
+                    list.get(*idx).ok_or_else(|| {
+                        TemplateError::new(
+                            TemplateErrorMsg::IndexNotInRange(*idx as i64, list.len()),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
+                            },
+                        )
+                    })?
+                }
+
+                VarIndex::Var { var, span } => {
+                    let TemplateValue::List(list) = current else {
+                        return Err(TemplateError::new(
+                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                current.kind(),
+                                TemplateValueKind::List,
+                            ),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
+                            },
+                        ));
+                    };
+
+                    let index_value = Self::resolve_var(var, context, pos)?;
+
+                    let TemplateValue::Number(index) = index_value else {
+                        return Err(TemplateError::new(
+                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                index_value.kind(),
+                                TemplateValueKind::Number,
+                            ),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
+                            },
+                        ));
+                    };
+
+                    if *index < 0 || *index as usize >= list.len() {
+                        return Err(TemplateError::new(
+                            TemplateErrorMsg::IndexNotInRange(*index, list.len()),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
                             },
                         ));
                     }
-                }
-                _ => Err(TemplateError::new(
-                    TemplateErrorMsg::VariableNotOfExpectedType(
-                        field.to_string(),
-                        TemplateValueKind::List,
-                    ),
-                    TemplatePositionData {
-                        file: pos.file.clone(),
-                        span: Some(Span::from_double(start_field, node_span.end)),
-                    },
-                ))?,
-            };
-            start_field += field.len();
 
-            field_idx += 1;
+                    &list[*index as usize]
+                }
+            };
+
+            access_start += access.len();
         }
+
         Ok(current)
     }
 
     fn resolve_bool(
-        condition: &[String],
+        var: &Var,
         context: &dyn TemplateContext,
         node: &TemplateNode,
     ) -> Result<bool, TemplateError> {
         use TemplateValue::*;
-        match Self::resolve_var(condition, context, &node.pos)? {
-            Bool(cond) => Ok(*cond),
-            List(template_values) => Ok(!template_values.is_empty()),
-            Text(text) => Ok(!text.is_empty()),
-            _ => Err(TemplateError::new(
-                TemplateErrorMsg::VariableNotOfExpectedType(
-                    condition.concat(),
+        match Self::resolve_var(var, context, &node.pos) {
+            Ok(Bool(cond)) => Ok(*cond),
+            Ok(List(template_values)) => Ok(!template_values.is_empty()),
+            Ok(Text(text)) => Ok(!text.is_empty()),
+
+            Err(TemplateError {
+                typ: TemplateErrorMsg::IndexNotInRange(_, _),
+                ..
+            }) => Ok(false),
+            Ok(other) => Err(TemplateError::new(
+                TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                    other.kind(),
                     TemplateValueKind::Bool,
                 ),
                 node.pos.clone(),
             ))?,
+            Err(err) => Err(err),
         }
     }
 
@@ -1465,15 +1577,17 @@ impl Template {
 #[derive(Clone, Debug)]
 enum TemplateValue {
     Text(String),
+    Number(i64),
     Date(Date),
     Bool(bool),
     List(Vec<TemplateValue>),
     Object(HashMap<String, TemplateValue>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TemplateValueKind {
     Text,
+    Number,
     Bool,
     Date,
     List,
@@ -1484,6 +1598,7 @@ impl TemplateValue {
     fn kind(&self) -> TemplateValueKind {
         match self {
             TemplateValue::Text(_) => TemplateValueKind::Text,
+            TemplateValue::Number(_) => TemplateValueKind::Number,
             TemplateValue::Bool(_) => TemplateValueKind::Bool,
             TemplateValue::Date(_) => TemplateValueKind::Date,
             TemplateValue::List(_) => TemplateValueKind::List,
@@ -1552,7 +1667,7 @@ impl ToTemplateValue for Duration {
 }
 impl ToTemplateValue for i64 {
     fn to_template_value(self) -> TemplateValue {
-        format!("{:.2?}", self).to_template_value()
+        TemplateValue::Number(self)
     }
 }
 
@@ -1603,7 +1718,7 @@ impl ToTemplateValue for AssetData {
     fn to_template_value(self) -> TemplateValue {
         use AssetData::*;
         match self {
-            Png(_) | Ico(_) | Woff2(_) | Otf(_) | Unknown(_) => {
+            Png(_) | Jpeg(_) | Ico(_) | Woff2(_) | Otf(_) | Unknown(_) => {
                 todo!("Cant insert binary assets into context yet")
             }
             Empty => todo!("not sure what to do with this"),
@@ -1617,10 +1732,7 @@ impl ToTemplateValue for MarkdownPost {
     fn to_template_value(self) -> TemplateValue {
         let published = match self.metadata.published {
             Ok(date) => date.to_template_value(),
-            Err(err) => {
-                
-                (*err).to_owned().to_template_value()
-            }
+            Err(err) => (*err).to_owned().to_template_value(),
         };
 
         let summary = self
@@ -1637,6 +1749,7 @@ impl ToTemplateValue for MarkdownPost {
           "slug" => self.metadata.slug.to_template_value(),
           "published" => published,
           "tags" => self.metadata.tags.to_template_value(),
+          "images" => self.images.to_template_value(),
           "summary" => summary,
           "draft" => self.metadata.draft.to_template_value(),
           "content" => self.html.to_template_value(),
@@ -1677,12 +1790,59 @@ struct TemplateNode {
     pos: TemplatePositionData,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum VarIndex {
+    Field { field: String, span: Span },
+    Index { idx: usize, span: Span },
+    Var { var: Var, span: Span },
+}
+
+impl Display for VarIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VarIndex::Field { field, .. } => write!(f, "{field}"),
+            VarIndex::Index { idx, .. } => write!(f, "[{idx}]"),
+            VarIndex::Var { var, .. } => write!(f, "[{var}]"),
+        }
+    }
+}
+
+impl VarIndex {
+    fn len(&self) -> usize {
+        match self {
+            VarIndex::Field { field, .. } => field.len(),
+            VarIndex::Index { idx, .. } => idx.to_string().len() + 2, // [idx]
+            VarIndex::Var { var, .. } => var.to_string().len() + 2,   // [idx]
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Var {
+    base: String,
+    indices: Vec<VarIndex>,
+}
+
+impl Display for Var {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.base)?;
+        for i in &self.indices {
+            match i {
+                VarIndex::Field { field, .. } => write!(f, ".{field}")?,
+                VarIndex::Index { idx, .. } => write!(f, "[{idx}]")?,
+                VarIndex::Var { var, .. } => write!(f, "[{var}]")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 enum TemplateNodeData {
     Text(String),
-    Variable(Vec<String>),
+    Variable(Var),
     Date {
-        date_var: Vec<String>,
+        date_var: Var,
         format: String,
     },
     If {
@@ -1692,8 +1852,9 @@ enum TemplateNodeData {
     },
     For {
         iter_bind: String,
-        iter_src: Vec<String>,
+        iter_src: Var,
         body: Vec<TemplateNode>,
+        skip: usize,
     },
     Block {
         ident: String,
@@ -1703,13 +1864,13 @@ enum TemplateNodeData {
 
 #[derive(Debug, Clone)]
 enum ConditionExpr {
-    Var(Vec<String>),
-    VarComp(Vec<String>, Vec<String>),
-    LiteralComp(Vec<String>, String),
+    Var(Var),
     Literal(bool),
+    LiteralComp(Var, String),
+    VarComp(Var, Var),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum TemplateNodeKind {
     Text,
     Date,
@@ -1723,7 +1884,7 @@ impl TemplateNodeData {
     fn kind(&self) -> TemplateNodeKind {
         match self {
             TemplateNodeData::Text(_) => TemplateNodeKind::Text,
-            TemplateNodeData::Variable(_) => TemplateNodeKind::Variable,
+            TemplateNodeData::Variable { .. } => TemplateNodeKind::Variable,
             TemplateNodeData::Date { .. } => TemplateNodeKind::Date,
             TemplateNodeData::If { .. } => TemplateNodeKind::If,
             TemplateNodeData::For { .. } => TemplateNodeKind::For,
@@ -1736,8 +1897,8 @@ impl fmt::Display for TemplateNodeData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TemplateNodeData::Text(text) => write!(f, "{}", text),
-            TemplateNodeData::Variable(parts) => {
-                write!(f, "{}", parts.join("."))
+            TemplateNodeData::Variable(var) => {
+                write!(f, "{var}")
             }
             TemplateNodeData::If {
                 condition,
@@ -1757,22 +1918,17 @@ impl fmt::Display for TemplateNodeData {
                     .join("\n");
 
                 match condition {
-                    ConditionExpr::Var(ident_1) => write!(
+                    ConditionExpr::Var(var) => write!(
                         f,
-                        "if {} then {{\n \t{then_branch_str}\n}} else {{\n\t{else_branch_str}\n}}",
-                        ident_1.join(".")
+                        "if {var} then {{\n \t{then_branch_str}\n}} else {{\n\t{else_branch_str}\n}}",
                     ),
-                    ConditionExpr::VarComp(ident_1, ident_2) => write!(
+                    ConditionExpr::VarComp(var_1, var_2) => write!(
                         f,
-                        "if {} == {} then {{\n \t{then_branch_str}\n}} else {{\n\t{else_branch_str}\n}}",
-                        ident_1.join("."),
-                        ident_2.join("."),
+                        "if {var_1} == {var_2} then {{\n \t{then_branch_str}\n}} else {{\n\t{else_branch_str}\n}}"
                     ),
-                    ConditionExpr::LiteralComp(ident_1, literal) => write!(
+                    ConditionExpr::LiteralComp(var, literal) => write!(
                         f,
-                        "if {} == \"{}\" then {{\n \t{then_branch_str}\n}} else {{\n\t{else_branch_str}\n}}",
-                        ident_1.join("."),
-                        literal
+                        "if {var} == \"{literal}\" then {{\n \t{then_branch_str}\n}} else {{\n\t{else_branch_str}\n}}",
                     ),
                     ConditionExpr::Literal(literal) => write!(
                         f,
@@ -1785,20 +1941,16 @@ impl fmt::Display for TemplateNodeData {
                 iter_bind,
                 iter_src,
                 body,
+                skip,
             } => {
                 let body_str = body
                     .iter()
+                    .skip(*skip)
                     .map(|n| format!("{}", n.data))
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                write!(
-                    f,
-                    "for {} in {} {{\n{}\n}}",
-                    iter_bind,
-                    iter_src.join("."),
-                    body_str
-                )
+                write!(f, "for {iter_bind} in {iter_src} {{\n{body_str}\n}}")
             }
             TemplateNodeData::Block { ident, body } => {
                 let body_str = body
@@ -1809,7 +1961,7 @@ impl fmt::Display for TemplateNodeData {
                 write!(f, "block {ident} {{\n{body_str}\n}}")
             }
             TemplateNodeData::Date { date_var, format } => {
-                write!(f, "block {} {format:?}", date_var.join("."))
+                write!(f, "block {date_var} {format:?}")
             }
         }
     }
@@ -1818,9 +1970,12 @@ impl fmt::Display for TemplateNodeData {
 #[derive(Debug, PartialEq, Clone)]
 enum TemplateToken {
     Text(Span),
+    Number(Span),
     Identifier(Span),
     Literal(Span),
     Dot(Span),
+    BracketOpen(Span),
+    BracketClose(Span),
     Equals(Span),
     Whitespace(Span),
     If(Span),
@@ -1835,6 +1990,7 @@ enum TemplateToken {
     EndBlock(Span),
     Extends(Span),
     Date(Span),
+    Skip(Span),
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1857,6 +2013,10 @@ enum TemplateTokenTyp {
     Dot,
     Date,
     Equals,
+    BracketOpen,
+    BracketClose,
+    Number,
+    Skip,
 }
 
 impl TemplateToken {
@@ -1866,6 +2026,7 @@ impl TemplateToken {
 
         match self {
             Token::Text(_) => Typ::Text,
+            Token::Number(_) => Typ::Number,
             Token::Identifier(_) => Typ::Identifier,
             Token::If(_) => Typ::If,
             Token::Else(_) => Typ::Else,
@@ -1875,6 +2036,8 @@ impl TemplateToken {
             Token::EndElse(_) => Typ::EndElse,
             Token::EndFor(_) => Typ::EndFor,
             Token::Block(_) => Typ::Block,
+            Token::BracketOpen(_) => Typ::BracketOpen,
+            Token::BracketClose(_) => Typ::BracketClose,
             Token::EndBlock(_) => Typ::EndBlock,
             Token::Extends(_) => Typ::Extends,
             Token::NewLine(_) => Typ::NewLine,
@@ -1883,12 +2046,14 @@ impl TemplateToken {
             Token::Date(_) => Typ::Date,
             Token::Equals(_) => Typ::Equals,
             Token::Literal(_) => Typ::Literal,
+            Token::Skip(_) => Typ::Skip,
         }
     }
 
     fn span(&self) -> &Span {
         match self {
             Self::Text(span)
+            | Self::Number(span)
             | Self::Identifier(span)
             | Self::Dot(span)
             | Self::Equals(span)
@@ -1898,6 +2063,8 @@ impl TemplateToken {
             | Self::For(span)
             | Self::In(span)
             | Self::EndIf(span)
+            | Self::BracketOpen(span)
+            | Self::BracketClose(span)
             | Self::EndElse(span)
             | Self::EndFor(span)
             | Self::NewLine(span)
@@ -1906,6 +2073,7 @@ impl TemplateToken {
             | Self::Date(span)
             | Self::Extends(span)
             | Self::Literal(span) => span,
+            Self::Skip(span) => span,
         }
     }
 
@@ -2082,21 +2250,23 @@ impl TemplateError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum TemplateErrorMsg {
     VariableNotFound(String),
-    FieldNotFoundOnVariable(String, String),
+    TemplateValueNotOfExptectedType(TemplateValueKind, TemplateValueKind),
+    FieldNotFoundOnVariable(Box<Var>, String),
     NodeNotOfExpectedType(String, TemplateNodeKind),
-    VariableNotOfExpectedType(String, TemplateValueKind),
     UnexpectedToken(TemplateTokenTyp, TemplateTokenTyp),
     DidNotExpectToken(TemplateTokenTyp),
     UnexpectedTokenOptions(TemplateTokenTyp, Vec<TemplateTokenTyp>),
     GenericError(String),
     UnknownDateFormat(String),
-    MultiLevelForLoopBind(Vec<String>),
+    MultiLevelForLoopBind(Box<Var>),
     UnexpectedTemplateValueType(TemplateNodeKind, TemplateNodeKind),
     CantCompareTemplateValues(TemplateValueKind, TemplateValueKind),
     CantCompareWithLiteral(TemplateValueKind),
+    IndexNotInRange(i64, usize),
+    UnableToParseNumber(String),
     ExtendsNotFirstLine,
     UnexpectedEOF,
 }
@@ -2128,8 +2298,9 @@ impl TemplateErrorMsg {
             | UnknownDateFormat(_)
             | FieldNotFoundOnVariable(_, _)
             | NodeNotOfExpectedType(_, _)
-            | VariableNotOfExpectedType(_, _)
+            | TemplateValueNotOfExptectedType(_, _)
             | CantCompareTemplateValues(_, _)
+            | IndexNotInRange(_, _)
             | CantCompareWithLiteral(_) => Render,
 
             UnexpectedToken(_, _)
@@ -2137,6 +2308,7 @@ impl TemplateErrorMsg {
             | UnexpectedTokenOptions(_, _)
             | MultiLevelForLoopBind(_)
             | UnexpectedTemplateValueType(_, _)
+            | UnableToParseNumber(_)
             | ExtendsNotFirstLine
             | UnexpectedEOF => Parse,
 
@@ -2159,16 +2331,29 @@ impl Display for TemplateErrorMsg {
                     "{error_kind}: Field '{field}' was not found on variable '{var}'"
                 )
             }
+            IndexNotInRange(start, len) => {
+                if *start < 0 {
+                    write!(
+                        f,
+                        "{error_kind}: Can not index list of length {len} with negative number {start}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{error_kind}: Index '{start}' out of range of list of len {len}"
+                    )
+                }
+            }
             NodeNotOfExpectedType(node, expected) => {
                 write!(
                     f,
                     "{error_kind}: Node '{node}' is not of expected type {expected:?}"
                 )
             }
-            VariableNotOfExpectedType(var, expected) => {
+            TemplateValueNotOfExptectedType(actual, expected) => {
                 write!(
                     f,
-                    "{error_kind}: Variable '{var}' is not of expected type {expected:?}"
+                    "{error_kind}: TemplateValue '{actual:?}' is not of expected type {expected:?}"
                 )
             }
 
@@ -2202,11 +2387,10 @@ impl Display for TemplateErrorMsg {
             GenericError(msg) => {
                 write!(f, "{error_kind}: {msg}")
             }
-            MultiLevelForLoopBind(path) => {
+            MultiLevelForLoopBind(bind) => {
                 write!(
                     f,
-                    "{error_kind}: For-loop binding must be a single identifier, found '{}'",
-                    path.join(".")
+                    "{error_kind}: For-loop binding must be a single identifier, found '{bind}'",
                 )
             }
             UnexpectedTemplateValueType(expected, found) => {
@@ -2226,6 +2410,9 @@ impl Display for TemplateErrorMsg {
                     f,
                     "{error_kind}: Cannot compare value of type {kind:?} with a literal"
                 )
+            }
+            UnableToParseNumber(string) => {
+                write!(f, "{error_kind}: Unable to parse {string} to number")
             }
             ExtendsNotFirstLine => {
                 write!(
@@ -2349,6 +2536,7 @@ impl Content {
         self.update_quotes(context);
         self.update_pages(context);
         self.update_blogs(context);
+        self.update_gallery(context);
     }
     fn check_update(&mut self, context: &mut Context) -> Result<bool, TemplateError> {
         let assets_changed = match self.update_assets() {
@@ -2475,12 +2663,23 @@ impl Content {
     }
 
     fn update_posts(&self, context: &mut Context) {
-        let posts: Vec<AssetData> = self
+        fn publish_date(asset: &AssetData) -> Option<&Date> {
+            match asset {
+                AssetData::Markdown(ParsedMarkdown::Post(post)) => {
+                    post.metadata.published.as_ref().ok()
+                }
+                _ => None,
+            }
+        }
+
+        let mut posts: Vec<AssetData> = self
             .assets
             .get_partial("/posts/")
             .into_iter()
             .map(|(_, p)| p.data.clone())
             .collect();
+
+        posts.sort_by(|a, b| publish_date(b).cmp(&publish_date(a)));
 
         let post_values = posts.to_template_value();
 
@@ -2566,6 +2765,22 @@ impl Content {
             .insert("quotes".to_owned(), quotes.to_template_value());
     }
 
+    fn update_random_quote(&self, context: &mut Context, day: i64) {
+        let quote_count = if let Some(TemplateValue::List(quotes)) = context.lookup("quotes") {
+            quotes.len() as u64
+        } else {
+            return;
+        };
+
+        if quote_count == 0 {
+            return;
+        }
+
+        if let Some(TemplateValue::Number(number)) = context.lookup_mut("random_quote_index") {
+            *number = (split_mix_64_hash(day as u64) % quote_count) as i64;
+        }
+    }
+
     fn update_pages(&self, context: &mut Context) {
         let pages = self.assets.get_partial("/pages/");
 
@@ -2591,6 +2806,24 @@ impl Content {
                 .global_context
                 .insert("cool_blogs".to_owned(), blogs.to_template_value());
         }
+    }
+
+    fn update_gallery(&self, context: &mut Context) {
+        let gallery = self.assets.get_partial("/gallery/");
+
+        let mut images = vec![];
+
+        for (path, image) in gallery {
+            match image.data {
+                AssetData::Png(_) | AssetData::Jpeg(_) => {
+                    images.push(path);
+                }
+                _ => {}
+            }
+        }
+        context
+            .global_context
+            .insert("gallery".to_owned(), images.to_template_value());
     }
 }
 
@@ -2636,6 +2869,7 @@ enum AssetData {
     Css(String),
     Js(String),
     Png(Vec<u8>),
+    Jpeg(Vec<u8>),
     Ico(Vec<u8>),
     Markdown(ParsedMarkdown),
     Woff2(Vec<u8>),
@@ -2654,6 +2888,7 @@ enum AssetDataRef<'a> {
     Unknown(&'a [u8]),
     UnknownText(&'a str),
     Png(&'a [u8]),
+    Jpeg(&'a [u8]),
     Ico(&'a [u8]),
     Woff2(&'a [u8]),
     Otf(&'a [u8]),
@@ -2668,6 +2903,7 @@ impl AssetDataRef<'_> {
             AssetDataRef::Css(_) => "text/css",
             AssetDataRef::Js(_) => "text/javascript",
             AssetDataRef::Png(_) => "image/png",
+            AssetDataRef::Jpeg(_) => "image/jpeg",
             AssetDataRef::Ico(_) => "image/ico",
             AssetDataRef::Woff2(_) => "font/woff2",
             AssetDataRef::Otf(_) => "font/otf",
@@ -2682,6 +2918,7 @@ impl AssetDataRef<'_> {
     fn as_bytes(&self) -> &[u8] {
         match self {
             AssetDataRef::Png(b)
+            | AssetDataRef::Jpeg(b)
             | AssetDataRef::Ico(b)
             | AssetDataRef::Woff2(b)
             | AssetDataRef::Otf(b)
@@ -2699,6 +2936,7 @@ impl AssetDataRef<'_> {
     fn as_str(&self) -> Option<&str> {
         match self {
             AssetDataRef::Png(_)
+            | AssetDataRef::Jpeg(_)
             | AssetDataRef::Ico(_)
             | AssetDataRef::Woff2(_)
             | AssetDataRef::Otf(_)
@@ -2719,6 +2957,7 @@ impl AssetData {
     fn read_asset(path: &Path) -> Result<AssetData, io::Error> {
         let content = match path.extension().and_then(|s| s.to_str()) {
             Some("png") => AssetData::Png(fs::read(path)?),
+            Some("jpg") | Some("jpeg") => AssetData::Jpeg(fs::read(path)?),
             Some("ico") => AssetData::Ico(fs::read(path)?),
             Some("md") => AssetData::Markdown(MarkdownParser::parse(&fs::read_to_string(path)?)),
             Some("html") => AssetData::Html(fs::read_to_string(path)?),
@@ -2745,6 +2984,7 @@ impl AssetData {
             AssetData::Css(css) => AssetDataRef::Css(css),
             AssetData::Js(js) => AssetDataRef::Js(js),
             AssetData::Png(bytes) => AssetDataRef::Png(bytes),
+            AssetData::Jpeg(bytes) => AssetDataRef::Jpeg(bytes),
             AssetData::Ico(bytes) => AssetDataRef::Ico(bytes),
             AssetData::Markdown(parsed_markdown) => AssetDataRef::Markdown(parsed_markdown),
             AssetData::Woff2(bytes) => AssetDataRef::Woff2(bytes),
@@ -2761,6 +3001,7 @@ impl AssetData {
             AssetData::Css(_) => "text/css",
             AssetData::Js(_) => "text/javascript",
             AssetData::Png(_) => "image/png",
+            AssetData::Jpeg(_) => "image/jpeg",
             AssetData::Ico(_) => "image/ico",
             AssetData::Woff2(_) => "font/woff2",
             AssetData::Otf(_) => "font/otf",
@@ -3046,6 +3287,7 @@ impl<'a> TemplateLexer<'a> {
             ("endIf", EndIf),
             ("block", Block),
             ("date", Date),
+            ("skip", Skip),
             ("else", Else),
             ("for", For),
             ("if", If),
@@ -3064,6 +3306,8 @@ impl<'a> TemplateLexer<'a> {
             if let Some((token, length)) =
                 match rest.chars().next().expect("non-empty rest invariant") {
                     '.' => Some((Dot(Span::from_double(cursor, cursor + 1)), 1)),
+                    '[' => Some((BracketOpen(Span::from_double(cursor, cursor + 1)), 1)),
+                    ']' => Some((BracketClose(Span::from_double(cursor, cursor + 1)), 1)),
 
                     '\n' => {
                         let next = cursor + 1;
@@ -3104,7 +3348,7 @@ impl<'a> TemplateLexer<'a> {
                     _ => None,
                 }
             {
-                Self::flush_ident(&mut tokens, start_ident, cursor);
+                Self::flush_ident(&mut tokens, input, start_ident, cursor);
 
                 tokens.push(token);
                 cursor += length;
@@ -3126,7 +3370,7 @@ impl<'a> TemplateLexer<'a> {
                     }
                 })
             {
-                Self::flush_ident(&mut tokens, start_ident, cursor);
+                Self::flush_ident(&mut tokens, input, start_ident, cursor);
 
                 tokens.push(make_token(Span::from_double(cursor, keyword_end)));
                 cursor = keyword_end;
@@ -3135,7 +3379,7 @@ impl<'a> TemplateLexer<'a> {
                 cursor += 1;
             }
         }
-        Self::flush_ident(&mut tokens, start_ident, end);
+        Self::flush_ident(&mut tokens, input, start_ident, end);
 
         tokens
     }
@@ -3154,9 +3398,18 @@ impl<'a> TemplateLexer<'a> {
         valid_before && valid_after
     }
 
-    fn flush_ident(tokens: &mut Vec<TemplateToken>, start: usize, end: usize) {
-        if start < end && start > 0 {
-            tokens.push(TemplateToken::Identifier(Span::from_double(start, end)));
+    fn flush_ident(tokens: &mut Vec<TemplateToken>, input: &str, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+
+        let span = Span::from_double(start, end);
+        let text = &input[start..end];
+
+        if text.bytes().all(|c| c.is_ascii_digit()) {
+            tokens.push(TemplateToken::Number(span));
+        } else {
+            tokens.push(TemplateToken::Identifier(span));
         }
     }
 }
@@ -3201,6 +3454,7 @@ impl TemplateParser<'_> {
             let tok_str = tok.span().to_str(self.input);
             match tok {
                 TemplateToken::Text(_) => print!("{tok_str}, "),
+                TemplateToken::Number(_) => print!("{tok_str}, "),
                 TemplateToken::Identifier(_) => print!("'{tok_str}', "),
                 TemplateToken::Literal(_) => print!("~{tok_str}~, "),
                 _ => print!("{:?}, ", tok.typ()),
@@ -3278,6 +3532,7 @@ impl TemplateParser<'_> {
                 }
                 Date(_) => self.parse_date()?,
                 Identifier(_) => self.parse_var()?,
+
                 Text(span) => {
                     let text = TemplateNode {
                         data: TemplateNodeData::Text(span.to_str(self.input).to_owned()),
@@ -3457,28 +3712,82 @@ impl TemplateParser<'_> {
     }
 
     fn parse_var(&mut self) -> Result<TemplateNode, TemplateError> {
-        use TemplateToken::*;
+        let base_span = self.consume(TemplateTokenTyp::Identifier)?;
+        let base = base_span.to_str(self.input).to_owned();
 
-        let start_span = self.next_token()?.span().start - 1;
-
-        let mut ident = Vec::new();
-
-        let input = self.input;
+        let mut indices = Vec::new();
+        let mut end_span = base_span.end;
 
         loop {
-            let span = self.consume(TemplateTokenTyp::Identifier)?;
+            let parsed = match self.tokens.get(self.cursor) {
+                Some(TemplateToken::Dot(_)) => Some(self.parse_field_access()?),
 
-            ident.push(span.to_str(input).to_owned());
-            let end_span = span.end - 1;
-            if let Some(Dot(_)) = self.tokens.get(self.cursor) {
-                self.consume(TemplateTokenTyp::Dot)?;
-            } else {
-                return Ok(TemplateNode {
-                    data: TemplateNodeData::Variable(ident),
-                    pos: self.span_to_position(&Span::from_double(start_span, end_span)),
-                });
-            }
+                Some(TemplateToken::BracketOpen(_)) => Some(self.parse_index()?),
+
+                _ => None,
+            };
+
+            let Some((end, index)) = parsed else {
+                break;
+            };
+
+            indices.push(index);
+            end_span = end;
         }
+
+        Ok(TemplateNode {
+            data: TemplateNodeData::Variable(Var { base, indices }),
+            pos: self.span_to_position(&Span::from_double(base_span.start, end_span)),
+        })
+    }
+
+    fn parse_field_access(&mut self) -> Result<(usize, VarIndex), TemplateError> {
+        self.consume(TemplateTokenTyp::Dot)?;
+
+        let field_span = self.consume(TemplateTokenTyp::Identifier)?;
+
+        Ok((
+            field_span.end,
+            VarIndex::Field {
+                field: field_span.to_str(self.input).to_owned(),
+                span: field_span,
+            },
+        ))
+    }
+
+    fn parse_index(&mut self) -> Result<(usize, VarIndex), TemplateError> {
+        self.consume(TemplateTokenTyp::BracketOpen)?;
+
+        let index = if let Some(number_span) = self.try_consume(TemplateTokenTyp::Number) {
+            let number_str = number_span.to_str(self.input);
+
+            let number = number_str.parse::<usize>().map_err(|_| {
+                self.error(
+                    TemplateErrorMsg::UnableToParseNumber(number_str.to_owned()),
+                    self.span_to_position(&number_span),
+                )
+            })?;
+
+            VarIndex::Index {
+                idx: number,
+                span: number_span,
+            }
+        } else {
+            let var_node = self.parse_var()?;
+
+            let TemplateNodeData::Variable(var) = var_node.data else {
+                unreachable!();
+            };
+
+            VarIndex::Var {
+                var,
+                span: var_node.pos.span.expect("invariant"),
+            }
+        };
+
+        let close_span = self.consume(TemplateTokenTyp::BracketClose)?;
+
+        Ok((close_span.end, index))
     }
 
     fn parse_date(&mut self) -> Result<TemplateNode, TemplateError> {
@@ -3521,13 +3830,11 @@ impl TemplateParser<'_> {
         let node = self.parse_var()?;
         let node_span = node.pos.span.expect("msg");
         let bind = if let TemplateNodeData::Variable(var) = node.data {
-            if var.len() == 1
-                && let Some(bind) = var.first()
-            {
-                bind.to_string()
+            if var.indices.is_empty() {
+                var.base
             } else {
                 return Err(self.error(
-                    TemplateErrorMsg::MultiLevelForLoopBind(var),
+                    TemplateErrorMsg::MultiLevelForLoopBind(Box::new(var)),
                     self.range_to_position(whitespace_tok.end, node_span.end),
                 ));
             }
@@ -3560,7 +3867,23 @@ impl TemplateParser<'_> {
                 ));
             }
         };
+        // Self::show_next_n_tokens(&self, 10);
+        let skip = if self.try_consume(Whitespace).is_some()
+            && self.consume(Skip).is_ok()
+            && self.consume(Whitespace).is_ok()
+            && let Ok(number_span) = self.consume(Number)
+        {
+            let number_str = number_span.to_str(self.input);
 
+            number_str.parse::<usize>().map_err(|_| {
+                self.error(
+                    TemplateErrorMsg::UnableToParseNumber(number_str.to_owned()),
+                    self.span_to_position(&number_span),
+                )
+            })?
+        } else {
+            0
+        };
         // Self::show_next_n_tokens(tokens, 3);
         let body: Vec<TemplateNode> = self.parse_until(&[EndFor])?;
         let end_tok = self.consume(EndFor)?;
@@ -3570,6 +3893,7 @@ impl TemplateParser<'_> {
                 iter_bind: bind,
                 iter_src,
                 body,
+                skip,
             },
             pos: self.range_to_position(start_tok.start, end_tok.end),
         })
@@ -3582,15 +3906,13 @@ impl TemplateParser<'_> {
         self.consume(Whitespace)?;
         let ident_node = self.parse_var()?;
         let ident = match ident_node.data {
-            ref node @ TemplateNodeData::Variable(ref var) if var.len() > 1 => {
-                return Err(self.error(
-                    TemplateErrorMsg::GenericError(format!(
-                        "blocks can only contain single level identifiers {node}"
-                    )),
-                    ident_node.pos,
-                ));
-            }
-            TemplateNodeData::Variable(var) => var.first().expect("invariant").clone(),
+            TemplateNodeData::Variable(var) if var.indices.is_empty() => var.base,
+            TemplateNodeData::Variable(var) => Err(self.error(
+                TemplateErrorMsg::GenericError(format!(
+                    "blocks can only contain single level identifiers {var}"
+                )),
+                ident_node.pos,
+            ))?,
             node => {
                 return Err(self.error(
                     TemplateErrorMsg::UnexpectedTemplateValueType(
@@ -3643,6 +3965,7 @@ impl ParsedMarkdown {
 #[derive(Clone, Debug)]
 struct MarkdownPost {
     html: String,
+    images: Vec<String>,
     metadata: PostMetadata,
     highlighted_langs: Vec<SyntaxHighlightLang>,
 }
@@ -3863,6 +4186,84 @@ enum MarkdownNode<'a> {
     },
 }
 
+impl<'a> MarkdownNode<'a> {
+    fn children(&self) -> &[MarkdownNode<'a>] {
+        match self {
+            MarkdownNode::Document(children)
+            | MarkdownNode::Paragraph(children)
+            | MarkdownNode::OrderedList(children)
+            | MarkdownNode::UnorderedList(children)
+            | MarkdownNode::BlockQuote(children)
+            | MarkdownNode::ListItem(children)
+            | MarkdownNode::Italic(children)
+            | MarkdownNode::Bold(children)
+            | MarkdownNode::StrikeThrough(children) => children,
+
+            MarkdownNode::Heading { children, .. } => children,
+            MarkdownNode::Link { text, .. } => text,
+
+            MarkdownNode::CodeBlock { .. }
+            | MarkdownNode::HorizontalLine
+            | MarkdownNode::_Table
+            | MarkdownNode::BreakLine
+            | MarkdownNode::Text(_)
+            | MarkdownNode::InlineCode(_)
+            | MarkdownNode::Image { .. } => &[],
+        }
+    }
+}
+
+impl<'a> MarkdownNode<'a> {
+    fn iter<'b>(&'b self, out: &mut Vec<&'b MarkdownNode<'a>>) {
+        out.push(self);
+
+        match self {
+            MarkdownNode::Document(nodes)
+            | MarkdownNode::Paragraph(nodes)
+            | MarkdownNode::OrderedList(nodes)
+            | MarkdownNode::UnorderedList(nodes)
+            | MarkdownNode::BlockQuote(nodes)
+            | MarkdownNode::ListItem(nodes)
+            | MarkdownNode::Italic(nodes)
+            | MarkdownNode::Bold(nodes)
+            | MarkdownNode::StrikeThrough(nodes) => {
+                for node in nodes {
+                    node.iter(out);
+                }
+            }
+
+            MarkdownNode::Heading { children, .. } => {
+                for node in children {
+                    node.iter(out);
+                }
+            }
+
+            MarkdownNode::Link { text, .. } => {
+                for node in text {
+                    node.iter(out);
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+impl<'a, 'b> IntoIterator for &'b MarkdownNode<'a> {
+    type Item = &'b MarkdownNode<'a>;
+    type IntoIter = IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let mut nodes = vec![self];
+
+        for node in self.children() {
+            nodes.extend(node.into_iter());
+        }
+
+        nodes.into_iter()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum MarkdownBlock<'a> {
     Heading {
@@ -3888,7 +4289,7 @@ enum MarkdownBlock<'a> {
         language: Option<SyntaxHighlightLang>,
         content: &'a [MarkdownToken],
     },
-    _BreakLine,
+    BreakLine,
     HorizontalLine,
 }
 
@@ -4093,11 +4494,13 @@ impl MarkdownParser {
         let blocks = Self::parse_blocks(&lex, markdown_input);
         let ast = Self::parse_block_content(&blocks, markdown_input);
         let highlighted_langs = Self::get_highlighted_langs(&blocks);
+        let images = Self::get_images(&ast);
         let html = Self::to_html(ast);
 
         if let Some(metadata) = metadata {
             ParsedMarkdown::Post(MarkdownPost {
                 html,
+                images,
                 metadata,
                 highlighted_langs,
             })
@@ -4122,6 +4525,18 @@ impl MarkdownParser {
         }
 
         langs
+    }
+    fn get_images(ast: &MarkdownNode<'_>) -> Vec<String> {
+        let mut images = vec![];
+
+        for node in ast {
+            match node {
+                MarkdownNode::Image { alt, path } => images.push(path.to_string()),
+                _ => continue,
+            }
+        }
+
+        images
     }
 
     fn lex(input: &str) -> Vec<MarkdownToken> {
@@ -4213,7 +4628,14 @@ impl MarkdownParser {
 
         while let [first, rest @ ..] = tokens {
             tokens = match first {
-                NewLine(_) => rest,
+                NewLine(_) => {
+                    blocks.push(BreakLine);
+                    let mut rest = rest;
+                    while let [NewLine(_), tail @ ..] = rest {
+                        rest = tail;
+                    }
+                    rest
+                }
                 Dash(span) if span.len() >= 3 => {
                     blocks.push(HorizontalLine);
                     rest
@@ -4429,7 +4851,7 @@ impl MarkdownParser {
                         content: Self::tokens_to_string(content, input),
                     });
                 }
-                MarkdownBlock::_BreakLine => nodes.push(MarkdownNode::BreakLine),
+                MarkdownBlock::BreakLine => nodes.push(MarkdownNode::BreakLine),
                 MarkdownBlock::HorizontalLine => nodes.push(MarkdownNode::HorizontalLine),
             }
         }
@@ -6232,6 +6654,13 @@ fn sha1(input: &str) -> [u8; 20] {
     digest
 }
 
+fn split_mix_64_hash(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
 #[derive(Debug, Clone)]
 enum DateFormat {
     Rfc1123,
@@ -6249,7 +6678,6 @@ enum DateFormat {
     WeekdayShort,
     MonthNameYearDay,
     MonthNameShortYearDay,
-    Unix,
 }
 
 impl DateFormat {
@@ -6280,19 +6708,17 @@ impl DateFormat {
             "month-name-day-year" => Some(MonthNameYearDay),
             "month-name-short-day-year" => Some(MonthNameShortYearDay),
 
-            "unix" => Some(Unix),
-
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Date {
     day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
+    hour: u64,
+    minute: u64,
+    second: u64,
 }
 
 impl Display for Date {
@@ -6309,6 +6735,11 @@ impl Date {
             minute: 0,
             second: 0,
         }
+    }
+    fn days() -> i64 {
+        let date = Self::from_systemtime(SystemTime::now()).expect("really fucked");
+
+        date.day
     }
 
     fn format(&self, format: &DateFormat) -> String {
@@ -6373,12 +6804,6 @@ impl Date {
             MonthNameYearDay => format!("{month_name} {day:02}, {year:04}"),
             #[allow(non_snake_case)]
             MonthNameShortDayYear => format!("{month_short} {day:02}, {year:04}"),
-            Unix => {
-                let seconds =
-                    self.day * 86_400 + self.hour * 3_600 + self.minute * 60 + self.second;
-
-                seconds.to_string()
-            }
         }
     }
 
@@ -6386,7 +6811,7 @@ impl Date {
         let unix_seconds = time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
         let day = unix_seconds.div_euclid(86_400);
-        let seconds_today = unix_seconds.rem_euclid(86_400);
+        let seconds_today = unix_seconds.rem_euclid(86_400) as u64;
 
         let hour = seconds_today / 3_600;
         let minute = (seconds_today % 3_600) / 60;

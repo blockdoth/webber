@@ -16,6 +16,7 @@
   }  
   .quote_container_container {
     margin-top: 10px;
+    padding: 10px;
   }  
   
   .quote_author {
@@ -26,24 +27,18 @@
     font-family: 'Future Mono', monospace;
 
   }  
-  .quotes_top_level {
-    font-size: 15px;
-    margin-top: 10px;
-    /* margin-bottom: 10px; */
-    padding-bottom: 10px;
-  }  
 
 </style>
 {{endBlock}}
 
 {{block body}}
-    <div class ="quotes_top_level">
+    <div class ="panel">
       Quotes I like in no particulair order
 
     </div>
-    <hr>    
+    
+    <div class="quote_container_container">
 
-  <div class="quote_container_container">
     {{for quote in quotes}}
       <div class="quote_container">
         <div class="quote_quote">
