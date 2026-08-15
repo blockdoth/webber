@@ -31,25 +31,186 @@
   .content {
     width: 100%;
   }
+
+  .gallery_description {
+    margin-top: -15px;
+    position: absolute;
+    font-size: x-small;
+  }
+
+  .background_overlay {
+    display: none;
+    position: absolute;
+    top: 0%;
+    left: 0%;
+    width: 100%;
+    height: 100%;
+    background-color: black;
+    opacity: .80;
+    position: fixed;
+    inset: 0;    
+
+  }
+  
+
+  .popup {
+    display: none;
+    position: absolute;
+    top: 10%;
+    left: 10%;
+    width: 80%;
+    height: 80%;
+    border: 1px solid white;
+    color: white;
+    background-color: black;
+    padding: 10px;
+    position: fixed;
+  }
+
+  .popup_photo {
+    width: 100%;
+    height: 100%;
+  }
+
+  .popup_container {
+    width: 100%;
+    height: 100%;
+    display: flex;    
+  } 
+
+  .popup_left_column {
+    flex: 1;     
+  }
+
+  .popup_right_column {
+    flex: 1;
+    width: 30px;   
+    padding-left: 10px;  
+  } 
+  .metadata_line {
+    font-size: smaller;
+    color: var(--gray);
+    display: grid;
+    grid-template-columns: 120px auto;    
+  }
+
 </style>
 {{endBlock}}
+
+{{block js}}
+  <script>
+    
+    function openPopUp(gallery) {
+      const photo = gallery.querySelector(".gallery_photo");
+    
+      const popup = document.querySelector(".popup");
+      const background_overlay = document.querySelector(".background_overlay");
+    
+      
+      const popupPhoto = document.createElement("img");
+      popupPhoto.src = photo.src;
+      popupPhoto.className = "popup_photo"
+      
+      const photo_origin = document.querySelector(".popup_left_column");
+      photo_origin.innerHTML = "";
+
+      photo_origin.appendChild(popupPhoto);
+
+      const metadata_origin = document.querySelector(".popup_right_column");
+
+      metadata_origin.innerHTML = "<h3>Metadata</h3>";
+
+      const metadata = [
+        ["Date", gallery.dataset.date],
+        ["Model", gallery.dataset.model],
+        ["Time", gallery.dataset.time],
+        ["ISO", gallery.dataset.iso],
+        ["Exposure", gallery.dataset.exposure_time],
+        ["Aperture", gallery.dataset.f_number],
+        ["Focal length", gallery.dataset.focal_length],
+      ];
+
+
+      for (const [key, value] of metadata) {
+        if (!value) continue;
+      
+        const line = document.createElement("div");
+        line.className = "metadata_line"
+        
+        const metadata_key = document.createElement("span");
+        metadata_key.textContent = `${key}:`;
+
+        const metadata_value = document.createElement("span");
+        metadata_value.textContent = value;
+
+        line.append(metadata_key, metadata_value);
+
+        metadata_origin.appendChild(line);
+      }
+
+      popup.style.display = "block";
+      background_overlay.style.display = "block";
+    }
+    
+    function closePopUp() {
+      document.querySelector('.popup').style.display='none'; 
+      document.querySelector('.background_overlay').style.display='none' 
+    }
+  </script>
+
+{{endBlock}}
+
 
 {{block body}}
 
 <div class="panel">
   Some photo's I like
+
 </div>
 
 <!-- Inspired by: https://github.com/xieranmaya/blog/issues/6 -->
 <section class="gallery_section panel">
 {{for photo in gallery}}
 
-  <div class="gallery" style="--w: {{photo.width}}; --h: {{photo.height}}; flex-basis: calc(150px * var(--w) / var(--h)); flex-grow: calc(var(--w) / var(--h))">
+  <div 
+    class="gallery" 
+    style="--w: {{photo.width}}; --h: {{photo.height}}; flex-basis: calc(150px * var(--w) / var(--h)); flex-grow: calc(var(--w) / var(--h))"
+    onclick="openPopUp(this)"
+
+    {{if photo.metadata}}
+      data-model="{{photo.metadata.model}}"
+      data-date="{{date photo.metadata.datetime_original "date" }}"
+      data-time="{{date photo.metadata.datetime_original "time" }}"
+      data-iso="{{photo.metadata.iso}}"
+      data-exposure_time="{{photo.metadata.exposure_time}}"
+      data-f_number="{{photo.metadata.f_number}}"
+      data-focal_length="{{photo.metadata.focal_length}}"
+
+    {{endIf}}
+
+    >
     <i class="gallery_padding" style="padding-bottom: calc(var(--h) / var(--w) * 100%)"></i>
     <img class="gallery_photo" src="{{photo.path}}">
+
+
   </div>
 
   {{endFor}}
 </section>
 
 {{endBlock}}
+
+
+{{block popup}} 
+<div class="background_overlay" onclick="closePopUp()"></div>
+
+<div class="popup">
+  <div class="popup_container">
+    <div class="popup_left_column"></div>
+    <div class="popup_right_column"></div>
+  </div>
+</div>
+{{endBlock}}
+
+
+

@@ -1589,11 +1589,18 @@ impl Template {
             Ok(Bool(cond)) => Ok(*cond),
             Ok(List(template_values)) => Ok(!template_values.is_empty()),
             Ok(Text(text)) => Ok(!text.is_empty()),
+            Ok(Object(obj)) => Ok(!obj.is_empty()),
 
             Err(TemplateError {
                 typ: TemplateErrorMsg::IndexNotInRange(_, _),
                 ..
             }) => Ok(false),
+
+            Err(TemplateError {
+                typ: TemplateErrorMsg::FieldNotFoundOnVariable(_, _),
+                ..
+            }) => Ok(false),
+
             Ok(other) => Err(TemplateError::new(
                 TemplateErrorMsg::TemplateValueNotOfExptectedType(
                     other.kind(),
@@ -1843,14 +1850,63 @@ impl ToTemplateValue for Date {
         TemplateValue::Date(self)
     }
 }
+
 impl ToTemplateValue for GalleryImage {
     fn to_template_value(self) -> TemplateValue {
-        hash_map! {
+        let mut base = hash_map! {
           "path" =>  self.path.to_template_value(),
           "height" => (self.height as i64).to_template_value(),
           "width" => (self.width as i64).to_template_value(),
+        };
+
+        if let Some(metadata) = self.metadata {
+            base.insert("metadata", metadata.to_template_value());
         }
-        .to_template_value()
+
+        base.to_template_value()
+    }
+}
+
+impl ToTemplateValue for ExifMetadata {
+    fn to_template_value(self) -> TemplateValue {
+        let mut obj = HashMap::new();
+
+
+        if let Some(value) = self.orientation {
+            obj.insert("orientation".to_owned(), (value as i64).to_template_value());
+        }
+        if let Some(value) = self.model {
+            obj.insert("model".to_owned(), value.to_template_value());
+        }
+        if let Some(value) = self.lens_model {
+            obj.insert("lens_model".to_owned(), value.to_template_value());
+        }
+        if let Some(value) = self.datetime_original {
+            obj.insert("datetime_original".to_owned(), value.to_template_value());
+        }
+        if let Some(value) = self.iso {
+            obj.insert("iso".to_owned(), (value as i64).to_template_value());
+        }
+        if let Some(value) = self.exposure_time {
+            obj.insert(
+                "exposure_time".to_owned(),
+                format!("1/{}", 1.0 / value).to_template_value(),
+            );
+        }
+        if let Some(value) = self.f_number {
+            obj.insert(
+                "f_number".to_owned(),
+                format!("{value:.1}").to_template_value(),
+            );
+        }
+        if let Some(value) = self.focal_length {
+            obj.insert(
+                "focal_length".to_owned(),
+                format!("{value:.1}").to_template_value(),
+            );
+        }
+
+        TemplateValue::Object(obj)
     }
 }
 
@@ -6916,6 +6972,28 @@ impl Date {
             second,
         })
     }
+
+    fn from_exif_date(date_str: String) -> Option<Self> {
+        let (date, time) = date_str.split_once(' ')?;
+
+        let mut date_parts = date.split(':');
+        let year: i32 = date_parts.next()?.parse().ok()?;
+        let month: u32 = date_parts.next()?.parse().ok()?;
+        let day: u32 = date_parts.next()?.parse().ok()?;
+
+        let mut time_parts = time.split(':');
+        let hour: u64 = time_parts.next()?.parse().ok()?;
+        let minute: u64 = time_parts.next()?.parse().ok()?;
+        let second: u64 = time_parts.next()?.parse().ok()?;
+
+        Some(Self {
+            day: Self::days_from_civil(year, month, day),
+            hour,
+            minute,
+            second,
+        })
+    }
+
     // Inspired by this posts and rewriten in rust by clanker
     // https://howardhinnant.github.io/date_algorithms.html
     fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
@@ -6967,11 +7045,17 @@ const TAG_DATETIME_ORIGINAL: u16 = 0x9003;
 const TAG_FOCAL_LENGTH: u16 = 0x920a;
 const TAG_LENS_MODEL: u16 = 0xa434;
 
-#[derive(Debug)]
-struct GalleryImage {
-    path: String,
-    width: u64,
-    height: u64,
+#[derive(Debug, Default)]
+struct ExifMetadata {
+    orientation: Option<u16>,
+    model: Option<String>,
+    lens_model: Option<String>,
+    datetime_original: Option<Date>,
+
+    iso: Option<u32>,
+    exposure_time: Option<f64>,
+    f_number: Option<f64>,
+    focal_length: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -6983,6 +7067,14 @@ enum ImageParseError {
     InvalidSegmentLength,
     DimensionsNotFound,
     InvalidExif,
+}
+
+#[derive(Debug)]
+struct GalleryImage {
+    path: String,
+    width: u64,
+    height: u64,
+    metadata: Option<ExifMetadata>,
 }
 
 impl GalleryImage {
@@ -7008,6 +7100,7 @@ impl GalleryImage {
             path: path.to_owned(),
             width,
             height,
+            metadata: None,
         })
     }
 
@@ -7075,6 +7168,7 @@ impl GalleryImage {
             path: path.to_owned(),
             width: width.ok_or(ImageParseError::DimensionsNotFound)?,
             height: height.ok_or(ImageParseError::DimensionsNotFound)?,
+            metadata: exif_data,
         })
     }
 
@@ -7102,7 +7196,7 @@ impl GalleryImage {
             &tiff[ifd0_offset..],
             endian,
             |tag, ty, count, value| match tag {
-                TAG_MAKE => metadata.make = Self::exif_ascii(tiff, ty, count, value, endian),
+                // TAG_MAKE => metadata.make = Self::exif_ascii(tiff, ty, count, value, endian),
                 TAG_MODEL => metadata.model = Self::exif_ascii(tiff, ty, count, value, endian),
                 TAG_ORIENTATION => {
                     metadata.orientation = Self::exif_u16(tiff, ty, count, value, endian)
@@ -7121,8 +7215,10 @@ impl GalleryImage {
                 TAG_LENS_MODEL => {
                     metadata.lens_model = Self::exif_ascii(tiff, ty, count, value, endian)
                 }
-                TAG_DATETIME_ORIGINAL => {
-                    metadata.datetime_original = Self::exif_ascii(tiff, ty, count, value, endian)
+                TAG_DATETIME_ORIGINAL
+                    if let Some(date) = Self::exif_ascii(tiff, ty, count, value, endian) =>
+                {
+                    metadata.datetime_original = Date::from_exif_date(date);
                 }
                 TAG_EXPOSURE_TIME => {
                     metadata.exposure_time = Self::exif_rational(tiff, ty, count, value, endian)
@@ -7299,18 +7395,4 @@ impl Endian {
             Self::Big => u32::from_be_bytes(bytes),
         })
     }
-}
-
-#[derive(Debug, Default)]
-struct ExifMetadata {
-    orientation: Option<u16>,
-    make: Option<String>,
-    model: Option<String>,
-    lens_model: Option<String>,
-    datetime_original: Option<String>,
-
-    iso: Option<u32>,
-    exposure_time: Option<f64>,
-    f_number: Option<f64>,
-    focal_length: Option<f64>,
 }
