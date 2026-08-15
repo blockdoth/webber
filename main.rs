@@ -20,8 +20,9 @@ use std::error::Error;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt::Write as FmtWrite;
 use std::fmt::{Debug, Display};
+use std::fs::{File, OpenOptions};
 use std::hash::BuildHasher;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::iter::{Peekable, zip};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ use std::ptr::{null, null_mut};
 use std::slice;
 use std::str::{CharIndices, FromStr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::vec::IntoIter;
 use std::{char, fmt, fs, vec};
@@ -40,6 +42,7 @@ const TEMPLATES_PATH: &str = "./templates/";
 const DEBUG_BIN_PATH: &str = "./target/debug/webber";
 const RELEASE_BIN_PATH: &str = "./target/release/webber";
 const METRICS_CACHE_SIZE: usize = 1000;
+const DB_SYNC_INTERVAL: u64 = 60;
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
@@ -130,23 +133,45 @@ fn comptime() -> Result<(), Box<dyn Error>> {
             .expect("Failed to strip prefix")
             .to_string_lossy()
             .into_owned();
+
         let content_str = match asset_path.extension().and_then(|s| s.to_str()) {
-            Some("png") | Some("ico") => {
-                &format!("AssetData::Png(include_bytes!({global_path:?}).to_vec())")
+            Some("png") => {
+                format!("AssetData::Png(Cow::Borrowed(include_bytes!({global_path:?})))")
             }
-            Some("jpg") | Some("jpeg") => {
-                &format!("AssetData::Jpeg(include_bytes!({global_path:?}).to_vec())")
+            Some("ico") => {
+                format!("AssetData::Ico(Cow::Borrowed(include_bytes!({global_path:?})))")
             }
-            Some("woff2") => &format!("AssetData::Woff2(include_bytes!({global_path:?}).to_vec())"),
-            Some("otf") => &format!("AssetData::Otf(include_bytes!({global_path:?}).to_vec())"),
-            Some("md") => &format!(
-                "AssetData::Markdown(MarkdownParser::parse(&include_str!({global_path:?})))"
-            ),
-            Some("html") => &format!("AssetData::Html(include_str!({global_path:?}))"),
-            Some("txt") => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
-            Some("css") => &format!("AssetData::Css(include_str!({global_path:?}).to_string())"),
-            Some("js") => &format!("AssetData::Js(include_str!({global_path:?}).to_string())"),
-            _ => &format!("AssetData::Text(include_str!({global_path:?}).to_string())"),
+            Some("jpg") | Some("jpeg") | Some("JPG") | Some("JPEG") => {
+                format!("AssetData::Jpeg(Cow::Borrowed(include_bytes!({global_path:?})))")
+            }
+            Some("woff2") => {
+                format!("AssetData::Woff2(Cow::Borrowed(include_bytes!({global_path:?})))")
+            }
+            Some("otf") => {
+                format!("AssetData::Otf(Cow::Borrowed(include_bytes!({global_path:?})))")
+            }
+
+            Some("md") => {
+                format!(
+                    "AssetData::Markdown(Cow::Owned(MarkdownParser::parse(include_str!({global_path:?}))))"
+                )
+            }
+
+            Some("html") => {
+                format!("AssetData::Html(Cow::Borrowed(include_str!({global_path:?})))")
+            }
+            Some("txt") => {
+                format!("AssetData::Text(Cow::Borrowed(include_str!({global_path:?})))")
+            }
+            Some("css") => {
+                format!("AssetData::Css(Cow::Borrowed(include_str!({global_path:?})))")
+            }
+            Some("js") => {
+                format!("AssetData::Js(Cow::Borrowed(include_str!({global_path:?})))")
+            }
+            _ => {
+                format!("AssetData::Text(Cow::Borrowed(include_str!({global_path:?})))")
+            }
         };
 
         out.push_str(&format!(
@@ -290,10 +315,10 @@ fn runtime() -> Result<(), Box<dyn Error>> {
     }
     let config = Config::from_env();
 
-    run_server(config.bind_address(), config.domain)
+    start_server(config.bind_address(), config.domain)
 }
 
-fn run_server(socket_addr: String, domain: String) -> Result<(), Box<dyn Error>> {
+fn start_server(socket_addr: String, domain: String) -> Result<(), Box<dyn Error>> {
     register_signal_handlers();
 
     let mut db = Db::init()?;
@@ -428,7 +453,7 @@ impl HttpServer {
         'main: while !SHUTDOWN.load(Ordering::Relaxed) {
             match listener.accept() {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if check_db_sync_timer.elapsed() > Duration::from_secs(60) {
+                    if check_db_sync_timer.elapsed() > Duration::from_secs(DB_SYNC_INTERVAL) {
                         router.db.sync()?;
                         check_db_sync_timer = Instant::now();
                     }
@@ -473,7 +498,7 @@ impl HttpServer {
                             is_ws = true;
                         }
                         path => {
-                            if path.starts_with("/api") {
+                            let result = if path.starts_with("/api") {
                                 match router.serve_api(&header, body) {
                                     Ok(content) => Self::send_response(
                                         HttpResponseCode::Ok,
@@ -511,7 +536,28 @@ impl HttpServer {
                                         self.build_error_response(&router, err, &mut stream)
                                     }
                                 }
-                            }?;
+                            };
+
+                            if let Err(err) = result {
+                                match err {
+                                    HttpServerError::StreamWriteFailed(ref io_err)
+                                        if matches!(
+                                            io_err.kind(),
+                                            ErrorKind::BrokenPipe
+                                                | ErrorKind::ConnectionReset
+                                                | ErrorKind::ConnectionAborted
+                                        ) =>
+                                    {
+                                        // browser/client disappeared.
+                                        continue 'main;
+                                    }
+
+                                    err => {
+                                        eprintln!("[{peer_addr}] request failed: {err}");
+                                        continue 'main;
+                                    }
+                                }
+                            }
 
                             let end_timer = Instant::now();
                             let duration = end_timer - start_timer;
@@ -819,7 +865,7 @@ impl HttpServer {
 enum HttpServerError {
     Redirect(String),
     TemplatingError(TemplateError),
-    StreamWriteFailed,
+    StreamWriteFailed(std::io::Error),
     MalformedRequest,
     InvalidRequestType(String),
     Todo,
@@ -831,7 +877,7 @@ impl Display for HttpServerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Redirect(location) => write!(f, "redirect to {location}"),
-            Self::StreamWriteFailed => write!(f, "failed to write to stream"),
+            Self::StreamWriteFailed(error) => write!(f, "failed to write to stream {error}"),
             Self::TemplatingError(error) => write!(f, "templating error: {error}"),
             Self::InvalidRequestType(request) => write!(f, "invalid request type {request}"),
             Self::Todo => write!(f, "operation not implemented"),
@@ -841,8 +887,8 @@ impl Display for HttpServerError {
 }
 
 impl From<std::io::Error> for HttpServerError {
-    fn from(_value: std::io::Error) -> Self {
-        HttpServerError::StreamWriteFailed
+    fn from(value: std::io::Error) -> Self {
+        HttpServerError::StreamWriteFailed(value)
     }
 }
 
@@ -1723,7 +1769,21 @@ impl ToTemplateValue for AssetData {
             }
             Empty => todo!("not sure what to do with this"),
             AssetData::Text(s) | Html(s) | Css(s) | Js(s) | UnknownText(s) => s.to_template_value(),
+
             Markdown(parsed) => parsed.to_template_value(),
+        }
+    }
+}
+
+impl<T> ToTemplateValue for Cow<'static, T>
+where
+    T: ToOwned + ?Sized,
+    T::Owned: ToTemplateValue,
+{
+    fn to_template_value(self) -> TemplateValue {
+        match self {
+            Cow::Borrowed(inner) => inner.to_owned().to_template_value(),
+            Cow::Owned(inner) => inner.to_template_value(),
         }
     }
 }
@@ -2675,7 +2735,8 @@ impl Content {
     fn update_posts(&self, context: &mut Context) {
         fn publish_date(asset: &AssetData) -> Option<&Date> {
             match asset {
-                AssetData::Markdown(ParsedMarkdown::Post(post)) => {
+                AssetData::Markdown(Cow::Owned(ParsedMarkdown::Post(post)))
+                | AssetData::Markdown(Cow::Borrowed(ParsedMarkdown::Post(post))) => {
                     post.metadata.published.as_ref().ok()
                 }
                 _ => None,
@@ -2825,12 +2886,14 @@ impl Content {
 
         for (path, image) in gallery {
             match &image.data {
-                AssetData::Png(bin) => {
-                    images.push(GalleryImage::from_png(&path, bin).expect("todo"))
-                }
-                AssetData::Jpeg(bin) => {
-                    images.push(GalleryImage::from_jpg(&path, bin).expect("todo"))
-                }
+                AssetData::Png(bin) => match GalleryImage::from_png(&path, bin) {
+                    Ok(img) => images.push(img),
+                    Err(err) => println!("{err:?}"),
+                },
+                AssetData::Jpeg(bin) => match GalleryImage::from_jpg(&path, bin) {
+                    Ok(img) => images.push(img),
+                    Err(err) => println!("{err:?}"),
+                },
                 _ => {}
             }
         }
@@ -2877,18 +2940,18 @@ enum AssetTyp {
 
 #[derive(Clone, Debug)]
 enum AssetData {
-    Text(String),
-    Html(String),
-    Css(String),
-    Js(String),
-    Png(Vec<u8>),
-    Jpeg(Vec<u8>),
-    Ico(Vec<u8>),
-    Markdown(ParsedMarkdown),
-    Woff2(Vec<u8>),
-    Otf(Vec<u8>),
-    UnknownText(String),
-    Unknown(Vec<u8>),
+    Text(Cow<'static, str>),
+    Html(Cow<'static, str>),
+    Css(Cow<'static, str>),
+    Js(Cow<'static, str>),
+    Png(Cow<'static, [u8]>),
+    Jpeg(Cow<'static, [u8]>),
+    Ico(Cow<'static, [u8]>),
+    Markdown(Cow<'static, ParsedMarkdown>),
+    Woff2(Cow<'static, [u8]>),
+    Otf(Cow<'static, [u8]>),
+    UnknownText(Cow<'static, str>),
+    Unknown(Cow<'static, [u8]>),
     Empty,
 }
 #[derive(Clone, Debug)]
@@ -2969,21 +3032,25 @@ impl AssetDataRef<'_> {
 impl AssetData {
     fn read_asset(path: &Path) -> Result<AssetData, io::Error> {
         let content = match path.extension().and_then(|s| s.to_str()) {
-            Some("png") => AssetData::Png(fs::read(path)?),
-            Some("jpg") | Some("jpeg") => AssetData::Jpeg(fs::read(path)?),
-            Some("ico") => AssetData::Ico(fs::read(path)?),
-            Some("md") => AssetData::Markdown(MarkdownParser::parse(&fs::read_to_string(path)?)),
-            Some("html") => AssetData::Html(fs::read_to_string(path)?),
-            Some("txt") => AssetData::Text(fs::read_to_string(path)?),
-            Some("otf") => AssetData::Otf(fs::read(path)?),
-            Some("woff2") => AssetData::Woff2(fs::read(path)?),
-            Some("css") => AssetData::Css(fs::read_to_string(path)?),
-            Some("js") => AssetData::Js(fs::read_to_string(path)?),
+            Some("png") => AssetData::Png(Cow::Owned(fs::read(path)?)),
+            Some("jpg") | Some("jpeg") | Some("JPG") | Some("JPEG") => {
+                AssetData::Jpeg(Cow::Owned(fs::read(path)?))
+            }
+            Some("ico") => AssetData::Ico(Cow::Owned(fs::read(path)?)),
+            Some("md") => AssetData::Markdown(Cow::Owned(MarkdownParser::parse(
+                &fs::read_to_string(path)?,
+            ))),
+            Some("html") => AssetData::Html(Cow::Owned(fs::read_to_string(path)?)),
+            Some("txt") => AssetData::Text(Cow::Owned(fs::read_to_string(path)?)),
+            Some("otf") => AssetData::Otf(Cow::Owned(fs::read(path)?)),
+            Some("woff2") => AssetData::Woff2(Cow::Owned(fs::read(path)?)),
+            Some("css") => AssetData::Css(Cow::Owned(fs::read_to_string(path)?)),
+            Some("js") => AssetData::Js(Cow::Owned(fs::read_to_string(path)?)),
             _ => {
                 if let Ok(text) = fs::read_to_string(path) {
-                    AssetData::Text(text)
+                    AssetData::Text(Cow::Owned(text))
                 } else {
-                    AssetData::Unknown(fs::read(path)?)
+                    AssetData::Unknown(Cow::Owned(fs::read(path)?))
                 }
             }
         };
@@ -3027,23 +3094,31 @@ impl AssetData {
 
     fn from_asset_type(buffer: &[u8], content_typ: &AssetTyp) -> AssetData {
         match content_typ {
-            AssetTyp::Png => AssetData::Png(buffer.to_owned()),
-            AssetTyp::Ico => AssetData::Ico(buffer.to_owned()),
-            AssetTyp::Woff2 => AssetData::Woff2(buffer.to_owned()),
-            AssetTyp::Otf => AssetData::Otf(buffer.to_owned()),
-            AssetTyp::Html => AssetData::Html(String::from_utf8_lossy(buffer).into_owned()),
-            AssetTyp::Css => AssetData::Css(String::from_utf8_lossy(buffer).into_owned()),
-            AssetTyp::Js => AssetData::Js(String::from_utf8_lossy(buffer).into_owned()),
-            AssetTyp::Text => AssetData::Text(String::from_utf8_lossy(buffer).into_owned()),
+            AssetTyp::Png => AssetData::Png(Cow::Owned(buffer.to_owned())),
+            AssetTyp::Ico => AssetData::Ico(Cow::Owned(buffer.to_owned())),
+            AssetTyp::Woff2 => AssetData::Woff2(Cow::Owned(buffer.to_owned())),
+            AssetTyp::Otf => AssetData::Otf(Cow::Owned(buffer.to_owned())),
+            AssetTyp::Js => AssetData::Js(Cow::Owned(String::from_utf8_lossy(buffer).into_owned())),
+            AssetTyp::Empty => AssetData::Empty,
+            AssetTyp::Md => todo!(),
+            AssetTyp::Html => {
+                AssetData::Html(Cow::Owned(String::from_utf8_lossy(buffer).into_owned()))
+            }
+            AssetTyp::Css => {
+                AssetData::Css(Cow::Owned(String::from_utf8_lossy(buffer).into_owned()))
+            }
+            AssetTyp::Text => {
+                AssetData::Text(Cow::Owned(String::from_utf8_lossy(buffer).into_owned()))
+            }
             AssetTyp::UnknownText
                 if let s = String::from_utf8_lossy(buffer)
                     && !s.is_empty() =>
             {
-                AssetData::UnknownText(s.into_owned())
+                AssetData::UnknownText(Cow::Owned(s.into_owned()))
             }
-            AssetTyp::UnknownText | AssetTyp::Unknown => AssetData::Unknown(buffer.to_vec()),
-            AssetTyp::Md => todo!(),
-            AssetTyp::Empty => AssetData::Empty,
+            AssetTyp::UnknownText | AssetTyp::Unknown => {
+                AssetData::Unknown(Cow::Owned(buffer.to_vec()))
+            }
         }
     }
 }
@@ -5802,7 +5877,7 @@ impl Connection {
         Ok(())
     }
 
-    fn import_db(path: PathBuf) -> Result<Connection, Box<dyn Error>> {
+    fn import_db(path: PathBuf) -> Result<(Connection, usize), Box<dyn Error>> {
         let bytes = fs::read(&path)?;
 
         let conn = Connection::deserialize(&bytes)?;
@@ -5811,7 +5886,7 @@ impl Connection {
             Blob::pretty_bytes(bytes.len())
         );
 
-        Ok(conn)
+        Ok((conn, bytes.len()))
     }
 
     fn sqlite_error_msg(conn: &Connection) -> String {
@@ -5891,55 +5966,65 @@ impl Blob {
         Ok(Some(&bytes[blob_offset..length_offset]))
     }
 
-    fn write_blob(bytes: &mut Vec<u8>, blob: &[u8]) -> Result<(), Box<dyn Error>> {
+    fn write_blob<W: Write>(writer: &mut W, blob: &[u8]) -> Result<(), Box<dyn Error>> {
         // Replace the existing blob rather than appending another blob each time.
-        Blob::remove_blob(bytes)?;
 
-        bytes.extend_from_slice(blob);
-        bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(BLOB_MAGIC);
-
-        Ok(())
-    }
-
-    fn remove_blob(bytes: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
-        if bytes.len() < BLOB_FOOTER_SIZE {
-            // Binary to small
-            return Ok(());
-        }
-
-        let magic_offset = bytes.len() - BLOB_MAGIC.len();
-
-        if &bytes[magic_offset..] != BLOB_MAGIC {
-            return Ok(());
-        }
-
-        let length_offset = magic_offset - 8;
-
-        let blob_len = usize::from_le_bytes(bytes[length_offset..magic_offset].try_into()?);
-
-        let blob_offset = length_offset - blob_len;
-
-        bytes.truncate(blob_offset);
+        writer.write_all(blob);
+        writer.write_all(&(blob.len() as u64).to_le_bytes());
+        writer.write_all(BLOB_MAGIC);
 
         Ok(())
     }
 
-    fn self_modify(
-        path: &PathBuf,
-        bytes: &mut Vec<u8>,
-        conn: &Connection,
-    ) -> Result<(), Box<dyn Error>> {
+    fn find_blob_start_offset(file: &mut File) -> Result<u64, Box<dyn Error>> {
+        let old_exe_len = file.metadata()?.len() as usize;
+
+        file.seek(SeekFrom::End(-(BLOB_MAGIC.len() as i64)))?;
+
+        let mut magic = vec![0; BLOB_MAGIC.len()];
+        file.read_exact(&mut magic)?;
+
+        if magic != BLOB_MAGIC {
+            return Ok(old_exe_len as u64);
+        }
+
+        let len_offset = BLOB_MAGIC.len() + size_of::<u64>();
+        file.seek(SeekFrom::End(-(len_offset as i64)))?;
+
+        let mut len_bytes = [0u8; size_of::<u64>()];
+        file.read_exact(&mut len_bytes)?;
+        let db_len = usize::from_le_bytes(len_bytes);
+
+        file.seek(SeekFrom::Start(0))?;
+
+        let trailer_len = len_offset + db_len;
+        Ok((old_exe_len - trailer_len) as u64)
+    }
+
+    fn self_modify(path: &PathBuf, conn: &Connection) -> Result<(), Box<dyn Error>> {
         let start_time = Instant::now();
+
         let serialized = conn.serialize();
 
-        Blob::write_blob(bytes, &serialized)?;
+        let mut old_exe = File::open("/proc/self/exe")?;
+        let perms = old_exe.metadata()?.permissions();
 
         let tmp = path.with_extension("tmp");
 
-        fs::write(&tmp, bytes)?;
+        let blob_start = Self::find_blob_start_offset(&mut old_exe)?;
+        let mut tmp_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
 
-        let perms = fs::metadata(path)?.permissions();
+        io::copy(&mut old_exe.take(blob_start), &mut tmp_file)?;
+
+        Blob::write_blob(&mut tmp_file, &serialized)?;
+
+        tmp_file.sync_all()?;
+        // drop(tmp_file);
+
         fs::set_permissions(&tmp, perms)?;
 
         // renames the executable, doesnt affect the currently running process
@@ -5947,9 +6032,10 @@ impl Blob {
 
         let end_time = start_time.elapsed();
         println!(
-            "Serialized db into {} bytes in {:?}",
+            "Serialized db into {} bytes in {:?}, total blob size {}",
             Self::pretty_bytes(serialized.len()),
-            end_time
+            end_time,
+            Self::pretty_bytes(blob_start as usize + serialized.len()),
         );
 
         Ok(())
@@ -5973,7 +6059,6 @@ impl Blob {
 #[derive(Debug)]
 struct Db {
     connection: Connection,
-    executable_bytes: Vec<u8>,
     executable_path: PathBuf,
     unsynced: bool,
     metric_cache: HashMap<String, Vec<CachedPageHit>>,
@@ -6020,7 +6105,6 @@ impl Db {
         };
         let mut db = Self {
             connection: conn,
-            executable_bytes,
             executable_path: current_executable_path,
             unsynced: true,
             metric_cache: HashMap::new(),
@@ -6036,11 +6120,7 @@ impl Db {
         }
 
         if self.unsynced {
-            Blob::self_modify(
-                &self.executable_path,
-                &mut self.executable_bytes,
-                &self.connection,
-            )?;
+            Blob::self_modify(&self.executable_path, &self.connection)?;
             self.unsynced = false;
             Ok(())
         } else {
@@ -6284,10 +6364,9 @@ impl Db {
 
         let executable_bytes = fs::read(&executable_path)?;
 
-        let connection = Connection::import_db(path)?;
+        let (connection, blob_size) = Connection::import_db(path)?;
         let mut db = Db {
             connection,
-            executable_bytes,
             executable_path,
             unsynced: true,
             metric_cache: HashMap::new(),
@@ -6875,25 +6954,50 @@ impl Date {
         era * 146_097 + doe - 719_468
     }
 }
+
+const TAG_MAKE: u16 = 0x010f;
+const TAG_MODEL: u16 = 0x0110;
+const TAG_ORIENTATION: u16 = 0x0112;
+const TAG_EXIF_IFD: u16 = 0x8769;
+
+const TAG_EXPOSURE_TIME: u16 = 0x829a;
+const TAG_F_NUMBER: u16 = 0x829d;
+const TAG_ISO: u16 = 0x8827;
+const TAG_DATETIME_ORIGINAL: u16 = 0x9003;
+const TAG_FOCAL_LENGTH: u16 = 0x920a;
+const TAG_LENS_MODEL: u16 = 0xa434;
+
+#[derive(Debug)]
 struct GalleryImage {
     path: String,
     width: u64,
     height: u64,
 }
 
+#[derive(Debug)]
+enum ImageParseError {
+    BinaryBlobToShort,
+    InvalidPngSignature,
+    MissingIhdrChunk,
+    UnexpectedEof,
+    InvalidSegmentLength,
+    DimensionsNotFound,
+    InvalidExif,
+}
+
 impl GalleryImage {
-    fn from_png(path: &str, bin: &[u8]) -> Result<Self, &'static str> {
+    fn from_png(path: &str, bin: &[u8]) -> Result<Self, ImageParseError> {
         // println!("{:?}", &bin[..32]);
         if bin.len() < 24 {
-            return Err("PNG too short");
+            return Err(ImageParseError::BinaryBlobToShort);
         }
 
         if &bin[0..8] != b"\x89PNG\r\n\x1a\n" {
-            return Err("Invalid PNG signature");
+            return Err(ImageParseError::InvalidPngSignature);
         }
 
         if &bin[12..16] != b"IHDR" {
-            return Err("Missing IHDR chunk");
+            return Err(ImageParseError::MissingIhdrChunk);
         }
 
         let width = u32::from_be_bytes(bin[16..20].try_into().expect("invariant")) as u64;
@@ -6907,14 +7011,306 @@ impl GalleryImage {
         })
     }
 
-    fn from_jpg(path: &str, bin: &[u8]) -> Result<Self, &'static str> {
-        let width = 0;
-        let height = 0;
+    fn from_jpg(path: &str, bin: &[u8]) -> Result<Self, ImageParseError> {
+        let mut cursor = 0;
 
-        Ok(Self {
+        let mut width = None;
+        let mut height = None;
+
+        let mut exif_data = None;
+
+        while cursor < bin.len() {
+            let marker = u16::from_be_bytes(bin[cursor..cursor + 2].try_into().unwrap());
+            cursor += 2;
+
+            match marker {
+                0xffd8 => continue, // SOI
+                0xffd9 => break,    // EOI
+                0xffda => break,    // SOS
+                0xffd0..=0xffd7 | 0xff01 => continue,
+                _ => {}
+            }
+
+            let segment_len =
+                u16::from_be_bytes(bin[cursor..cursor + 2].try_into().unwrap()) as usize;
+
+            if segment_len < 2 {
+                return Err(ImageParseError::InvalidSegmentLength);
+            }
+            cursor += 2;
+
+            let payload_len = segment_len - 2;
+            let payload = bin
+                .get(cursor..cursor + payload_len)
+                .ok_or(ImageParseError::UnexpectedEof)?;
+
+            if payload.starts_with(b"Exif\0\0") {
+                exif_data = Self::parse_tiff(payload);
+            }
+
+            if matches!(
+                marker,
+                0xFFC0..=0xFFC3 | 0xFFC5..=0xFFC7 | 0xFFC9..=0xFFCB | 0xFFCD..=0xFFCF
+            ) {
+                let header = &bin[cursor..cursor + 6];
+
+                width = Some(u16::from_be_bytes([header[3], header[4]]) as u64);
+                height = Some(u16::from_be_bytes([header[1], header[2]]) as u64);
+            }
+
+            cursor += payload_len;
+
+            if cursor > bin.len() {
+                return Err(ImageParseError::UnexpectedEof);
+            }
+        }
+
+        if let Some(metadata) = &exif_data
+            && matches!(metadata.orientation, Some(5..=8))
+        {
+            std::mem::swap(&mut width, &mut height);
+        }
+        // println!("{exif_data:#?}");
+        Ok(GalleryImage {
             path: path.to_owned(),
-            width,
-            height,
+            width: width.ok_or(ImageParseError::DimensionsNotFound)?,
+            height: height.ok_or(ImageParseError::DimensionsNotFound)?,
         })
     }
+
+    fn parse_tiff(tiff: &[u8]) -> Option<ExifMetadata> {
+        let tiff = tiff.strip_prefix(b"Exif\0\0")?;
+
+        let endian = match tiff.get(..2)? {
+            b"II" => Endian::Little,
+            b"MM" => Endian::Big,
+            _ => return None,
+        };
+
+        if endian.u16(tiff.get(2..)?)? != 42 {
+            // hehehe
+            return None;
+        }
+
+        let ifd0_offset = endian.u32(tiff.get(4..)?)? as usize;
+
+        let mut metadata = ExifMetadata::default();
+
+        let mut exif_ifd_offset = None;
+
+        Self::parse_ifd(
+            &tiff[ifd0_offset..],
+            endian,
+            |tag, ty, count, value| match tag {
+                TAG_MAKE => metadata.make = Self::exif_ascii(tiff, ty, count, value, endian),
+                TAG_MODEL => metadata.model = Self::exif_ascii(tiff, ty, count, value, endian),
+                TAG_ORIENTATION => {
+                    metadata.orientation = Self::exif_u16(tiff, ty, count, value, endian)
+                }
+                TAG_EXIF_IFD => {
+                    exif_ifd_offset =
+                        Self::exif_u32(tiff, ty, count, value, endian).map(|v| v as usize)
+                }
+                _ => {}
+            },
+        )?;
+
+        if let Some(offset) = exif_ifd_offset {
+            Self::parse_ifd(&tiff[offset..], endian, |tag, ty, count, value| match tag {
+                TAG_ISO => metadata.iso = Self::exif_unsigned(tiff, ty, count, value, endian),
+                TAG_LENS_MODEL => {
+                    metadata.lens_model = Self::exif_ascii(tiff, ty, count, value, endian)
+                }
+                TAG_DATETIME_ORIGINAL => {
+                    metadata.datetime_original = Self::exif_ascii(tiff, ty, count, value, endian)
+                }
+                TAG_EXPOSURE_TIME => {
+                    metadata.exposure_time = Self::exif_rational(tiff, ty, count, value, endian)
+                }
+                TAG_F_NUMBER => {
+                    metadata.f_number = Self::exif_rational(tiff, ty, count, value, endian)
+                }
+                TAG_FOCAL_LENGTH => {
+                    metadata.focal_length = Self::exif_rational(tiff, ty, count, value, endian)
+                }
+                _ => {}
+            })?;
+        }
+
+        Some(metadata)
+    }
+
+    fn parse_ifd(
+        tiff: &[u8],
+        endian: Endian,
+        mut handle: impl FnMut(u16, u16, u32, &[u8]),
+    ) -> Option<()> {
+        let count = endian.u16(tiff)? as usize;
+
+        for i in 0..count {
+            let pos = 2 + i * 12;
+            let entry = tiff.get(pos..pos + 12)?;
+
+            let tag = endian.u16(&entry[0..2])?;
+            let ty = endian.u16(&entry[2..4])?;
+            let count = endian.u32(&entry[4..8])?;
+            let value = &entry[8..12];
+
+            handle(tag, ty, count, value);
+        }
+
+        Some(())
+    }
+
+    // Deals with direct value / offset distinction
+    fn exif_value_data<'a>(
+        tiff: &'a [u8],
+        element_size: usize,
+        count: u32,
+        value: &'a [u8],
+        endian: Endian,
+    ) -> Option<&'a [u8]> {
+        let size = element_size * count as usize;
+
+        if size <= 4 {
+            Some(&value[..size])
+        } else {
+            let offset = endian.u32(value)? as usize;
+            Some(&tiff[offset..offset + size])
+        }
+    }
+
+    fn exif_ascii<'a>(
+        tiff: &'a [u8],
+        ty: u16,
+        count: u32,
+        value: &'a [u8],
+        endian: Endian,
+    ) -> Option<String> {
+        // TIFF type 2 = char
+        if ty != 2 || count == 0 {
+            return None;
+        }
+
+        let bytes = Self::exif_value_data(tiff, 1, count, value, endian)?;
+
+        // Zero terminated
+        let bytes = bytes.split(|&byte| byte == b'\0').next().unwrap_or(bytes);
+
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+
+    fn exif_u16(tiff: &[u8], ty: u16, count: u32, value: &[u8], endian: Endian) -> Option<u16> {
+        // TIFF type 3 = u16
+        if ty != 3 || count < 1 {
+            return None;
+        }
+
+        let data = Self::exif_value_data(tiff, 2, count, value, endian)?;
+
+        endian.u16(data)
+    }
+
+    fn exif_u32(tiff: &[u8], ty: u16, count: u32, value: &[u8], endian: Endian) -> Option<u32> {
+        // TIFF type 4 = u32
+        if ty != 4 || count < 1 {
+            return None;
+        }
+
+        let data = Self::exif_value_data(tiff, 4, count, value, endian)?;
+
+        endian.u32(data)
+    }
+
+    fn exif_unsigned(
+        tiff: &[u8],
+        ty: u16,
+        count: u32,
+        value: &[u8],
+        endian: Endian,
+    ) -> Option<u32> {
+        match ty {
+            // u8
+            1 => {
+                let data = Self::exif_value_data(tiff, 1, count, value, endian)?;
+                Some(*data.first()? as u32)
+            }
+            // u16
+            3 => {
+                let data = Self::exif_value_data(tiff, 2, count, value, endian)?;
+                Some(endian.u16(data)? as u32)
+            }
+            // u32
+            4 => {
+                let data = Self::exif_value_data(tiff, 4, count, value, endian)?;
+                endian.u32(data)
+            }
+            _ => None,
+        }
+    }
+
+    fn exif_rational(
+        tiff: &[u8],
+        ty: u16,
+        count: u32,
+        value: &[u8],
+        endian: Endian,
+    ) -> Option<f64> {
+        // TIFF type 5 = RATIONAL:
+        // two u32 values: numerator / denominator.
+        if ty != 5 || count < 1 {
+            return None;
+        }
+
+        let data = Self::exif_value_data(tiff, 8, count, value, endian)?;
+
+        let numerator = endian.u32(&data[0..4])?;
+        let denominator = endian.u32(&data[4..8])?;
+
+        if denominator == 0 {
+            return None;
+        }
+
+        Some(numerator as f64 / denominator as f64)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Endian {
+    Little,
+    Big,
+}
+
+impl Endian {
+    fn u16(self, bytes: &[u8]) -> Option<u16> {
+        let bytes: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+
+        Some(match self {
+            Self::Little => u16::from_le_bytes(bytes),
+            Self::Big => u16::from_be_bytes(bytes),
+        })
+    }
+
+    fn u32(self, bytes: &[u8]) -> Option<u32> {
+        let bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+
+        Some(match self {
+            Self::Little => u32::from_le_bytes(bytes),
+            Self::Big => u32::from_be_bytes(bytes),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExifMetadata {
+    orientation: Option<u16>,
+    make: Option<String>,
+    model: Option<String>,
+    lens_model: Option<String>,
+    datetime_original: Option<String>,
+
+    iso: Option<u32>,
+    exposure_time: Option<f64>,
+    f_number: Option<f64>,
+    focal_length: Option<f64>,
 }
