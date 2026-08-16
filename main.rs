@@ -25,6 +25,7 @@ use std::hash::BuildHasher;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::iter::{Peekable, zip};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::{null, null_mut};
@@ -42,7 +43,7 @@ const TEMPLATES_PATH: &str = "./templates/";
 const DEBUG_BIN_PATH: &str = "./target/debug/webber";
 const RELEASE_BIN_PATH: &str = "./target/release/webber";
 const METRICS_CACHE_SIZE: usize = 1000;
-const DB_SYNC_INTERVAL: u64 = 60;
+const DB_SYNC_INTERVAL: u64 = 1;
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
@@ -5044,7 +5045,7 @@ impl MarkdownParser {
         use MarkdownNode::*;
         use MarkdownToken::*;
         let mut nodes = vec![];
-        println!("{tokens:#?}");
+
         while !tokens.is_empty() {
             match &tokens {
                 [Backtick(open), rest @ ..] if open.len() == 1 => {
@@ -5133,9 +5134,6 @@ impl MarkdownParser {
                 }
             }
         }
-        println!("Nodes {nodes:#?}");
-
-        // panic!();
 
         nodes
     }
@@ -6025,11 +6023,9 @@ impl Blob {
     }
 
     fn write_blob<W: Write>(writer: &mut W, blob: &[u8]) -> Result<(), Box<dyn Error>> {
-        // Replace the existing blob rather than appending another blob each time.
-
-        writer.write_all(blob);
-        writer.write_all(&(blob.len() as u64).to_le_bytes());
-        writer.write_all(BLOB_MAGIC);
+        writer.write_all(blob)?;
+        writer.write_all(&(blob.len() as u64).to_le_bytes())?;
+        writer.write_all(BLOB_MAGIC)?;
 
         Ok(())
     }
@@ -6043,6 +6039,7 @@ impl Blob {
         file.read_exact(&mut magic)?;
 
         if magic != BLOB_MAGIC {
+            file.seek(SeekFrom::Start(0))?;
             return Ok(old_exe_len as u64);
         }
 
@@ -6065,23 +6062,22 @@ impl Blob {
         let serialized = conn.serialize();
 
         let mut old_exe = File::open("/proc/self/exe")?;
+
         let perms = old_exe.metadata()?.permissions();
 
         let tmp = path.with_extension("tmp");
 
         let blob_start = Self::find_blob_start_offset(&mut old_exe)?;
+
         let mut tmp_file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&tmp)?;
 
-        io::copy(&mut old_exe.take(blob_start), &mut tmp_file)?;
+        let old_size = io::copy(&mut old_exe.take(blob_start), &mut tmp_file)?;
 
         Blob::write_blob(&mut tmp_file, &serialized)?;
-
-        tmp_file.sync_all()?;
-        // drop(tmp_file);
 
         fs::set_permissions(&tmp, perms)?;
 
@@ -6093,7 +6089,7 @@ impl Blob {
             "Serialized db into {} bytes in {:?}, total blob size {}",
             Self::pretty_bytes(serialized.len()),
             end_time,
-            Self::pretty_bytes(blob_start as usize + serialized.len()),
+            Self::pretty_bytes(old_size as usize + serialized.len()),
         );
 
         Ok(())
