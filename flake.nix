@@ -36,6 +36,7 @@
 
               wrk # for benchmarking
               hey # for benchmarking
+              imagemagick
             ];
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
           };

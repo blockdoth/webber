@@ -4,3 +4,4 @@ result/
 target/
 Cargo.lock
 profile.json.gz
+/gallery/

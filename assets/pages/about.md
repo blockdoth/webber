@@ -1,5 +1,5 @@
 ###Me 
-Computer science student. Currently on a rust streak.
+Computer science student. Appriciator of the intracies of the process of engerineering. Currently on a rust streak.
 
 Browse my [flake](https://github.com/blockdoth/nixos)
 
@@ -23,3 +23,7 @@ The site is entirely self contained within it's executable, so should be reasona
 ### Privacy
 I currently collect page hits and load durations. No IP, user agent or any other traceable information is collected. I might do so in the future out of curiosity. Sue me.
 
+### Attribution
+LLM based chat bots have used during the development of this website, primarily for answering technical question and occasionally to fill out boilerplate code (Think allong the lines of implementing the `Display` trait for error messages). 
+
+For implementing various components of this project I often looked at related libraries in the wild. When my implementation was heavily inspired by something specific I added a reference link as a comment

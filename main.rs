@@ -438,10 +438,10 @@ impl HttpServer {
         for (route, page) in &router.dynamic_routes {
             println!(" {route}\t\t->\t{}", page.template_path);
         }
-        println!("Assets");
-        for (route, asset) in &router.content.assets.collect_kv_mut() {
-            println!(" {route:?}\t\t->\t{}", asset.data.html_typ_string());
-        }
+        // println!("Assets");
+        // for (route, asset) in &router.content.assets.collect_kv_mut() {
+        //     println!(" {route:?}\t\t->\t{}", asset.data.html_typ_string());
+        // }
 
         println!(" Fallback\t->\t{:?}", router.fallback);
 
@@ -1405,6 +1405,7 @@ impl Template {
                                 Self::render_helper(body, &child_context, blocks, out)?;
                             }
                         }
+
                         other => {
                             return Err(TemplateError::new(
                                 TemplateErrorMsg::TemplateValueNotOfExptectedType(
@@ -1871,16 +1872,13 @@ impl ToTemplateValue for ExifMetadata {
     fn to_template_value(self) -> TemplateValue {
         let mut obj = HashMap::new();
 
-
         if let Some(value) = self.orientation {
             obj.insert("orientation".to_owned(), (value as i64).to_template_value());
         }
         if let Some(value) = self.model {
             obj.insert("model".to_owned(), value.to_template_value());
         }
-        if let Some(value) = self.lens_model {
-            obj.insert("lens_model".to_owned(), value.to_template_value());
-        }
+
         if let Some(value) = self.datetime_original {
             obj.insert("datetime_original".to_owned(), value.to_template_value());
         }
@@ -2934,28 +2932,55 @@ impl Content {
                 .insert("cool_blogs".to_owned(), blogs.to_template_value());
         }
     }
-
     fn update_gallery(&self, context: &mut Context) {
-        let gallery = self.assets.get_partial("/gallery/");
+        let gallery_assets = self.assets.get_partial("/gallery/");
 
-        let mut images = vec![];
+        let mut grouped: HashMap<String, Vec<GalleryImage>> = HashMap::new();
 
-        for (path, image) in gallery {
-            match &image.data {
+        for (path, image) in gallery_assets {
+            let img = match &image.data {
                 AssetData::Png(bin) => match GalleryImage::from_png(&path, bin) {
-                    Ok(img) => images.push(img),
-                    Err(err) => println!("{err:?}"),
+                    Ok(img) => img,
+                    Err(err) => {
+                        println!("{err:?}");
+                        continue;
+                    }
                 },
                 AssetData::Jpeg(bin) => match GalleryImage::from_jpg(&path, bin) {
-                    Ok(img) => images.push(img),
-                    Err(err) => println!("{err:?}"),
+                    Ok(img) => img,
+                    Err(err) => {
+                        println!("{err:?}");
+                        continue;
+                    }
                 },
-                _ => {}
-            }
+                _ => continue,
+            };
+
+            let path_buf = PathBuf::from(&path);
+
+            let label = path_buf
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|p| p.to_str())
+                .unwrap_or("unlabelled")
+                .to_owned();
+
+            grouped.entry(label).or_default().push(img);
         }
+
+        let mut gallery = vec![];
+
+        for (label, photos) in grouped {
+            let label = label.split('_').next_back().unwrap_or(&label).to_string();
+            gallery.push(hash_map! {
+                "label" => label.to_template_value(),
+                "photos" => photos.to_template_value(),
+            });
+        }
+
         context
             .global_context
-            .insert("gallery".to_owned(), images.to_template_value());
+            .insert("gallery".to_owned(), gallery.to_template_value());
     }
 }
 
@@ -4634,7 +4659,6 @@ impl MarkdownParser {
             });
 
         let lex = Self::lex(markdown_input);
-
         let blocks = Self::parse_blocks(&lex, markdown_input);
         let ast = Self::parse_block_content(&blocks, markdown_input);
         let highlighted_langs = Self::get_highlighted_langs(&blocks);
@@ -5003,6 +5027,16 @@ impl MarkdownParser {
         MarkdownNode::Document(nodes)
     }
 
+    fn find_closing(tokens: &[MarkdownToken], closing: MarkdownTokenTyp) -> Option<(&Span, usize)> {
+        tokens.iter().enumerate().find_map(|(i, token)| {
+            if token.typ() == closing {
+                Some((token.span(), i))
+            } else {
+                None
+            }
+        })
+    }
+
     fn parse_inline_helper<'a>(
         mut tokens: &'a [MarkdownToken],
         input: &'a str,
@@ -5010,89 +5044,53 @@ impl MarkdownParser {
         use MarkdownNode::*;
         use MarkdownToken::*;
         let mut nodes = vec![];
+        println!("{tokens:#?}");
         while !tokens.is_empty() {
             match &tokens {
                 [Backtick(open), rest @ ..] if open.len() == 1 => {
-                    if let Some(close_index) = rest
-                        .iter()
-                        .position(|token| matches!(token, Backtick(span) if span.len() == 1))
+                    tokens = if let Some((close_span, close_index)) =
+                        Self::find_closing(rest, MarkdownTokenTyp::Backtick(1))
                     {
-                        let Backtick(close) = &rest[close_index] else {
-                            unreachable!();
-                        };
+                        nodes.push(InlineCode(&input[open.end..close_span.start]));
+                        &rest[close_index + 1..]
+                    } else {
+                        nodes.push(Text(open.to_str(input)));
+                        rest
+                    }
+                }
+                [
+                    open @ (Underscore(open_span) | Asterisk(open_span) | Tilde(open_span)),
+                    rest @ ..,
+                ] if open_span.len() == 1 => {
+                    let (closing, make_node): (
+                        MarkdownTokenTyp,
+                        fn(Vec<MarkdownNode<'a>>) -> MarkdownNode<'a>,
+                    ) = match open {
+                        Underscore(_) => (MarkdownTokenTyp::Underscore(1), Italic),
+                        Asterisk(_) => (MarkdownTokenTyp::Asterisk(1), Bold),
+                        Tilde(_) => (MarkdownTokenTyp::Tilde(1), StrikeThrough),
+                        _ => unreachable!(),
+                    };
 
-                        nodes.push(InlineCode(&input[open.end..close.start]));
+                    if let Some((close_span, close_index)) = Self::find_closing(rest, closing) {
+                        nodes.push(make_node(Self::parse_inline_helper(
+                            &rest[..close_index],
+                            input,
+                        )));
 
                         tokens = &rest[close_index + 1..];
                     } else {
-                        nodes.push(Text(&input[open.start..open.end]));
+                        nodes.push(Text(open_span.to_str(input)));
                         tokens = rest;
-                    }
-                }
-                [Underscore(open), _] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
-                    let close_index = tokens.iter().enumerate().position(|(idx, token)| {
-                        matches!(token, Underscore(_)) && Self::delimiter_can_close(tokens, idx)
-                    });
-                    if let Some(close_index) = close_index {
-                        nodes.push(Italic(Self::parse_inline_helper(
-                            &tokens[1..close_index],
-                            input,
-                        )));
-
-                        tokens = &tokens[close_index + 1..];
-                    } else {
-                        nodes.push(Text(open.to_str(input)));
-                        tokens = &tokens[1..];
-                    }
-                }
-                [Asterisk(open), _] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
-                    let close_index = tokens.iter().enumerate().position(|(idx, token)| {
-                        matches!(token, Asterisk(_)) && Self::delimiter_can_close(tokens, idx)
-                    });
-                    if let Some(close_index) = close_index {
-                        nodes.push(Bold(Self::parse_inline_helper(
-                            &tokens[1..close_index],
-                            input,
-                        )));
-
-                        tokens = &tokens[close_index + 1..];
-                    } else {
-                        nodes.push(Text(open.to_str(input)));
-                        tokens = &tokens[1..];
-                    }
-                }
-                [Tilde(open), _] if open.len() == 1 && Self::delimiter_can_open(tokens) => {
-                    let close_index = tokens.iter().enumerate().position(|(idx, token)| {
-                        matches!(token, Tilde(_)) && Self::delimiter_can_close(tokens, idx)
-                    });
-                    if let Some(close_index) = close_index {
-                        nodes.push(StrikeThrough(Self::parse_inline_helper(
-                            &tokens[1..close_index],
-                            input,
-                        )));
-
-                        tokens = &tokens[close_index + 1..];
-                    } else {
-                        nodes.push(Text(open.to_str(input)));
-                        tokens = &tokens[1..];
-                    }
-                }
-                [Asterisk(count), after @ ..] | [Underscore(count), after @ ..] => {
-                    if count.len() >= 3 {
-                        nodes.push(HorizontalLine);
-                        tokens = after;
-                    } else {
-                        nodes.push(Text(count.to_str(input)));
-                        tokens = after;
                     }
                 }
                 [first @ BracketOpen { .. }, after_open @ ..] => {
-                    if let Some((node, rest)) = Self::try_parse_link(after_open, input) {
+                    tokens = if let Some((node, rest)) = Self::try_parse_link(after_open, input) {
                         nodes.push(node);
-                        tokens = rest;
+                        rest
                     } else {
                         nodes.push(Text(first.span().to_str(input)));
-                        tokens = after_open;
+                        after_open
                     }
                 }
                 [
@@ -5100,12 +5098,12 @@ impl MarkdownParser {
                     second @ BracketOpen { .. },
                     after_open @ ..,
                 ] => {
-                    if let Some((node, rest)) = Self::try_parse_image(after_open, input) {
+                    tokens = if let Some((node, rest)) = Self::try_parse_image(after_open, input) {
                         nodes.push(node);
-                        tokens = rest;
+                        rest
                     } else {
                         nodes.push(Text(&input[first.start()..second.end()]));
-                        tokens = after_open;
+                        after_open
                     }
                 }
                 _ => {
@@ -5135,6 +5133,9 @@ impl MarkdownParser {
                 }
             }
         }
+        println!("Nodes {nodes:#?}");
+
+        // panic!();
 
         nodes
     }
@@ -5203,6 +5204,7 @@ impl MarkdownParser {
                 | MarkdownToken::Backtick(_)
                 | MarkdownToken::Underscore(_)
                 | MarkdownToken::Asterisk(_)
+                | MarkdownToken::Tilde(_)
         )
     }
     fn delimiter_can_open(tokens: &[MarkdownToken]) -> bool {
@@ -5241,7 +5243,7 @@ impl MarkdownParser {
                 nodes.iter().for_each(|n| Self::html_helper(n, builder));
             }
             MarkdownNode::Paragraph(children) => {
-                builder.push_str("<p>");
+                builder.push_str("<p class=\"post_paragraph\">");
                 children.iter().for_each(|n| Self::html_helper(n, builder));
 
                 builder.push_str("</p>\n");
@@ -5287,7 +5289,7 @@ impl MarkdownParser {
                 }
             }
             MarkdownNode::InlineCode(code) => {
-                builder.push_str("<code>");
+                builder.push_str("<code class=\"inline_code\">");
                 builder.push_str(code);
                 builder.push_str("</code>");
             }
@@ -5295,7 +5297,7 @@ impl MarkdownParser {
                 if let Some(language) = language {
                     builder.push_str("<pre><code class=\"language-");
                     builder.push_str(language.to_str());
-                    builder.push_str("\">\n");
+                    builder.push_str(" codeblock\">\n");
                 } else {
                     builder.push_str("<pre><code>\n");
                 }
@@ -5324,7 +5326,7 @@ impl MarkdownParser {
                 builder.push_str("</li>\n");
             }
             MarkdownNode::BlockQuote(nodes) => {
-                builder.push_str("<blockquote>\n");
+                builder.push_str("<blockquote class=\"blockquote\">\n");
                 for child in nodes {
                     Self::html_helper(child, builder);
                     builder.push('\n');
@@ -5345,7 +5347,7 @@ impl MarkdownParser {
                 builder.push_str("</a>");
             }
             MarkdownNode::Image { alt, path } => {
-                builder.push_str("<img class=\"image\" src=\"");
+                builder.push_str("<img class=\"post_image\" src=\"");
                 builder.push_str(path);
                 builder.push('"');
                 // builder.push_str(" alt=\"");
