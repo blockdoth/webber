@@ -200,26 +200,16 @@
       <div class="nav">
         <a href="/home" class="logo_container">
           <div class = "logo_placeholder">
-            <img 
-              src="/images/faxger.png" 
-              class="logo"
-              decoding="async"
-              fetchpriority="low"              
-              >
+            <img src="/images/faxger.png" class="logo"decoding="async"fetchpriority="low">
           </div>
-          
           <div class="blockdoth {{if current_page_url == "/home" }} active {{endIf}}">
             blockdoth
           </div>
-
         </a>
         <div class="nav_pages">
 
           {{for page in pages-static}}
-          
-          
-          <a href="{{page.url}}" onmouseenter="prefetch(this)" class="nav_button {{if page.url == current_page_url }} active {{endIf}}" >~/{{page.name}}</a>
-          
+            <a href="{{page.url}}" onmouseenter="prefetch(this)" class="nav_button {{if page.url == current_page_url }} active {{endIf}}" >~/{{page.name}}</a>
           {{endFor}}
         </div>
       </div>
@@ -227,7 +217,7 @@
       <div class="background">
         <div class="content">
           {{block body}} 
-
+          <!-- Main content -->
           {{endBlock}}
         </div>
       </div>

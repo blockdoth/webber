@@ -84,7 +84,7 @@
                 git add *.rs *.nix Cargo.toml toolchain.toml templates/* assets/*   
 
                 copy_user="penger"
-                deploy_user="webber-deployer"
+                deploy_user="webber-deploy"
                 server="nuc"
   
                 package="$(
