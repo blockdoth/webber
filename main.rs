@@ -99,14 +99,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         // #[cfg(generated)] // Marks everything deadcode during build time
         // runtime()?;
 
-        let bytes = fs::read("assets/gallery/1_lissabon/IMG_0003.JPG")?;
-
-        let t = GalleryImage::from_jpg("assets/gallery/1_lissabon/IMG_0003.JPG", &bytes)?;
-
-        println!("{t:#?}");
-        // let decoded = Jpeg::decode("assets/gallery/1_lissabon/IMG_0003.JPG")?;
-        // decoded.write_ppm("./result.ppm")?;
-        // decoded.encode("./result.jpg")?;
+        let decoded = Jpeg::deserialize("assets/gallery/1_lissabon/IMG_0235.JPG")?;
+        decoded.write_ppm("./result.ppm")?;
+        decoded.serialize("./result.jpg")?;
+        Jpeg::deserialize("./result.jpg")?;
         Ok(())
     }
 }
@@ -7075,14 +7071,12 @@ impl GalleryImage {
     }
 
     fn from_jpg(path: &str, bytes: &[u8]) -> Result<Self, JpegError> {
-        let (metadata, mut width, mut height) = Jpeg::parse_metadata(bytes)?;
+        let (metadata, mut width, mut height) = Jpeg::deserialize_metadata(bytes)?;
 
         if let Some(metadata) = &metadata
             && matches!(metadata.orientation, Some(5..=8))
         {
-            let temp = width;
-            width = height;
-            height = width;
+            std::mem::swap(&mut width, &mut height)
         }
 
         Ok(GalleryImage {
@@ -7368,7 +7362,7 @@ fn read_u16_be<R: io::Read>(reader: &mut R) -> io::Result<u16> {
     Ok(u16::from_be_bytes(buf))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum JpegError {
     FileNotFound(String),
     UnableToReadFile(String),
@@ -7388,11 +7382,18 @@ enum JpegError {
     UnexpectedEndOfFile,
     ComponentCountDontMatch,
     MetadataNotFound,
+    WriteError(io::Error),
 }
 
 impl fmt::Display for JpegError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+impl From<io::Error> for JpegError {
+    fn from(error: io::Error) -> Self {
+        JpegError::WriteError(error)
     }
 }
 
@@ -7405,25 +7406,28 @@ const TAG_SOF0: u16 = 0xFFC0; // Baseline DCT
 const TAG_DHT: u16 = 0xFFC4; // Define Huffman Table
 const TAG_SOS: u16 = 0xFFDA; // Start Of Scan
 const TAG_EOI: u16 = 0xFFD9; // End Of Image
+const JPEG_MAGIC: [u8; 5] = [0x4A, 0x46, 0x49, 0x46, 0x00]; // "JFIF"
 
 impl Error for JpegError {}
 
 #[derive(Debug)]
 struct Jpeg {
-    //   sof0: Sof0,
-    //   quant_tables: [Option<QuantizationTable>; 4],
-    //   huffman_codebook: HuffmanCodeBook,
-    //   metadata:
-    // }
+    sof0: Sof0,
+    quant_tables: [Option<QuantizationTable>; 4],
+    huffman_codebook: HuffmanCodeBook,
+    metadata: Option<ExifMetadata>,
+    scan_header: ScanHeader,
+    app_1_blob: Option<Vec<u8>>,
+    image_data: Vec<u8>,
 }
 // Jpeg Structure https://github.com/corkami/formats/blob/master/image/jpeg.md
 // Inspired by https://github.com/image-rs/jpeg-decoder
 impl Jpeg {
-    fn decode(path: &str) -> Result<DecodedJpeg, JpegError> {
+    fn deserialize(path: &str) -> Result<Jpeg, JpegError> {
         use JpegError::*;
         println!("Decoding {path:?}");
 
-        let bytes = fs::read(path).map_err(|err| {
+        let mut bytes = fs::read(path).map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
                 FileNotFound(path.to_owned())
             } else {
@@ -7432,6 +7436,7 @@ impl Jpeg {
         })?;
 
         let mut sof0: Option<Sof0> = None;
+        let mut metadata: Option<ExifMetadata> = None;
         let mut quant_tables: [Option<QuantizationTable>; 4] = [const { None }; 4];
         let mut huffman_codebook = HuffmanCodeBook {
             ac: [const { None }; 4],
@@ -7440,6 +7445,8 @@ impl Jpeg {
 
         let mut cursor = 0;
 
+        let mut app1_blob_start = 0;
+        let mut app1_blob_end = 0;
         while cursor + 1 < bytes.len() {
             let marker = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]);
 
@@ -7457,25 +7464,40 @@ impl Jpeg {
                 TAG_SOS => {
                     println!("SOS - Start of Scan");
 
-                    if let Some(sof0) = &sof0
+                    if let Some(sof0) = sof0
                         && quant_tables.iter().any(|table| table.is_some())
                         && huffman_codebook.ac.iter().any(|table| table.is_some())
                         && huffman_codebook.dc.iter().any(|table| table.is_some())
                     {
-                        let (header, offset) = ScanHeader::parse(&bytes[cursor + 2..])
+                        let (scan_header, offset) = ScanHeader::deserialize(&bytes[cursor + 2..])
                             .ok_or(FailedToParseScanHeader)?;
-                        cursor += offset;
 
-                        let metadata = JpegDecodeMetadata::from(sof0, &header)
+                        let jpeg_metadata = JpegDecodeMetadata::from(&sof0, &scan_header)
                             .ok_or(ComponentCountDontMatch)?;
 
-                        return Self::parse_entropy_coded(
-                            &mut Bit69tream::new(&bytes[cursor..]),
-                            &metadata,
+                        let image_data = Self::deserialize_entropy_coded(
+                            &mut Bit69tream::new(&bytes[cursor + offset..]),
+                            &jpeg_metadata,
                             &huffman_codebook,
                             &quant_tables,
                         )
-                        .ok_or(FailedToDecodeEntropyData);
+                        .ok_or(FailedToDecodeEntropyData)?;
+
+                        let app_1_blob = if app1_blob_end != 0 {
+                            Some(bytes[app1_blob_start..app1_blob_end].to_vec())
+                        } else {
+                            None
+                        };
+
+                        return Ok(Jpeg {
+                            sof0,
+                            quant_tables,
+                            huffman_codebook,
+                            scan_header,
+                            metadata,
+                            app_1_blob,
+                            image_data,
+                        });
                     } else {
                         return Err(NotSufficientInfoToDecode);
                     }
@@ -7488,8 +7510,7 @@ impl Jpeg {
                     cursor += 4;
 
                     if sof0.is_none() {
-                        sof0 = Some(Sof0::parse(&bytes[cursor..]).ok_or(FailedToParseSof0)?);
-                        println!("{sof0:#?}");
+                        sof0 = Some(Sof0::deserialize(&bytes[cursor..]).ok_or(FailedToParseSof0)?);
                     } else {
                         return Err(UnexpectedRepeatedSegment);
                     }
@@ -7501,15 +7522,15 @@ impl Jpeg {
                     println!("DHT - Define Huffman Table, {segment_len} bytes");
                     cursor += 4;
 
-                    if let Some(huff_table) = HuffmanTable::parse(&bytes[cursor..]) {
+                    if let Some(huff_table) = HuffmanTable::deserialize(&bytes[cursor..]) {
                         let idx = huff_table.id as usize;
 
                         match huff_table.class {
                             HuffmanClass::Ac => {
-                                huffman_codebook.ac[idx] = Some(HuffmanTable::decode(huff_table))
+                                huffman_codebook.ac[idx] = Some(HuffmanTable::into_tree(huff_table))
                             }
                             HuffmanClass::Dc => {
-                                huffman_codebook.dc[idx] = Some(HuffmanTable::decode(huff_table))
+                                huffman_codebook.dc[idx] = Some(HuffmanTable::into_tree(huff_table))
                             }
                         }
                     } else {
@@ -7523,7 +7544,7 @@ impl Jpeg {
                     println!("DQT - Define Quantization Table, {segment_len} bytes");
                     cursor += 4;
 
-                    if let Some(quant_table) = QuantizationTable::parse(&bytes[cursor..]) {
+                    if let Some(quant_table) = QuantizationTable::deserialize(&bytes[cursor..]) {
                         quant_tables[quant_table.id as usize] = Some(quant_table.unzig());
                     } else {
                         return Err(FailedToParseQuantizationTable);
@@ -7533,13 +7554,9 @@ impl Jpeg {
                 TAG_APP0 => {
                     let segment_len = Self::segment_len(&bytes, cursor);
                     println!("APP0 - JFIF, {segment_len} bytes");
-                    let magic: [u8; 5] = [
-                        0x4A, 0x46, 0x49, 0x46, // "JFIF"
-                        0x00,
-                    ];
 
                     cursor += 4;
-                    if bytes.get(cursor..cursor + 5).ok_or(FileToShort)? != magic {
+                    if bytes.get(cursor..cursor + 5).ok_or(FileToShort)? != JPEG_MAGIC {
                         return Err(NotAJpeg);
                     }
                     cursor += segment_len;
@@ -7548,12 +7565,11 @@ impl Jpeg {
                 TAG_APP1 => {
                     let segment_len = Self::segment_len(&bytes, cursor);
                     println!("APP1 - EXIF/XMP, {segment_len} bytes");
+                    app1_blob_start = cursor + 2;
+                    metadata = ExifMetadata::parse(&bytes[cursor + 4..]);
 
-                    let exif_data = ExifMetadata::parse(&bytes[cursor + 4..]).unwrap();
-
-                    println!("{exif_data:?}");
-                    todo!();
                     cursor += segment_len + 4;
+                    app1_blob_end = cursor;
                 }
 
                 TAG_APP2 => {
@@ -7571,12 +7587,12 @@ impl Jpeg {
 
     // https://yasoob.me/posts/understanding-and-writing-jpeg-decoder-in-python/
     //  Remember to remove 0x00
-    fn parse_entropy_coded(
+    fn deserialize_entropy_coded(
         stream: &mut Bit69tream,
         metadata: &JpegDecodeMetadata,
         huff_book: &HuffmanCodeBook,
         quant_tables: &[Option<QuantizationTable>; 4],
-    ) -> Option<DecodedJpeg> {
+    ) -> Option<Vec<u8>> {
         let max_h_samples = metadata
             .components
             .iter()
@@ -7603,7 +7619,7 @@ impl Jpeg {
 
         for mcu_y in 0..mcu_y_count {
             for mcu_x in 0..mcu_x_count {
-                let components = McuComponents::decode(
+                let components = McuComponents::deserialize(
                     stream,
                     metadata,
                     huff_book,
@@ -7626,14 +7642,12 @@ impl Jpeg {
             }
         }
 
-        Some(DecodedJpeg {
-            width: metadata.width,
-            height: metadata.height,
-            data: image,
-        })
+        Some(image)
     }
 
-    fn parse_metadata(bytes: &[u8]) -> Result<(Option<ExifMetadata>, usize, usize), JpegError> {
+    fn deserialize_metadata(
+        bytes: &[u8],
+    ) -> Result<(Option<ExifMetadata>, usize, usize), JpegError> {
         use JpegError::*;
 
         let mut cursor = 0;
@@ -7649,24 +7663,24 @@ impl Jpeg {
                 }
 
                 TAG_SOF0 => {
-                    let segment_len = Jpeg::segment_len(&bytes, cursor);
+                    let segment_len = Jpeg::segment_len(bytes, cursor);
                     cursor += 4;
 
-                    let sof0 = Sof0::parse(&bytes[cursor..]).ok_or(UnexpectedEndOfFile)?;
+                    let sof0 = Sof0::deserialize(&bytes[cursor..]).ok_or(UnexpectedEndOfFile)?;
 
                     width = Some(sof0.width);
                     height = Some(sof0.height);
                     cursor += segment_len;
                 }
                 TAG_APP1 => {
-                    let segment_len = Jpeg::segment_len(&bytes, cursor);
+                    let segment_len = Jpeg::segment_len(bytes, cursor);
                     cursor += 4;
 
                     exif_data = ExifMetadata::parse(&bytes[cursor..]);
                     cursor += segment_len;
                 }
                 TAG_APP0 | TAG_APP2 | TAG_DHT | TAG_DQT => {
-                    let segment_len = Jpeg::segment_len(&bytes, cursor);
+                    let segment_len = Jpeg::segment_len(bytes, cursor);
                     cursor += 4;
                     cursor += segment_len;
                 }
@@ -7683,17 +7697,83 @@ impl Jpeg {
         ))
     }
 
+    fn serialize(self, path: &str) -> Result<(), Box<dyn Error>> {
+        let mut writer = File::create(path)?;
+        // APP0
+        writer.write_all(&TAG_SOI.to_be_bytes())?;
+        writer.write_all(&TAG_APP0.to_be_bytes())?;
+        writer.write_all(&(JPEG_MAGIC.len() as u16 + 2).to_be_bytes())?;
+        writer.write_all(&JPEG_MAGIC)?;
+
+        if let Some(app_1) = &self.app_1_blob {
+            let blob_len = app_1.len() as u16 + 2;
+            writer.write_all(&TAG_APP1.to_be_bytes())?;
+            writer.write_all(&blob_len.to_be_bytes())?;
+            writer.write_all(app_1)?;
+        }
+
+        for quant in self.quant_tables.iter().flatten() {
+            quant.serialize(&mut writer)?;
+        }
+
+        self.sof0.serialize(&mut writer);
+
+        for huff in self
+            .huffman_codebook
+            .ac
+            .into_iter()
+            .chain(self.huffman_codebook.dc.into_iter())
+            .flatten()
+        {
+            huff.table.serialize(&mut writer)?;
+        }
+
+        self.scan_header.serialize(&mut writer, 10);
+
+        writer.write_all(&TAG_EOI.to_be_bytes())?;
+
+        Ok(())
+    }
     fn segment_len(bytes: &[u8], cursor: usize) -> usize {
         u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]) as usize - 2
     }
+
+    fn write_ppm(&self, path: &str) -> Result<(), Box<dyn Error>> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+
+        write!(
+            writer,
+            "P6\n{} {}\n255\n",
+            self.sof0.width, self.sof0.height
+        )?;
+
+        writer.write_all(&self.image_data)?;
+
+        Ok(())
+    }
 }
+// TAG_APP0 => {
+//   let segment_len = Self::segment_len(&bytes, cursor);
+//   // println!("APP0 - JFIF, {segment_len} bytes");
+//   let magic: [u8; 5] = [
+//       0x4A, 0x46, 0x49, 0x46, // "JFIF"
+//       0x00,
+//   ];
+
+//   cursor += 4;
+//   if bytes.get(cursor..cursor + 5).ok_or(FileToShort)? != magic {
+//       return Err(NotAJpeg);
+//   }
+//   cursor += segment_len;
+// }
 
 struct Block {
     data: [i16; 64],
 }
 
 impl Block {
-    fn decode(
+    fn deserialize(
         stream: &mut Bit69tream,
         component: &JpegDecodeMetadataComponent,
         huff_book: &HuffmanCodeBook,
@@ -7747,6 +7827,10 @@ impl Block {
         );
 
         Some(block)
+    }
+
+    fn serialize<W: Write>(self, writer: &mut W) -> Result<(), JpegError> {
+        todo!()
     }
 
     fn idct(matrix: [i16; 64], quant_table: &[u16; 64]) -> Block {
@@ -7840,7 +7924,7 @@ struct McuComponents {
 }
 
 impl McuComponents {
-    fn decode(
+    fn deserialize(
         stream: &mut Bit69tream,
         decoded_metadata: &JpegDecodeMetadata,
         huff_book: &HuffmanCodeBook,
@@ -7854,7 +7938,7 @@ impl McuComponents {
                 Vec::with_capacity((comp.vertical_sampling * comp.horizontal_sampling) as usize);
             for block_y in 0..comp.vertical_sampling {
                 for block_x in 0..comp.horizontal_sampling {
-                    let block = Block::decode(
+                    let block = Block::deserialize(
                         stream,
                         comp,
                         huff_book,
@@ -7969,6 +8053,10 @@ impl JpegNum {
         // Negative
         num as i16 + 1 - (1 << jpeg_num_len)
     }
+
+    fn encode(num: u16) -> (u16, usize) {
+        todo!();
+    }
 }
 
 #[derive(Debug)]
@@ -7980,7 +8068,7 @@ struct Sof0 {
 }
 
 impl Sof0 {
-    fn parse(bytes: &[u8]) -> Option<Sof0> {
+    fn deserialize(bytes: &[u8]) -> Option<Sof0> {
         let precision = *bytes.first()?;
 
         let height = u16::from_be_bytes([*bytes.get(1)?, *bytes.get(2)?]) as usize;
@@ -8012,6 +8100,26 @@ impl Sof0 {
             components,
         })
     }
+
+    fn serialize<W: Write>(self, writer: &mut W) -> Result<(), JpegError> {
+        writer.write_all(&TAG_SOF0.to_be_bytes())?;
+        let size = 8 + 3 * self.components.len() as u16;
+        writer.write_all(&size.to_be_bytes())?;
+        writer.write_all(&[self.precision])?;
+        writer.write_all(&(self.height as u16).to_be_bytes())?;
+        writer.write_all(&(self.width as u16).to_be_bytes())?;
+
+        writer.write_all(&[self.components.len() as u8])?;
+
+        for comp in self.components {
+            writer.write_all(&[comp.id as u8])?;
+
+            writer.write_all(&[(comp.horizontal_sampling << 4) | comp.vertical_sampling])?;
+            writer.write_all(&[comp.quantization_table])?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -8023,6 +8131,13 @@ struct Sof0Component {
 }
 
 #[derive(Debug)]
+struct ScanComponent {
+    id: usize,
+    dc_table: usize,
+    ac_table: usize,
+}
+
+#[derive(Debug)]
 struct ScanHeader {
     components: Vec<ScanComponent>,
     spectral_start: usize,
@@ -8030,15 +8145,8 @@ struct ScanHeader {
     successive_approximation: usize,
 }
 
-#[derive(Debug)]
-struct ScanComponent {
-    id: usize,
-    dc_table: usize,
-    ac_table: usize,
-}
-
 impl ScanHeader {
-    fn parse(bytes: &[u8]) -> Option<(ScanHeader, usize)> {
+    fn deserialize(bytes: &[u8]) -> Option<(ScanHeader, usize)> {
         let scan_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
 
         let component_count = *bytes.get(2)? as usize;
@@ -8073,6 +8181,23 @@ impl ScanHeader {
             },
             scan_len + 2,
         ))
+    }
+
+    fn serialize<W: Write>(self, writer: &mut W, len: u16) -> Result<(), JpegError> {
+        writer.write_all(&TAG_SOS.to_be_bytes())?;
+        writer.write_all(&len.to_be_bytes())?;
+        writer.write_all(&[self.components.len() as u8])?;
+
+        for comp in self.components {
+            writer.write_all(&[comp.id as u8])?;
+            writer.write_all(&[(comp.dc_table as u8) << 4 | (comp.ac_table as u8)])?;
+        }
+
+        writer.write_all(&[self.spectral_start as u8])?;
+        writer.write_all(&[self.spectral_end as u8])?;
+        writer.write_all(&[self.successive_approximation as u8])?;
+
+        Ok(())
     }
 }
 
@@ -8214,6 +8339,7 @@ impl<'a> Bit69tream<'a> {
 #[derive(Debug)]
 struct HuffmanTree {
     map: HashMap<(u16, u8), u8>,
+    table: HuffmanTable,
 }
 
 impl HuffmanTree {
@@ -8272,6 +8398,22 @@ impl ColorSpace {
             b.clamp(0.0, 255.0) as u8,
         ]
     }
+
+    fn rgb_to_ycbcr(r: u8, g: u8, b: u8) -> [u8; 3] {
+        let r = r as f32;
+        let g = g as f32;
+        let b = b as f32;
+
+        let y = 0.29900 * r + 0.58700 * g + 0.11400 * b;
+        let cb = -0.16874 * r - 0.33126 * g + 0.50000 * b + 128.0;
+        let cr = 0.50000 * r - 0.41869 * g - 0.08131 * b + 128.0;
+
+        [
+            y.clamp(0.0, 255.0) as u8,
+            cb.clamp(0.0, 255.0) as u8,
+            cr.clamp(0.0, 255.0) as u8,
+        ]
+    }
 }
 
 #[derive(Debug)]
@@ -8290,25 +8432,25 @@ struct HuffmanTable {
 }
 
 impl HuffmanTable {
-    fn decode(self) -> HuffmanTree {
+    fn into_tree(self) -> HuffmanTree {
         let mut map = HashMap::new();
         let mut code: u16 = 0;
 
-        let mut symbols = self.symbols.into_iter();
+        let mut symbols = self.symbols.iter();
 
         for (size, count) in self.counts.iter().enumerate() {
             for _ in 0..*count {
                 let symbol = symbols.next().expect("invariant");
-                map.insert((code, (size + 1) as u8), symbol);
+                map.insert((code, (size + 1) as u8), *symbol);
                 code += 1
             }
             code <<= 1;
         }
 
-        HuffmanTree { map }
+        HuffmanTree { map, table: self }
     }
 
-    fn parse(bytes: &[u8]) -> Option<HuffmanTable> {
+    fn deserialize(bytes: &[u8]) -> Option<HuffmanTable> {
         let class_and_id = bytes.first()?;
         let class = match class_and_id >> 4 {
             0 => HuffmanClass::Dc,
@@ -8331,6 +8473,23 @@ impl HuffmanTable {
             symbols,
         })
     }
+
+    fn serialize<W: Write>(self, writer: &mut W) -> Result<(), JpegError> {
+        writer.write_all(&TAG_DHT.to_be_bytes())?;
+        let length = 2 + 1 + 16 + self.symbols.len();
+        writer.write_all(&(length as u16).to_be_bytes())?;
+
+        let class_and_id = match self.class {
+            HuffmanClass::Dc => self.id,
+            HuffmanClass::Ac => 0x10 | self.id,
+        };
+
+        writer.write_all(&[class_and_id])?;
+        writer.write_all(&self.counts)?;
+        writer.write_all(&self.symbols)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -8341,7 +8500,7 @@ struct QuantizationTable {
 }
 
 impl QuantizationTable {
-    fn parse(bytes: &[u8]) -> Option<QuantizationTable> {
+    fn deserialize(bytes: &[u8]) -> Option<QuantizationTable> {
         let precision_and_id = bytes.first()?;
 
         let precision = precision_and_id >> 4;
@@ -8366,6 +8525,18 @@ impl QuantizationTable {
             precision,
             values,
         })
+    }
+
+    fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), JpegError> {
+        writer.write_all(&TAG_DQT.to_be_bytes())?;
+        writer.write_all(&((2 + 1 + 64) as u16).to_be_bytes())?;
+        writer.write_all(&[self.precision << 4 | self.id])?;
+
+        for value in &self.values {
+            writer.write_all(&value.to_be_bytes())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -8406,24 +8577,5 @@ impl QuantizationTable {
             id: self.id,
             precision: self.precision,
         }
-    }
-}
-
-struct DecodedJpeg {
-    width: usize,
-    height: usize,
-    data: Vec<u8>,
-}
-
-impl DecodedJpeg {
-    fn write_ppm(&self, path: &str) -> std::io::Result<()> {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-
-        write!(writer, "P6\n{} {}\n255\n", self.width, self.height)?;
-
-        writer.write_all(&self.data)?;
-
-        Ok(())
     }
 }
