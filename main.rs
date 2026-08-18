@@ -99,8 +99,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         // #[cfg(generated)] // Marks everything deadcode during build time
         // runtime()?;
 
-        let decoded = Jpeg::decode("assets/gallery/1_lissabon/IMG_0235.JPG")?;
-        decoded.write_ppm("./result.ppm")?;
+        let bytes = fs::read("assets/gallery/1_lissabon/IMG_0003.JPG")?;
+
+        let t = GalleryImage::from_jpg("assets/gallery/1_lissabon/IMG_0003.JPG", &bytes)?;
+
+        println!("{t:#?}");
+        // let decoded = Jpeg::decode("assets/gallery/1_lissabon/IMG_0003.JPG")?;
+        // decoded.write_ppm("./result.ppm")?;
+        // decoded.encode("./result.jpg")?;
         Ok(())
     }
 }
@@ -7033,6 +7039,61 @@ impl Date {
     }
 }
 
+#[derive(Debug)]
+struct GalleryImage {
+    path: String,
+    width: usize,
+    height: usize,
+    metadata: Option<ExifMetadata>,
+}
+
+impl GalleryImage {
+    fn from_png(path: &str, bin: &[u8]) -> Result<Self, ImageParseError> {
+        // println!("{:?}", &bin[..32]);
+        if bin.len() < 24 {
+            return Err(ImageParseError::BinaryBlobToShort);
+        }
+
+        if &bin[0..8] != b"\x89PNG\r\n\x1a\n" {
+            return Err(ImageParseError::InvalidPngSignature);
+        }
+
+        if &bin[12..16] != b"IHDR" {
+            return Err(ImageParseError::MissingIhdrChunk);
+        }
+
+        let width = u32::from_be_bytes(bin[16..20].try_into().expect("invariant")) as usize;
+
+        let height = u32::from_be_bytes(bin[20..24].try_into().expect("invariant")) as usize;
+
+        Ok(Self {
+            path: path.to_owned(),
+            width,
+            height,
+            metadata: None,
+        })
+    }
+
+    fn from_jpg(path: &str, bytes: &[u8]) -> Result<Self, JpegError> {
+        let (metadata, mut width, mut height) = Jpeg::parse_metadata(bytes)?;
+
+        if let Some(metadata) = &metadata
+            && matches!(metadata.orientation, Some(5..=8))
+        {
+            let temp = width;
+            width = height;
+            height = width;
+        }
+
+        Ok(GalleryImage {
+            path: path.to_owned(),
+            width,
+            height,
+            metadata,
+        })
+    }
+}
+
 const TAG_MAKE: u16 = 0x010f;
 const TAG_MODEL: u16 = 0x0110;
 const TAG_ORIENTATION: u16 = 0x0112;
@@ -7058,121 +7119,8 @@ struct ExifMetadata {
     focal_length: Option<f64>,
 }
 
-#[derive(Debug)]
-enum ImageParseError {
-    BinaryBlobToShort,
-    InvalidPngSignature,
-    MissingIhdrChunk,
-    UnexpectedEof,
-    InvalidSegmentLength,
-    DimensionsNotFound,
-    InvalidExif,
-}
-
-#[derive(Debug)]
-struct GalleryImage {
-    path: String,
-    width: u64,
-    height: u64,
-    metadata: Option<ExifMetadata>,
-}
-
-impl GalleryImage {
-    fn from_png(path: &str, bin: &[u8]) -> Result<Self, ImageParseError> {
-        // println!("{:?}", &bin[..32]);
-        if bin.len() < 24 {
-            return Err(ImageParseError::BinaryBlobToShort);
-        }
-
-        if &bin[0..8] != b"\x89PNG\r\n\x1a\n" {
-            return Err(ImageParseError::InvalidPngSignature);
-        }
-
-        if &bin[12..16] != b"IHDR" {
-            return Err(ImageParseError::MissingIhdrChunk);
-        }
-
-        let width = u32::from_be_bytes(bin[16..20].try_into().expect("invariant")) as u64;
-
-        let height = u32::from_be_bytes(bin[20..24].try_into().expect("invariant")) as u64;
-
-        Ok(Self {
-            path: path.to_owned(),
-            width,
-            height,
-            metadata: None,
-        })
-    }
-
-    fn from_jpg(path: &str, bin: &[u8]) -> Result<Self, ImageParseError> {
-        let mut cursor = 0;
-
-        let mut width = None;
-        let mut height = None;
-
-        let mut exif_data = None;
-
-        while cursor < bin.len() {
-            let marker = u16::from_be_bytes(bin[cursor..cursor + 2].try_into().unwrap());
-            cursor += 2;
-
-            match marker {
-                0xffd8 => continue, // SOI
-                0xffd9 => break,    // EOI
-                0xffda => break,    // SOS
-                0xffd0..=0xffd7 | 0xff01 => continue,
-                _ => {}
-            }
-
-            let segment_len =
-                u16::from_be_bytes(bin[cursor..cursor + 2].try_into().unwrap()) as usize;
-
-            if segment_len < 2 {
-                return Err(ImageParseError::InvalidSegmentLength);
-            }
-            cursor += 2;
-
-            let payload_len = segment_len - 2;
-            let payload = bin
-                .get(cursor..cursor + payload_len)
-                .ok_or(ImageParseError::UnexpectedEof)?;
-
-            if payload.starts_with(b"Exif\0\0") {
-                exif_data = Self::parse_tiff(payload);
-            }
-
-            if matches!(
-                marker,
-                0xFFC0..=0xFFC3 | 0xFFC5..=0xFFC7 | 0xFFC9..=0xFFCB | 0xFFCD..=0xFFCF
-            ) {
-                let header = &bin[cursor..cursor + 6];
-
-                width = Some(u16::from_be_bytes([header[3], header[4]]) as u64);
-                height = Some(u16::from_be_bytes([header[1], header[2]]) as u64);
-            }
-
-            cursor += payload_len;
-
-            if cursor > bin.len() {
-                return Err(ImageParseError::UnexpectedEof);
-            }
-        }
-
-        if let Some(metadata) = &exif_data
-            && matches!(metadata.orientation, Some(5..=8))
-        {
-            std::mem::swap(&mut width, &mut height);
-        }
-        // println!("{exif_data:#?}");
-        Ok(GalleryImage {
-            path: path.to_owned(),
-            width: width.ok_or(ImageParseError::DimensionsNotFound)?,
-            height: height.ok_or(ImageParseError::DimensionsNotFound)?,
-            metadata: exif_data,
-        })
-    }
-
-    fn parse_tiff(tiff: &[u8]) -> Option<ExifMetadata> {
+impl ExifMetadata {
+    fn parse(tiff: &[u8]) -> Option<ExifMetadata> {
         let tiff = tiff.strip_prefix(b"Exif\0\0")?;
 
         let endian = match tiff.get(..2)? {
@@ -7371,6 +7319,17 @@ impl GalleryImage {
     }
 }
 
+#[derive(Debug)]
+enum ImageParseError {
+    BinaryBlobToShort,
+    InvalidPngSignature,
+    MissingIhdrChunk,
+    UnexpectedEof,
+    InvalidSegmentLength,
+    DimensionsNotFound,
+    InvalidExif,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Endian {
     Little,
@@ -7428,6 +7387,7 @@ enum JpegError {
     FailedToDecodeEntropyData,
     UnexpectedEndOfFile,
     ComponentCountDontMatch,
+    MetadataNotFound,
 }
 
 impl fmt::Display for JpegError {
@@ -7449,8 +7409,13 @@ const TAG_EOI: u16 = 0xFFD9; // End Of Image
 impl Error for JpegError {}
 
 #[derive(Debug)]
-struct Jpeg {}
-
+struct Jpeg {
+    //   sof0: Sof0,
+    //   quant_tables: [Option<QuantizationTable>; 4],
+    //   huffman_codebook: HuffmanCodeBook,
+    //   metadata:
+    // }
+}
 // Jpeg Structure https://github.com/corkami/formats/blob/master/image/jpeg.md
 // Inspired by https://github.com/image-rs/jpeg-decoder
 impl Jpeg {
@@ -7466,18 +7431,6 @@ impl Jpeg {
             }
         })?;
 
-        let magic: [u8; 11] = [
-            0xFF, 0xD8, // SOI
-            0xFF, 0xE0, // APP0
-            0x00, 0x10, // APP0 length = 16
-            0x4A, 0x46, 0x49, 0x46, // "JFIF"
-            0x00,
-        ];
-
-        if bytes.get(..11).ok_or(FileToShort)? != magic {
-            return Err(NotAJpeg);
-        }
-
         let mut sof0: Option<Sof0> = None;
         let mut quant_tables: [Option<QuantizationTable>; 4] = [const { None }; 4];
         let mut huffman_codebook = HuffmanCodeBook {
@@ -7492,17 +7445,17 @@ impl Jpeg {
 
             match marker {
                 TAG_SOI => {
-                    // println!("SOI - Start of Image");
+                    println!("SOI - Start of Image");
                     cursor += 2;
                 }
 
                 TAG_EOI => {
-                    // println!("EOI - End of Image");
+                    println!("EOI - End of Image");
                     break;
                 }
 
                 TAG_SOS => {
-                    // println!("SOS - Start of Scan");
+                    println!("SOS - Start of Scan");
 
                     if let Some(sof0) = &sof0
                         && quant_tables.iter().any(|table| table.is_some())
@@ -7530,13 +7483,13 @@ impl Jpeg {
 
                 TAG_SOF0 => {
                     let segment_len = Self::segment_len(&bytes, cursor);
-                    // println!("SOF0 - Baseline DCT, {segment_len} bytes");
+                    println!("SOF0 - Baseline DCT, {segment_len} bytes");
 
                     cursor += 4;
 
                     if sof0.is_none() {
                         sof0 = Some(Sof0::parse(&bytes[cursor..]).ok_or(FailedToParseSof0)?);
-                        // println!("{sof0:#?}");
+                        println!("{sof0:#?}");
                     } else {
                         return Err(UnexpectedRepeatedSegment);
                     }
@@ -7545,7 +7498,7 @@ impl Jpeg {
 
                 TAG_DHT => {
                     let segment_len = Self::segment_len(&bytes, cursor);
-                    // println!("DHT - Define Huffman Table, {segment_len} bytes");
+                    println!("DHT - Define Huffman Table, {segment_len} bytes");
                     cursor += 4;
 
                     if let Some(huff_table) = HuffmanTable::parse(&bytes[cursor..]) {
@@ -7567,7 +7520,7 @@ impl Jpeg {
 
                 TAG_DQT => {
                     let segment_len = Self::segment_len(&bytes, cursor);
-                    // println!("DQT - Define Quantization Table, {segment_len} bytes");
+                    println!("DQT - Define Quantization Table, {segment_len} bytes");
                     cursor += 4;
 
                     if let Some(quant_table) = QuantizationTable::parse(&bytes[cursor..]) {
@@ -7579,19 +7532,33 @@ impl Jpeg {
                 }
                 TAG_APP0 => {
                     let segment_len = Self::segment_len(&bytes, cursor);
-                    // println!("APP0 - JFIF, {segment_len} bytes");
-                    cursor += segment_len + 4;
+                    println!("APP0 - JFIF, {segment_len} bytes");
+                    let magic: [u8; 5] = [
+                        0x4A, 0x46, 0x49, 0x46, // "JFIF"
+                        0x00,
+                    ];
+
+                    cursor += 4;
+                    if bytes.get(cursor..cursor + 5).ok_or(FileToShort)? != magic {
+                        return Err(NotAJpeg);
+                    }
+                    cursor += segment_len;
                 }
 
                 TAG_APP1 => {
                     let segment_len = Self::segment_len(&bytes, cursor);
-                    // println!("APP1 - EXIF/XMP, {segment_len} bytes");
+                    println!("APP1 - EXIF/XMP, {segment_len} bytes");
+
+                    let exif_data = ExifMetadata::parse(&bytes[cursor + 4..]).unwrap();
+
+                    println!("{exif_data:?}");
+                    todo!();
                     cursor += segment_len + 4;
                 }
 
                 TAG_APP2 => {
                     let segment_len = Self::segment_len(&bytes, cursor);
-                    // println!("APP2 - ICC, {segment_len} bytes");
+                    println!("APP2 - ICC, {segment_len} bytes");
                     cursor += segment_len + 4;
                 }
                 _ => {
@@ -7664,6 +7631,56 @@ impl Jpeg {
             height: metadata.height,
             data: image,
         })
+    }
+
+    fn parse_metadata(bytes: &[u8]) -> Result<(Option<ExifMetadata>, usize, usize), JpegError> {
+        use JpegError::*;
+
+        let mut cursor = 0;
+
+        let mut width = None;
+        let mut height = None;
+        let mut exif_data = None;
+
+        while cursor + 2 < bytes.len() {
+            match u16::from_be_bytes(bytes[cursor..cursor + 2].try_into().unwrap()) {
+                TAG_EOI | TAG_SOS => {
+                    break;
+                }
+
+                TAG_SOF0 => {
+                    let segment_len = Jpeg::segment_len(&bytes, cursor);
+                    cursor += 4;
+
+                    let sof0 = Sof0::parse(&bytes[cursor..]).ok_or(UnexpectedEndOfFile)?;
+
+                    width = Some(sof0.width);
+                    height = Some(sof0.height);
+                    cursor += segment_len;
+                }
+                TAG_APP1 => {
+                    let segment_len = Jpeg::segment_len(&bytes, cursor);
+                    cursor += 4;
+
+                    exif_data = ExifMetadata::parse(&bytes[cursor..]);
+                    cursor += segment_len;
+                }
+                TAG_APP0 | TAG_APP2 | TAG_DHT | TAG_DQT => {
+                    let segment_len = Jpeg::segment_len(&bytes, cursor);
+                    cursor += 4;
+                    cursor += segment_len;
+                }
+                _ => {
+                    cursor += 1;
+                }
+            }
+        }
+
+        Ok((
+            exif_data,
+            width.ok_or(MetadataNotFound)?,
+            height.ok_or(MetadataNotFound)?,
+        ))
     }
 
     fn segment_len(bytes: &[u8], cursor: usize) -> usize {
