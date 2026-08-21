@@ -1,5 +1,6 @@
 pub mod metadata;
 pub mod parser;
+pub mod render;
 pub mod syntax;
 
 #[derive(Debug, PartialEq, Clone)]

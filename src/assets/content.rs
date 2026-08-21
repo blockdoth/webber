@@ -15,9 +15,13 @@ use crate::runtime::jpeg::errors::ImageParseError;
 use crate::runtime::jpeg::errors::JpegError;
 use crate::runtime::jpeg::exif::ExifMetadata;
 use crate::runtime::jpeg::jpeg::Jpeg;
+use crate::runtime::markdown;
+use crate::runtime::markdown::parser::MarkdownPost;
 use crate::runtime::markdown::parser::ParsedMarkdown;
 use crate::runtime::misc::byte_stuff::split_mix_64_hash;
 use crate::runtime::misc::date::Date;
+use crate::runtime::server::router::DynamicRoute;
+use crate::runtime::server::router::Router;
 use crate::runtime::templating::context::Context;
 use crate::runtime::templating::context::TemplateContext;
 use crate::runtime::templating::error::TemplateError;
@@ -46,18 +50,26 @@ impl Content {
         // assets
         Self { assets, templates }
     }
-    pub fn update_asset_content(&self, context: &mut Context) {
-        self.update_posts(context);
+    pub fn update_asset_content(
+        &self,
+        context: &mut Context,
+        dynamic_routes: Option<&mut HashMap<String, DynamicRoute>>,
+    ) {
+        self.update_posts(context, dynamic_routes);
         self.update_quotes(context);
-        self.update_pages(context);
         self.update_blogs(context);
         self.update_gallery(context);
+        self.update_pages(context);
     }
-    pub fn check_update(&mut self, context: &mut Context) -> Result<bool, TemplateError> {
+    pub fn check_update(
+        &mut self,
+        context: &mut Context,
+        dynamic_routes: &mut HashMap<String, DynamicRoute>,
+    ) -> Result<bool, TemplateError> {
         let assets_changed = match self.update_assets() {
             Ok(assets_changed) => {
                 if assets_changed {
-                    self.update_asset_content(context);
+                    self.update_asset_content(context, Some(dynamic_routes));
                 }
                 assets_changed
             }
@@ -177,7 +189,11 @@ impl Content {
         Ok(changed)
     }
 
-    pub fn update_posts(&self, context: &mut Context) {
+    pub fn update_posts(
+        &self,
+        context: &mut Context,
+        mut dynamic_routes: Option<&mut HashMap<String, DynamicRoute>>,
+    ) {
         fn publish_date(asset: &AssetData) -> Option<&Date> {
             match asset {
                 AssetData::Markdown(Cow::Owned(ParsedMarkdown::Post(post)))
@@ -188,12 +204,53 @@ impl Content {
             }
         }
 
-        let mut posts: Vec<AssetData> = self
-            .assets
-            .get_partial("/posts/")
-            .into_iter()
-            .map(|(_, p)| p.data.clone())
-            .collect();
+        let mut posts: Vec<AssetData> = Vec::new();
+
+        let mut post_routes = HashMap::new();
+
+        let mut base_dir_found = None;
+        for (path, Asset { data, internal, .. }) in self.assets.get_partial("/posts/") {
+            if *internal {
+                continue;
+            }
+
+            let AssetData::Markdown(markdown) = &data else {
+                continue;
+            };
+            let ParsedMarkdown::Post(post) = markdown.as_ref() else {
+                continue;
+            };
+
+            if let Some(dyn_routes) = &mut dynamic_routes
+                && let Some(stripped_path) = path.strip_suffix(".md")
+                && let Some((base_path, _)) = stripped_path.rsplit_once('/')
+                && let Some(route) = dyn_routes
+                    .values()
+                    .find(|route| route.base_dir == base_path)
+            {
+                let dyn_route = DynamicRoute {
+                    base_dir: base_path.to_owned(),
+                    page_var_name: route.page_var_name.to_owned(),
+                    list_var_name: route.list_var_name.to_owned(),
+                    template_path: route.template_path.to_owned(),
+                    slug: post.metadata.slug.to_owned(),
+                };
+
+                post_routes.insert(
+                    format!("{}/{}", base_path, post.metadata.slug.to_owned()),
+                    dyn_route,
+                );
+                base_dir_found.get_or_insert(base_path.to_owned());
+            }
+            posts.push(data.clone());
+        }
+
+        if let Some(dyn_routes) = dynamic_routes
+            && let Some(base_dir) = base_dir_found
+        {
+            dyn_routes.retain(|_, r| r.base_dir != base_dir);
+            dyn_routes.extend(post_routes);
+        }
 
         posts.sort_by(|a, b| publish_date(b).cmp(&publish_date(a)));
 
@@ -301,12 +358,12 @@ impl Content {
         let pages = self.assets.get_partial("/pages/");
 
         for (path, page) in pages {
-            if let AssetData::Markdown(..) = page.data
+            if let AssetData::Markdown(..) = &page.data
                 && let Some(stripped_path) = path.strip_suffix(".md")
                 && let Some(stripped_path) = stripped_path.strip_prefix("/")
             {
-                println!("{stripped_path}");
                 let page_value = page.data.clone().to_template_value();
+
                 context
                     .global_context
                     .insert(stripped_path.to_owned(), page_value);
@@ -358,6 +415,15 @@ impl Content {
 
             grouped.entry(label).or_default().push(img);
         }
+
+        let mut grouped: Vec<_> = grouped.into_iter().collect();
+
+        grouped.sort_by_key(|(label, _)| {
+            label
+                .split_once('_')
+                .and_then(|(n, _)| n.parse::<u32>().ok())
+                .unwrap_or(u32::MAX)
+        });
 
         let mut gallery = vec![];
 

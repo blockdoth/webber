@@ -1,4 +1,54 @@
-use crate::runtime::misc::date::Date;
+use crate::runtime::{
+    markdown::{
+        parser::{MarkdownNode, MarkdownParser, ParsedMarkdown},
+        render::MarkdownRenderer,
+    },
+    misc::date::Date,
+};
+
+#[derive(Clone, Debug)]
+pub struct PostMetadataPartial {
+    title: Option<String>,
+    slug: Option<String>,
+    published: Result<Date, &'static str>,
+    tags: Vec<String>,
+    summary: Option<String>,
+    draft: bool,
+}
+
+impl PostMetadataPartial {
+    pub fn finalize(mut self, ast: MarkdownNode<'_>) -> PostMetadata {
+        if self.title.is_none()
+            && let Some(title) = ast.into_iter().find_map(|node| match node {
+                MarkdownNode::Heading { level: 1, .. } => Some(MarkdownRenderer::to_text(node)),
+                _ => None,
+            })
+        {
+            self.title = Some(title);
+        }
+
+        if self.slug.is_none()
+            && let Some(title) = &self.title
+        {
+            self.slug = Some(
+                title
+                    .trim()
+                    .replace(' ', "-")
+                    .replace(',', "")
+                    .to_lowercase(),
+            );
+        }
+
+        PostMetadata {
+            title: self.title.unwrap_or("Untitled".to_owned()),
+            slug: self.slug.unwrap_or("untitled".to_owned()),
+            published: self.published,
+            tags: self.tags,
+            summary: self.summary,
+            draft: self.draft,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PostMetadata {
@@ -11,14 +61,11 @@ pub struct PostMetadata {
 }
 
 impl PostMetadata {
-    pub fn parse_metadata(input: &str) -> Option<(Self, &str)> {
-        let mut cursor: usize = 0;
+    pub fn parse_metadata(input: &str) -> Option<(PostMetadataPartial, &str)> {
+        let mut cursor = 0;
 
-        let first_line_end = input[cursor..]
-            .find('\n')
-            .map_or(input.len(), |i| cursor + i);
-
-        let first_line = &input[cursor..first_line_end];
+        let first_line_end = input.find('\n').unwrap_or(input.len());
+        let first_line = &input[..first_line_end];
 
         if !first_line.starts_with("::::") {
             return None;
@@ -30,12 +77,12 @@ impl PostMetadata {
             first_line_end
         };
 
-        let mut metadata_lines = vec![];
+        let mut metadata_lines = Vec::new();
 
         loop {
             let line_end = input[cursor..]
                 .find('\n')
-                .map_or(input.len(), |i| cursor + i);
+                .map_or(input.len(), |offset| cursor + offset);
 
             let line = &input[cursor..line_end];
 
@@ -48,20 +95,22 @@ impl PostMetadata {
 
                 break;
             }
+
             metadata_lines.push(line);
+
             if line_end == input.len() {
-                return Some((PostMetadata::parse_metadata_content(metadata_lines), input));
+                return None;
             }
 
             cursor = line_end + 1;
         }
-        Some((
-            PostMetadata::parse_metadata_content(metadata_lines),
-            &input[cursor..],
-        ))
+
+        let metadata = Self::parse_metadata_content(metadata_lines)?;
+
+        Some((metadata, &input[cursor..]))
     }
 
-    fn parse_metadata_content(lines: Vec<&str>) -> PostMetadata {
+    fn parse_metadata_content(lines: Vec<&str>) -> Option<PostMetadataPartial> {
         let mut title: Option<String> = None;
         let mut slug: Option<String> = None;
         let mut published: Option<Result<Date, &'static str>> = None;
@@ -96,15 +145,14 @@ impl PostMetadata {
             }
         }
 
-        let title_str = title.unwrap_or("untitled".to_owned());
-        PostMetadata {
-            slug: slug.unwrap_or(title_str.replace(' ', "-").to_lowercase()),
-            title: title_str,
-            published: published.unwrap_or(Err("no publish date specified")),
+        Some(PostMetadataPartial {
+            title,
+            slug,
+            published: published?,
             tags,
             draft,
             summary,
-        }
+        })
     }
 
     fn parse_string(value: &str) -> Option<String> {

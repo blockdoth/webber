@@ -23,8 +23,6 @@ mod comptime;
 mod runtime;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env::set_current_dir("src")?;
-
     if std::env::args().any(|arg| arg.contains("build-script-build")) {
         comptime::comptime()
     } else {

@@ -68,6 +68,7 @@ impl SyntaxHighlightLang {
         }
 
         result.extend_from_slice(langs);
+        result.dedup();
         result
     }
 }

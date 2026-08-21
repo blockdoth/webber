@@ -27,7 +27,6 @@ use crate::comptime::GIT_HASH_SHORT;
 
 pub fn runtime() -> Result<(), Box<dyn Error>> {
     let args = std::env::args();
-
     if cli::run_arg_tools(args)? {
         return Ok(());
     }
@@ -40,9 +39,8 @@ pub fn start_server(socket_addr: String, domain: String) -> Result<(), Box<dyn E
     sighandlers::register_signal_handlers();
 
     let mut db = Db::init()?;
-    println!("Initialized db");
-    db.test_counter()?;
-    db.sync()?;
+    // db.test_counter()?;
+    // db.sync()?;
 
     let content = Content::load_embedded();
 
@@ -56,7 +54,7 @@ pub fn start_server(socket_addr: String, domain: String) -> Result<(), Box<dyn E
         .route_static_page("/gallery", "pages/gallery.html")
         .route_static_page("/stats", "pages/stats.html")
         .route_static_page("/about", "pages/about.html")
-        .route_dynamic_pages("/posts/:post", "pages/post.html", "posts")
+        .route_dynamic_pages("/posts", "posts", "post", "pages/post.html")
         .fallback("/home")
         .error_page("error.html")
         .rss("rss.html");
@@ -72,7 +70,8 @@ fn construct_context(content: &Content, domain: String) -> Context {
 
     let last_build_date = Date::from_systemtime(SystemTime::now()).expect("failed to parse date");
 
-    content.update_asset_content(&mut context);
+    content.update_asset_content(&mut context, None);
+
     context.insert_global("random_quote_index", 0);
     context.insert_global("basedate", Date::default());
     context.insert_global("copyright_start", "2026".to_string());

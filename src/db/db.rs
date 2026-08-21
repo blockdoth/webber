@@ -80,7 +80,7 @@ impl Db {
             metric_cache: HashMap::new(),
             current_cache_count: 0,
         };
-        db.sync()?;
+        // db.sync()?;
         Ok(db)
     }
 
@@ -326,7 +326,7 @@ impl Db {
             })
             .collect();
 
-        metrics.sort_unstable_by(|a, b| a.avg_loadtime.cmp(&b.avg_loadtime));
+        metrics.sort_unstable_by(|a, b| b.count.cmp(&a.count));
         Ok(Stats {
             pages: metrics,
             start_time,
@@ -350,8 +350,8 @@ impl Db {
     }
 
     pub fn export_db_serialized(&mut self, path: PathBuf) -> Result<(), Box<dyn Error>> {
-        self.connection.export_db_serialized(path)?;
-        self.sync()
+        self.sync()?;
+        self.connection.export_db_serialized(path)
     }
     pub fn export_db(&self, path: &PathBuf) -> Result<(), Box<dyn Error>> {
         if path.exists() {
@@ -556,11 +556,11 @@ impl Connection {
     fn export_db_serialized(&self, path: PathBuf) -> Result<(), Box<dyn Error>> {
         let bytes = self.serialize();
 
+        fs::write(&path, &bytes)?;
         println!(
             "Exported db of size {} to {path:?}",
             byte_stuff::pretty_bytes(bytes.len())
         );
-        fs::write(path, bytes)?;
         Ok(())
     }
 

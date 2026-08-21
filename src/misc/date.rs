@@ -81,6 +81,7 @@ impl Date {
             Month => format!("{month:02}"),
             MonthName => month_name.to_string(),
             MonthShort => month_short.to_string(),
+            MonthShortDay => format!("{} {}", month_short, day),
             Day => format!("{day:02}"),
             Weekday => weekday.to_string(),
             WeekdayShort => weekday_short.to_string(),
@@ -185,12 +186,31 @@ pub enum DateFormat {
     Month,
     MonthName,
     MonthShort,
+    MonthShortDay,
     Day,
     Weekday,
     WeekdayShort,
     MonthNameYearDay,
     MonthNameShortYearDay,
 }
+
+// rfc1123                     Thu, 01 Jan 1970 00:00:00 GMT
+// iso8601                     1970-01-01T00:00:00Z
+// iso-date                    1970-01-01
+// datetime                    1970-01-01 00:00:00
+// date                        1970/01/01
+// time                        00:00:00
+// year                        1970
+// month                       01
+// month-name                  January
+// month-short                 Jan
+// month-short-day             Jan 1
+// day                         01
+// weekday                     Thursday
+// weekday-short               Thu
+// unix                        0
+// month-name-day-year
+// month-name-short-day-year
 
 impl DateFormat {
     pub fn parse(input: &str) -> Option<DateFormat> {
@@ -211,6 +231,7 @@ impl DateFormat {
             "month" => Some(Month),
             "month-name" => Some(MonthName),
             "month-short" => Some(MonthShort),
+            "month-short-day" => Some(MonthShortDay),
 
             "day" => Some(Day),
 

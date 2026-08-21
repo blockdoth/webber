@@ -15,9 +15,9 @@ use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 
 #[derive(Debug)]
 pub struct DynamicRoute {
-    _base_url: String,
-    _page_list_name: String,
+    pub base_dir: String,
     pub page_var_name: String,
+    pub list_var_name: String,
     pub template_path: String,
     pub slug: String,
 }
@@ -100,15 +100,14 @@ impl Router {
     pub fn route_dynamic_pages(
         mut self,
         path: &str,
+        list_var_name: &str,
+        page_var_name: &str,
         base_template_path: &str,
-        list_name: &str,
     ) -> Self {
-        let (base_path, key) = path.rsplit_once(':').expect("expected path to contain ':'");
-
         let template_value = self
             .context
-            .lookup(list_name)
-            .unwrap_or_else(|| panic!("Failed to find var {} in context", list_name))
+            .lookup(list_var_name)
+            .unwrap_or_else(|| panic!("Failed to find var {} in context", list_var_name))
             .clone();
 
         let TemplateValue::List(page_list) = template_value else {
@@ -119,12 +118,12 @@ impl Router {
             if let TemplateValue::Object(ref object) = page
                 && let Some(TemplateValue::Text(slug)) = object.get("slug")
             {
-                let url = format!("{base_path}{slug}");
+                let url = format!("{path}/{slug}");
 
                 let dyn_route = DynamicRoute {
-                    _base_url: base_path.to_owned(),
-                    _page_list_name: list_name.to_owned(),
-                    page_var_name: key.to_owned(),
+                    base_dir: path.to_owned(),
+                    page_var_name: page_var_name.to_owned(),
+                    list_var_name: list_var_name.to_owned(),
                     template_path: base_template_path.to_owned(),
                     slug: slug.to_string(),
                 };
@@ -205,6 +204,7 @@ impl Router {
                     &self.content.templates,
                     &self.context,
                     &route.path,
+                    &route.path,
                     render_buffer,
                     template_cache,
                 )?;
@@ -216,6 +216,7 @@ impl Router {
                     &self.content.templates,
                     &self.context,
                     &route.path,
+                    &route.path,
                     render_buffer,
                     template_cache,
                 )?;
@@ -223,8 +224,6 @@ impl Router {
             }
             _ => match self.dynamic_routes.get(header.path) {
                 Some(dyn_route) => {
-                    // println!("Serving dynamic page {}", header.path);
-
                     let page_context_var = if let Some(TemplateValue::Object(posts_by_slug)) =
                         self.context.lookup("posts_by_slug")
                         && let Some(template_value) = posts_by_slug.get(&dyn_route.slug)
@@ -243,6 +242,7 @@ impl Router {
                         &self.content.templates,
                         &local_context,
                         &dyn_route.template_path,
+                        &dyn_route.slug,
                         render_buffer,
                         template_cache,
                     )?;
@@ -264,17 +264,17 @@ impl Router {
         templates: &HashMap<String, Result<Template, TemplateError>>,
         context: &dyn TemplateContext,
         path: &str,
+        slug: &str,
         render_buffer: &mut String,
         path_cache: &'a mut HashMap<String, String>,
     ) -> Result<&'a str, TemplateError> {
-        if !path_cache.contains_key(path) {
+        if !path_cache.contains_key(slug) {
             let rendered = Self::render_template(templates, context, path, render_buffer)?;
-
-            path_cache.insert(path.to_owned(), rendered.to_owned());
+            path_cache.insert(slug.to_owned(), rendered.to_owned());
         }
 
         let (_, rendered) = path_cache
-            .get_key_value(path)
+            .get_key_value(slug)
             .expect("value was just cached");
 
         Ok(rendered)

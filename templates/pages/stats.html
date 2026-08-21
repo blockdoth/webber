@@ -4,7 +4,9 @@
 <style>
   .stat_entry {
     color: var(--white);
-    display: flex;     
+    display: flex; 
+    overflow-wrap: anywhere;
+    font-size: 1.5rem;
   }  
 
   .url {
@@ -27,7 +29,7 @@
 
 {{block body}}
 <div class="stats_description panel"> 
-  Start time: {{stats.start_time}}
+  Last database reset: {{stats.start_time}}
 </div>
 {{for page in stats.pages}}
 

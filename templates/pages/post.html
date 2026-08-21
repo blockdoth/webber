@@ -13,7 +13,6 @@
 {{block js}}
 {{if post.highlighted_langs}}
   <!-- Syntax highlighting -->
-  <link href="/css/prism.css" rel="stylesheet" />
   <script src="/js/prism-core.js"></script>
   
   {{for lang in post.highlighted_langs}}
@@ -26,28 +25,168 @@
 
 
 {{block css}}
-<style>
-  .post {
-    padding: 20px;
-    margin: 2rem;
-    background-color: var(--black);
-    border: 1px solid var(--white);
-  }
 
-  .post_image {
-    width: 100%;
-  }
+{{if post.highlighted_langs}}
+  <style>
+    /* Gruvbox */
+    
+    :root {
+      --code-background: #282828;
+      --code-text: #ebdbb2;
+      --code-comment: #928374;
+      --code-punctuation: #a89984;
+      --code-property: #83a598;
+      --code-number: #d3869b;
+      --code-string: #b8bb26;
+      --code-operator: #fe8019;
+      --code-keyword: #fb4934;
+      --code-function: #fabd2f;
+      --code-variable: #8ec07c;
+    }
 
-  .inline_code {
-    background-color: var(--light-black);
-  }
+    @media print{code[class*=language-],
+      pre[class*=language-]{
+        text-shadow:none
+      }
+    }
 
-</style>
+    pre[class*=language-]{
+      padding:1em;
+      margin:.5em 0;
+    }
+    :not(pre)>code[class*=language-],
+    pre[class*=language-]{
+      background:var(--code-text)
+    
+    }:not(pre)>code[class*=language-]{
+      padding:.1em;
+      border-radius:.3em;
+      white-space:normal
+    }
+
+    code[class*=language-],
+    pre[class*=language-]
+    {
+      background:0 0;
+      font-size:0.9em;
+      text-align:left;
+      line-height:1.5;
+      -moz-tab-size:4;
+      -o-tab-size:4;
+      tab-size:4;
+      -webkit-hyphens:none;
+      -moz-hyphens:none;
+      -ms-hyphens:none;
+      hyphens:none;
+      color: var(--code-text);
+      background: var(--code-background);
+      margin: 0px; 
+
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;      
+    }
+
+
+    code[class*=language-] ::selection,
+    code[class*=language-]::selection,
+    pre[class*=language-] ::selection,
+    pre[class*=language-]::selection
+    {
+      background:var(--code-punctuation);  
+    }
+    .token.namespace{
+      opacity:.7
+    }
+
+    .token.bold,
+    .token.important{
+      font-weight:700
+    }
+    .token.italic{
+      font-style:italic
+    }
+    .token.entity{
+      cursor:help
+    }
+
+    .token.comment,
+    .token.prolog,
+    .token.doctype,
+    .token.cdata {
+        color: var(--code-comment);
+    }
+
+    .token.punctuation {
+        color: var(--code-punctuation);
+    }
+
+    .token.property,
+    .token.tag,
+    .token.constant,
+    .token.symbol,
+    .token.deleted {
+        color: var(--code-property);
+    }
+
+    .token.boolean,
+    .token.number {
+        color: var(--code-number);
+    }
+
+    .token.selector,
+    .token.attr-name,
+    .token.string,
+    .token.char,
+    .token.builtin,
+    .token.inserted {
+        color: var(--code-string);
+    }
+
+    .token.operator,
+    .token.entity,
+    .token.url,
+    .language-css .token.string {
+        color: var(--code-operator);
+        background: var(--code-background);
+    }
+
+    .token.atrule,
+    .token.attr-value,
+    .token.keyword {
+        color: var(--code-keyword);
+    }
+
+    .token.function,
+    .token.class-name {
+        color: var(--code-function);
+    }
+
+    .token.regex,
+    .token.important,
+    .token.variable {
+        color: var(--code-variable);
+    }
+  </style>
+  {{endIf}}
+  
+  <style>
+  
+    .post_image {
+      width: 100%;
+    }
+    .codeblock_wrapper {
+      border: solid 1px var(--code-comment);
+    }
+    /* .inline_code {
+      background-color: var(--light-black);
+    } */
+      
+  </style>
 {{endBlock}}
 
 {{block body}}
-<div class="post">
+<div class="panel">
   {{post.content}}
 </div>
-
 {{endBlock}}

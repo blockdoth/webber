@@ -5,11 +5,16 @@
 
 <style>
 
-  
   html {
     --gallery_row_height: 200px;
   }
-  
+
+  @media (max-width: 996px) {
+    html {
+      --gallery_row_height: 400px;
+    }
+  }
+
   .gallery_section {
     display: flex;
     flex-wrap: wrap;
@@ -33,9 +38,6 @@
     top: 0;
     width: 100%;
     vertical-align: bottom;
-  }
-  .content {
-    width: 100%;
   }
 
   .gallery_description {
@@ -120,6 +122,18 @@
     grid-template-columns: 120px auto;    
   }
 
+  @media (max-width: 996px) {
+    .popup_container {
+      display: block;    
+    }
+    .popup_right_column {
+      padding-left: 0px;  
+    } 
+    .metadata_line {
+      grid-template-columns: 300px auto;    
+    }
+  }
+
 </style>
 {{endBlock}}
 
@@ -198,8 +212,6 @@
       }
     });
   </script>
-
-
 {{endBlock}}
 
 
@@ -207,7 +219,6 @@
 
 <div class="panel">
   Some photo's I like
-
 </div>
 
 <!-- Inspired by: https://github.com/xieranmaya/blog/issues/6 -->
@@ -215,7 +226,7 @@
 {{for photo_collection in gallery}}
 
 <div class="panel">
-  <h3>{{photo_collection.label}}</h3>
+  <h2>{{photo_collection.label}}</h2>
 
   <section class="gallery_section">
     {{for photo in photo_collection.photos}}
@@ -237,7 +248,7 @@
 
         >
         <i class="gallery_padding" style="padding-bottom: calc(var(--h) / var(--w) * 100%)"></i>
-        <img class="gallery_photo" src="{{photo.path}}">
+        <img class="gallery_photo" loading="lazy" src="{{photo.path}}">
 
 
       </div>

@@ -5,6 +5,35 @@
       
   {{endBlock}}    
 
+    <!-- global js -->
+  
+    {{if hotreload}}
+    <script>
+      const ws = new WebSocket("ws://127.0.0.1:4000/ws");
+      ws.onopen = () => console.log("Websocket connected!");
+      ws.onmessage = (event) => {
+        if ( event.data == "reload" ) {
+          window.location.reload();
+        };
+      }
+      </script>
+    {{endIf}}  
+    
+    <script>
+      function prefetch(a) {
+        console.log("prefetch", a.href);        
+        let l = document.createElement("link");
+        l.rel = "prefetch";
+        l.href = a.href;
+        document.head.appendChild(l);
+        a.onmouseenter = null;
+      }
+    </script>
+    
+    <!-- local js -->
+    {{block js}} 
+      
+    {{endBlock}}    
     <!-- global css -->
     <style>
 
@@ -42,17 +71,13 @@
         color: var(--white);
       }
 
-      .link {
-        color: var(--blue);
-      }
-
       h1, h2, h3 {
         /* padding-top: 1rem; */
         margin-top: -0.4rem;
         padding-bottom: 0.2rem;
         font-family: 'Future Mono', monospace;
       }
-
+      
       ul {
         padding-left: 1rem;
         list-style: none;
@@ -65,10 +90,19 @@
       ul li:before {
         content: '> ';
       }
+      hr {
+        margin-top: 0.3rem;
+        margin-bottom: 0.3rem;
+      } 
+
+      .link {
+        color: var(--blue);
+      }
       .container {
         min-height: 100%;
         display: grid;
         grid-template-rows: auto 1fr auto;  
+        container-type: inline-size;
       }
 
       .logo {
@@ -83,11 +117,11 @@
       .nav {
         border-color: var(--white);
         border-bottom: 2px solid var(--white);
-        font-size: 1.2rem;
         display: flex;
         margin-top: 10px;
-        gap: 1.5rem;       
-        align-items: bottom;         
+        gap: 1rem;       
+        font-size: 1.2rem;
+        white-space: nowrap;
       }
       
       .nav_button {
@@ -108,7 +142,6 @@
         text-decoration:none;        
         padding-inline:10px;   
         font-family: 'Future Mono', monospace;
-
       }  
       .nav_button:hover, .blockdoth:hover {
         color: var(--black);
@@ -129,9 +162,9 @@
       }
 
       .content {
-        width: min(50em, calc(100% - 2rem));
+        width: min(70em, calc(100% - 2rem));
         margin-inline: auto;
-        margin-top: 20px;
+        margin-top: 1rem;
       }
 
       .background {
@@ -145,7 +178,7 @@
         align-items: center;        
         gap: 3rem;
         
-        font-size: 12px;
+        font-size: 0.8rem;
         color: var(--gray);
         padding-top: 5px;
       }
@@ -153,8 +186,63 @@
       .panel {
         background-color: var(--black);
         margin: 10px;
-        padding: 15px;
+        padding: 20px;
         border: 1px solid var(--white);
+        /* min-width: 0; */
+      }
+      @media (max-width: 996px) {
+        .nav  {
+            display: block;
+            border-bottom: 0px;
+            align-items: center;
+          }
+        .nav_pages {
+          padding-top: 12px;
+          margin-left: -5px;
+          border-bottom: 2px solid var(--white);
+          font-size: 1.8rem;
+          display: flex;
+          justify-content: center;      
+          padding-bottom: 0;       
+        }
+
+        .nav_button {
+          margin-bottom: 0px;
+        }
+
+        .logo_container {
+          display: flex;
+          justify-content: center;
+        }
+        .logo_placeholder {
+          display: none;
+        }
+        .blockdoth {
+          font-size: 100px;
+        }
+        .content {
+          width: calc(100% - 1rem);
+          margin-top: 2rem;
+        }
+        .footer {
+          font-size: 1.2rem;
+        }
+
+        body {
+          font-size: 1.7em;
+        }
+      
+        h1 {
+          font-size: 4rem;
+        }
+      
+        h2 {
+          font-size: 3rem;
+        }
+      
+        h3 {
+          font-size: 1.5rem;
+        }
       }
 
     </style>
@@ -163,35 +251,7 @@
       
     {{endBlock}}
 
-    <!-- global css -->
 
-    {{if hotreload}}
-    <script>
-      const ws = new WebSocket("ws://127.0.0.1:4000/ws");
-      ws.onopen = () => console.log("Websocket connected!");
-      ws.onmessage = (event) => {
-        if ( event.data == "reload" ) {
-          window.location.reload();
-        };
-      }
-      </script>
-    {{endIf}}  
-    
-    <script>
-      function prefetch(a) {
-        console.log("prefetch", a.href);        
-        let l = document.createElement("link");
-        l.rel = "prefetch";
-        l.href = a.href;
-        document.head.appendChild(l);
-        a.onmouseenter = null;
-      }
-    </script>
-    
-    <!-- local js -->
-    {{block js}} 
-      
-    {{endBlock}}    
     
 </head>
 

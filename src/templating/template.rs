@@ -75,8 +75,6 @@ impl Template {
                 Some(pos) => {
                     if pos.file == self.origin_file {
                         e.enhance_error(self)
-                    } else if pos.file == parent.origin_file {
-                        e.enhance_error(self)
                     } else {
                         panic!("cosmic ray type event")
                     }

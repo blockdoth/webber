@@ -9,10 +9,10 @@ use crate::runtime::assets::content::walk_dir;
 #[cfg(generated)]
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
-pub const DEBUG_BIN_PATH: &str = "../target/debug/webber";
-pub const RELEASE_BIN_PATH: &str = "../target/release/webber";
-pub const ASSETS_PATH: &str = "../assets/";
-pub const TEMPLATES_PATH: &str = "../templates/";
+pub const DEBUG_BIN_PATH: &str = "./target/debug/webber";
+pub const RELEASE_BIN_PATH: &str = "./target/release/webber";
+pub const ASSETS_PATH: &str = "./assets/";
+pub const TEMPLATES_PATH: &str = "./templates/";
 
 pub fn comptime() -> Result<(), Box<dyn Error>> {
     println!("cargo:rustc-cfg=generated");
@@ -169,7 +169,7 @@ pub fn comptime() -> Result<(), Box<dyn Error>> {
         fs::copy(&prev_bin_path, &last_bin_path)?;
 
         println!(
-            "cargo:warning=embedding binary path: {}",
+            "cargo:warning=embedded db from previous binary: \"{}\"",
             prev_bin_path.display()
         );
 

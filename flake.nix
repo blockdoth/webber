@@ -39,6 +39,7 @@
               imagemagick
             ];
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
+
           };
 
           packages.default = pkgs.stdenv.mkDerivation {
@@ -81,10 +82,10 @@
               pkgs.writeShellScript "deploy-webber" ''
                 set -euo pipefail
 
-                git add *.rs *.nix Cargo.toml toolchain.toml templates/* assets/*   
+                git add *.nix Cargo.toml toolchain.toml templates/* assets/*  src/*
 
                 copy_user="penger"
-                deploy_user="webber-deploy"
+                deploy_user="webber-deployer"
                 server="nuc"
   
                 package="$(
@@ -95,7 +96,7 @@
                 nix copy --to "ssh://$copy_user@$server" "$package"
 
                 echo "Deploying on $server"
-                ssh "$deploy_user@$server" sudo -n /run/current-system/sw/bin/deploy-webber "$package/bin/webber"
+                ssh "$deploy_user@$server" sudo  /run/current-system/sw/bin/deploy-webber "$package/bin/webber"
               ''
             );
           };

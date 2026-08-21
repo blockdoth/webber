@@ -5,52 +5,73 @@
 <style>
   .left-column {
     flex: 2;
-    margin-right: 2.5px;
   }
+  
   .right-column {
+    margin-left: 2.5px;
     flex: 1;
   }
 
   .home-container {
     display: flex;
     margin-bottom: -10px;
-    margin-top: -10px;
   }
   
   .quote_author {
     font-family: 'Future Mono', monospace;
     text-align: right;
+    font-size: 0.8rem;
   }
+
   .featured_post {
-    padding-bottom: 15px;
+    padding-bottom: 10px;
     color: var(--white);
     display: flex;
-
+    /* min-height: 5rem; */
   }  
+  
   .featured_post_summary {
-    font-size: smaller
+    font-size: 0.8rem
+  
   }
   .featured_post_date {
     color: var(--gray);
-    font-size: small;
+    font-size: 0.8rem
   }
+
   .posts_archive {
     padding-top: 10px;
   }
+
   .featured_post_text {
     padding-top: 5px;
-    padding-left: 20px;
-    flex: 4
+  }
+
+  .featured_text {
+    padding-left: 0.3rem;
   }
 
   .featured_post_image {
-    flex: 1;
     height: auto;
-    width: 100%; 
-    /* padding: 10px; */
+    width: 20%;
     padding-top: 0px;
+    padding-right: 20px;
   }
 
+  @media (max-width: 996px) {
+    .home-container  {
+        display: block;
+        margin-bottom: 0;
+        margin-top: 0px;
+    }
+
+    .right-column {
+      margin-left: 10px;
+    }   
+    .featured_post {
+      min-height: 10rem;
+    } 
+  }
 
 
 </style>
@@ -58,68 +79,86 @@
 
 
 {{ block body }}
-
+<!-- <script>
+  document.addEventListener("DOMContentLoaded", () => {
+      document.body.insertAdjacentHTML(
+          "afterbegin",
+          `<pre style="position:fixed;top:0;left:0;z-index:99999;background:black;color:white;padding:10px">
+  width: ${window.innerWidth}px
+  height: ${window.innerHeight}px
+  DPR: ${window.devicePixelRatio}
+  screen: ${screen.width}×${screen.height}
+  </pre>`
+      );
+  });
+  </script> -->
 <div class="home-container">
   <div class="left-column panel">
     Welcome to my website. Currently work in process and full of filler content to hash out the style
   </div>
   <div class="right-column panel">
 
-    <h3>Sites I like</h3>
-    {{for blog in cool_blogs}}
-      <ul>
-        <li> <a class="link" href="https://{{blog}}">{{blog}}</a> </li> 
-      </ul>
-    {{endFor}}
+    <a href="/quotes">
+        <h3>Quote of the day:</h3>
+        "{{quotes[random_quote_index].quote}}"
+        
+        <div class="quote_author">
+          ~{{quotes[random_quote_index].author}}{{if quotes[random_quote_index].description}}, {{endIf}} {{quotes[random_quote_index].description}}
+        </div>
+    </a>
+
   </div>
 </div>
 
-<a href="/quotes">
-  <div class="panel">
-    <h3>Quote of the day:</h3>
-    "{{quotes[random_quote_index].quote}}"
-    
-    <div class="quote_author">
-      ~{{quotes[random_quote_index].author}}{{if quotes[random_quote_index].description}}, {{endIf}} {{quotes[random_quote_index].description}}
-    </div>
-  </div>
-</a>
   
 
 <div class="panel">
   
   <a href="/posts/{{posts[0].slug}}" onmouseenter="prefetch(this)">
+    <h3>Writing</h3>
+    <hr>    
     <div class="featured_post">
-      
       {{if posts[0].images[0]}}  
-        <img class="featured_post_image" src="{{posts[0].images[0]}}"></img>
+        <img class="featured_post_image" src="{{posts[0].images[0]}}">
       {{endIf}}
 
       <div class="featured_post_text">
-        <h3>{{posts[0].title}}</h3>
-        <div class="featured_post_summary">
-          {{posts[0].summary}}
-        </div>
-        
-        <div class="featured_post_date">
-          {{date posts[0].published "month-name-day-year"}}
+        <h2>{{posts[0].title}}</h2>
+        <div class="featured_text">
+
+          <div class="featured_post_summary">
+            {{posts[0].summary}}
+          </div>
+          
+          <div class="featured_post_date">
+            {{date posts[0].published "month-name-day-year"}}
+          </div>
         </div>
       </div>
 
     </div>
   </a>
 
+  
   <hr>
-
   <div class="posts_archive">
     <h3>Archive</h3>
     {{for post in posts skip 1}}
     <ul>
-      <li>{{date post.published "date"}} - <a class="link" href="posts/{{post.slug}}" onmouseenter="prefetch(this)"> {{post.title}} </a></li> 
+      <li>{{date post.published "month-name-day-year"}} - <a class="link" href="posts/{{post.slug}}" onmouseenter="prefetch(this)"> {{post.title}} </a></li> 
     </ul>
     {{endFor}}
   </div>
     
+</div>
+
+<div class="panel">
+  <h3>Sites I think are cool</h3>
+  {{for blog in cool_blogs}}
+    <ul>
+      <li> <a class="link" href="https://{{blog}}">{{blog}}</a> </li> 
+    </ul>
+  {{endFor}}
 </div>
 
 
