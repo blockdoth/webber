@@ -838,7 +838,7 @@ fn test_read_bits_across_byte_boundary() {
     let bytes = [0b1010_1010, 0b1100_1100];
     let mut reader = ReadBit69tream::new(&bytes);
 
-    assert_eq!(reader.read_bits(7), Some(0b1010_101));
+    assert_eq!(reader.read_bits(7), Some(0b101_0101));
     assert_eq!(reader.read_bits(2), Some(0b01));
 }
 

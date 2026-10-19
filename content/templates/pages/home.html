@@ -1,4 +1,4 @@
-{{extends "layout.html"}}
+{{extends "content/templates/layout.html"}}
 
 
 {{block css}}
@@ -103,7 +103,8 @@
         "{{quotes[random_quote_index].quote}}"
         
         <div class="quote_author">
-          ~{{quotes[random_quote_index].author}}{{if quotes[random_quote_index].description}}, {{endIf}} {{quotes[random_quote_index].description}}
+            
+          ~{{quotes[random_quote_index].author}}{{if quotes[random_quote_index].source}}, {{quotes[random_quote_index].source}}{{endIf}} 
         </div>
     </a>
 

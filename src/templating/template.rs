@@ -73,11 +73,12 @@ impl Template {
         Self::render_helper(&parent.template, context, &self.blocks, render_buffer).map_err(
             |e| match &e.pos {
                 Some(pos) => {
-                    if pos.file == self.origin_file {
-                        e.enhance_error(self)
-                    } else {
-                        panic!("cosmic ray type event")
-                    }
+                    e.enhance_error(self)
+                    // if pos.file == self.origin_file {
+                    // } else {
+                    //     println!("{} {}", pos.file, self.origin_file);
+                    //     panic!("cosmic ray type event")
+                    // }
                 }
                 None => e.enhance_error(self),
             },

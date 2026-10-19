@@ -16,6 +16,8 @@
 use std::env;
 use std::error::Error;
 
+pub const CONFIG_PATH: &str = "./content/server.tomlish";
+
 #[path = "src/comptime.rs"]
 mod comptime;
 
@@ -27,7 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         comptime::comptime()
     } else {
         #[cfg(generated)] // Marks everything deadcode during build time
-        runtime::runtime();
+        runtime::runtime()?;
         Ok(())
     }
 }

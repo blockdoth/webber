@@ -77,11 +77,13 @@ impl HttpServer {
         for (route, page) in &router.dynamic_routes {
             println!(" {route:17}->\t{}", page.template_path);
         }
-        // println!("Assets");
+        // println!("Generated assets");
         // for (route, asset) in &router.content.assets.collect_kv_mut() {
-        //     println!(" {route:?}\t\t->\t{}", asset.data.html_typ_string());
+        //     if asset.internal {
+        //         println!(" {route:?}\t\t->\t{}", asset.data.html_typ_string());
+        //     }
         // }
-
+        // println!("{:#?}", router.context.global_context);
         println!(" Fallback\t  ->\t{:?}", router.fallback);
 
         #[cfg(debug_assertions)]
@@ -132,7 +134,6 @@ impl HttpServer {
                     match header.path {
                         #[cfg(debug_assertions)]
                         "/ws" => {
-                            // print!("[{peer_addr:?}] Upgrading websocket ... ");
                             self.upgrade_websocket(header, &mut stream)?;
                             is_ws = true;
                         }
@@ -149,7 +150,7 @@ impl HttpServer {
                                         self.build_error_response(&router, err, &mut stream)
                                     }
                                 }
-                            } else if let Some(asset) = router.content.assets.get_ref(header.path)
+                            } else if let Some(asset) = router.content.assets.get_ref(&format!("{}{}", router.asset_path ,header.path)) //TODO remove allocation
                                 && !asset.internal
                             {
                                 Self::send_response(
@@ -225,16 +226,23 @@ impl HttpServer {
                 let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
                     check_fs_timer = Instant::now();
 
-                    template_cache.clear();
-                    router
-                        .content
-                        .check_update(&mut router.context, &mut router.dynamic_routes)?
+                    router.content.check_update(
+                        &mut router.context,
+                        &mut router.dynamic_routes,
+                        &router.asset_path,
+                        &router.template_path,
+                        &router.generated_path,
+                    )?
                 } else {
                     false
                 };
 
                 if reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
                     check_alive_timer = Instant::now();
+                    if reload {
+                        template_cache.clear();
+                        println!("Something changed");
+                    }
                     self.active_streams.retain(|mut stream| {
                         let connection_is_alive = match stream.read(&mut [0]) {
                             Ok(0) => false,
@@ -245,7 +253,7 @@ impl HttpServer {
                         if connection_is_alive && let Ok(_peer_addr) = stream.peer_addr() {
                             if reload {
                                 let _ = HttpServer::send_ws_message(stream, "reload");
-                                // println!("[{peer_addr:?}] Reloaded");
+                                println!("[{_peer_addr:?}] Reloaded");
                             }
                             true
                         } else {
