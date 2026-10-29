@@ -1,4 +1,4 @@
-{{extends "layout.html"}}
+{{extends "content/templates/layout.html"}}
 
 
 {{block css}}
@@ -34,7 +34,7 @@
 
 {{block body}}
 
-{{for post in posts}}
+{{for key, post in posts}}
 <a href="/posts/{{post.slug}}">
 
   <div class="post_entry panel">

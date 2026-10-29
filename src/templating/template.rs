@@ -10,10 +10,12 @@ use crate::runtime::misc::date::DateFormat;
 use crate::runtime::templating::context::{LocalContext, TemplateContext};
 use crate::runtime::templating::error::TemplateErrorMsg;
 use crate::runtime::templating::lexer::{TemplateInfo, TemplatePositionData};
+use crate::runtime::templating::parser::ForIterBind;
 use crate::runtime::templating::parser::{
     ConditionExpr, TemplateNode, TemplateNodeData, TemplateParser, Var, VarIndex,
 };
 use crate::runtime::templating::values::TemplateValueKind;
+use crate::runtime::templating::values::ToTemplateValue;
 use crate::runtime::templating::{error::TemplateError, values::TemplateValue};
 
 #[derive(Debug)]
@@ -73,11 +75,8 @@ impl Template {
         Self::render_helper(&parent.template, context, &self.blocks, render_buffer).map_err(
             |e| match &e.pos {
                 Some(pos) => {
-                    if pos.file == self.origin_file {
-                        e.enhance_error(self)
-                    } else {
-                        panic!("cosmic ray type event")
-                    }
+                    // todo, something here idk
+                    e.enhance_error(self)
                 }
                 None => e.enhance_error(self),
             },
@@ -157,16 +156,51 @@ impl Template {
                     skip,
                 } => {
                     // Todo remove clone
-                    match Self::resolve_var(iter_src, context, &node.pos)? {
-                        List(iter) => {
+                    match (Self::resolve_var(iter_src, context, &node.pos)?, iter_bind) {
+                        (List(iter), ForIterBind::Simple(iter_bind)) => {
                             for it in iter.iter().skip(*skip) {
                                 let child_context = LocalContext::new(context, iter_bind, it);
 
                                 Self::render_helper(body, &child_context, blocks, out)?;
                             }
                         }
+                        (List(iter), ForIterBind::Object(_)) => {
+                            return Err(TemplateError::new(
+                                TemplateErrorMsg::WrongIterBindForList,
+                                node.pos.clone(),
+                            ));
+                        }
 
-                        other => {
+                        (Object(iter), ForIterBind::Object((key_bind, iter_bind))) => {
+                            let mut sorted: Vec<(&String, &TemplateValue)> = iter.iter().collect();
+                            sorted.sort_unstable_by_key(|(key, _)| *key);
+                            for (key, bind) in sorted.into_iter().skip(*skip) {
+                                let key = key.clone().to_template_value(); //todo remove clone
+                                let child_context = LocalContext::new(context, key_bind, &key);
+                                let child_context =
+                                    LocalContext::new(&child_context, iter_bind, bind);
+
+                                Self::render_helper(body, &child_context, blocks, out)?;
+                            }
+                        }
+
+                        (Object(iter), ForIterBind::Simple(iter_bind)) => {
+                            let mut sorted: Vec<(&String, &TemplateValue)> = iter.iter().collect();
+                            sorted.sort_unstable_by_key(|(key, _)| *key);
+                            for (key, bind) in sorted.into_iter().skip(*skip) {
+                                let key = key.clone().to_template_value(); //todo remove clone
+                                let object = TemplateValue::Object(hash_map! {
+                                    "key".to_string() => key,
+                                    "value".to_string() => bind.clone(), // Todo remove clone
+                                });
+
+                                let child_context = LocalContext::new(context, iter_bind, &object);
+
+                                Self::render_helper(body, &child_context, blocks, out)?;
+                            }
+                        }
+
+                        (other, bind) => {
                             return Err(TemplateError::new(
                                 TemplateErrorMsg::TemplateValueNotOfExptectedType(
                                     other.kind(),

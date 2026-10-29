@@ -1,4 +1,4 @@
-{{extends "layout.html"}}
+{{extends "content/templates/layout.html"}}
 
 
 {{block css}}
@@ -223,13 +223,13 @@
 
 <!-- Inspired by: https://github.com/xieranmaya/blog/issues/6 -->
 
-{{for photo_collection in gallery}}
+{{for collection_name, collection_photos in gallery}}
 
 <div class="panel">
-  <h2>{{photo_collection.label}}</h2>
+  <h2>{{collection_name}}</h2>
 
   <section class="gallery_section">
-    {{for photo in photo_collection.photos}}
+    {{for _, photo in collection_photos}}
       <div 
         class="gallery" 
         style="--w: {{photo.width}}; --h: {{photo.height}}; flex-basis: calc(var(--gallery_row_height) * var(--w) / var(--h)); flex-grow: calc(var(--w) / var(--h))"

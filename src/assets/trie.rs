@@ -21,7 +21,7 @@ impl<T> Default for TrieNode<T> {
 #[derive(Default, Debug)]
 pub struct Trie<T> {
     root: TrieNode<T>,
-    paths: HashSet<String>,
+    pub paths: HashSet<String>,
 }
 
 impl<T> Trie<T> {
@@ -148,25 +148,6 @@ impl<T> Trie<T> {
         self.paths.remove(path);
         // TODO remove the emtpy data nodes left behind
         true
-    }
-    pub fn remove_other_than_except_generated(&mut self, current_paths: Vec<String>) -> bool {
-        let current_paths_set: HashSet<String> = current_paths.into_iter().collect();
-
-        let paths_to_delete: Vec<String> =
-            self.paths.difference(&current_paths_set).cloned().collect();
-
-        let mut changed = false;
-
-        for path in &paths_to_delete {
-            if path.starts_with("/generated") {
-                continue;
-            }
-            println!("Removed file {path:?}");
-            changed |= self.remove(path);
-        }
-        self.paths = current_paths_set;
-
-        changed
     }
 
     fn len(&self) -> usize {

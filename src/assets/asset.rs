@@ -5,7 +5,10 @@ use std::io::{self};
 use std::path::Path;
 use std::time::SystemTime;
 
+use crate::runtime::assets::image::GalleryImage;
+use crate::runtime::jpeg::errors::ImageParseError;
 use crate::runtime::markdown::parser::{MarkdownParser, ParsedMarkdown};
+use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 
 #[derive(Clone, Debug)]
 pub struct Asset {
@@ -17,11 +20,11 @@ pub struct Asset {
 impl Asset {
     // Used by build script
     #[allow(unused)]
-    pub fn new(content: AssetData) -> Self {
+    pub fn new(content: AssetData, generated: bool) -> Self {
         Self {
             last_modified: SystemTime::now(),
             data: content,
-            internal: false,
+            internal: generated,
         }
     }
 }
@@ -42,6 +45,7 @@ pub enum AssetData {
     Unknown(Cow<'static, [u8]>),
     Empty,
 }
+
 #[derive(Clone, Debug)]
 pub enum AssetDataRef<'a> {
     Text(&'a str),
@@ -207,6 +211,21 @@ impl AssetData {
             AssetTyp::UnknownText | AssetTyp::Unknown => {
                 AssetData::Unknown(Cow::Owned(buffer.to_vec()))
             }
+        }
+    }
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_template_value_with_path(
+        self,
+        path: &str,
+        asset_path: &str,
+    ) -> Result<TemplateValue, ImageParseError> {
+        use AssetData::*;
+        let path = path.strip_prefix(asset_path).unwrap_or(path);
+
+        match self {
+            Png(bytes) => Ok(GalleryImage::from_png_bytes(path, &bytes)?.to_template_value()),
+            Jpeg(bytes) => Ok(GalleryImage::from_jpeg_bytes(path, &bytes)?.to_template_value()),
+            rest => Ok(rest.to_template_value()),
         }
     }
 }

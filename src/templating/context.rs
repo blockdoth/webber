@@ -6,12 +6,14 @@ use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 #[derive(Debug)]
 pub struct Context {
     pub global_context: HashMap<String, TemplateValue>,
+    pub generated_to_asset_map: HashMap<String, String>,
 }
 
 impl Context {
     pub fn new() -> Self {
         Context {
             global_context: HashMap::new(),
+            generated_to_asset_map: HashMap::new(),
         }
     }
 

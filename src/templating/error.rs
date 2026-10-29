@@ -224,6 +224,7 @@ pub enum TemplateErrorMsg {
     IndexNotInRange(i64, usize),
     UnableToParseNumber(String),
     ExtendsNotFirstLine,
+    WrongIterBindForList,
     UnexpectedEOF,
 }
 
@@ -247,6 +248,7 @@ impl TemplateErrorMsg {
             | MultiLevelForLoopBind(_)
             | UnexpectedTemplateValueType(_, _)
             | UnableToParseNumber(_)
+            | WrongIterBindForList
             | ExtendsNotFirstLine
             | UnexpectedEOF => Parse,
 
@@ -262,6 +264,9 @@ impl Display for TemplateErrorMsg {
         match self {
             VariableNotFound(var) => {
                 write!(f, "{error_kind}: Variable '{var}' was not found in context")
+            }
+            WrongIterBindForList => {
+                write!(f, "Lists dont support non simple iter binds")
             }
             FieldNotFoundOnVariable(var, field) => {
                 write!(

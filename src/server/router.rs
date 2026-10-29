@@ -4,10 +4,11 @@ use std::vec;
 
 use crate::runtime::assets::asset::{AssetData, AssetDataRef};
 use crate::runtime::assets::content::Content;
+use crate::runtime::config::config::{Config, DynamicRouteConfig};
 use crate::runtime::db::db::Db;
 use crate::runtime::server::server::{HttpRequestHeader, HttpResponseCode, HttpServerError};
 use crate::runtime::templating::context::{Context, LocalContext, TemplateContext};
-use crate::runtime::templating::error::TemplateError;
+use crate::runtime::templating::error::{self, TemplateError};
 use crate::runtime::templating::template::Template;
 use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 
@@ -17,6 +18,7 @@ use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 pub struct DynamicRoute {
     pub base_dir: String,
     pub page_var_name: String,
+    pub page_var_key: String,
     pub list_var_name: String,
     pub template_path: String,
     pub slug: String,
@@ -48,11 +50,28 @@ pub struct Router {
     pub fallback: Option<String>,
     pub error_page: Option<String>,
     pub rss_template: Option<String>,
+
+    pub asset_path: String,
+    pub template_path: String,
+    pub generated_path: String,
 }
 
 impl Router {
-    pub fn new(content: Content, context: Context, db: Db) -> Self {
-        Router {
+    // pub fn new(content: Content, context: Context, db: Db) -> Self {
+    //     Router {
+    //         content,
+    //         context,
+    //         db,
+    //         static_routes: HashMap::new(),
+    //         dynamic_routes: HashMap::new(),
+    //         fallback: None,
+    //         error_page: None,
+    //         rss_template: None,
+    //     }
+    // }
+
+    pub fn from_config(config: Config, content: Content, context: Context, db: Db) -> Self {
+        let mut router = Router {
             content,
             context,
             db,
@@ -61,7 +80,39 @@ impl Router {
             fallback: None,
             error_page: None,
             rss_template: None,
+            asset_path: config.assets_path,
+            template_path: config.templates_path,
+            generated_path: config.generated_path,
+        };
+
+        if let Some(fallback) = config.fallback_route {
+            router = router.fallback(&fallback)
+        };
+
+        if let Some(error) = config.error_template {
+            router = router.error_page(&error)
+        };
+
+        for (route, template_path) in config.static_routes {
+            router = router.route_static_page(&route, &template_path);
         }
+
+        for (
+            route,
+            DynamicRouteConfig {
+                template,
+                context_var,
+                bind,
+            },
+        ) in config.dynamic_routes
+        {
+            router = router.route_dynamic_pages(&route, &context_var, &bind, &template);
+        }
+        if let Some(rss) = config.rss_template {
+            router = router.rss(&rss)
+        };
+
+        router
     }
 
     pub fn add_to_static_pages(context: &mut Context, obj: TemplateValue) {
@@ -110,11 +161,14 @@ impl Router {
             .unwrap_or_else(|| panic!("Failed to find var {} in context", list_var_name))
             .clone();
 
-        let TemplateValue::List(page_list) = template_value else {
-            todo!("dynamic page source must be a list");
+        let page_object = match template_value {
+            TemplateValue::Object(object) => object,
+            _ => {
+                todo!("dynamic page source must be a object, got {template_value:?}");
+            }
         };
 
-        for page in page_list {
+        for (key, page) in page_object {
             if let TemplateValue::Object(ref object) = page
                 && let Some(TemplateValue::Text(slug)) = object.get("slug")
             {
@@ -123,6 +177,7 @@ impl Router {
                 let dyn_route = DynamicRoute {
                     base_dir: path.to_owned(),
                     page_var_name: page_var_name.to_owned(),
+                    page_var_key: key,
                     list_var_name: list_var_name.to_owned(),
                     template_path: base_template_path.to_owned(),
                     slug: slug.to_string(),
@@ -155,7 +210,10 @@ impl Router {
 
     pub fn rss(mut self, template: &str) -> Self {
         match self.content.templates.get(template) {
-            None => panic!("RSS template page: \"{template}\" must be in the templates"),
+            None => {
+                let keys = self.content.templates.keys();
+                panic!("RSS template page: \"{template}\" must be in the templates {keys:?}")
+            }
             Some(Err(err)) => {
                 panic!("RSS template page: \"{template}\" has a render or parsing error: {err:#?}")
             }
@@ -199,18 +257,6 @@ impl Router {
 
                 Ok(AssetDataRef::Html(page))
             }
-            Some(route) if header.path == "/rss" => {
-                let page = Self::render_template_cacheable(
-                    &self.content.templates,
-                    &self.context,
-                    &route.path,
-                    &route.path,
-                    render_buffer,
-                    template_cache,
-                )?;
-
-                Ok(AssetDataRef::Text(page))
-            }
             Some(route) => {
                 let page = Self::render_template_cacheable(
                     &self.content.templates,
@@ -220,13 +266,18 @@ impl Router {
                     render_buffer,
                     template_cache,
                 )?;
-                Ok(AssetDataRef::Html(page))
+                if header.path == "/rss" {
+                    Ok(AssetDataRef::Text(page))
+                } else {
+                    Ok(AssetDataRef::Html(page))
+                }
             }
+
             _ => match self.dynamic_routes.get(header.path) {
                 Some(dyn_route) => {
-                    let page_context_var = if let Some(TemplateValue::Object(posts_by_slug)) =
-                        self.context.lookup("posts_by_slug")
-                        && let Some(template_value) = posts_by_slug.get(&dyn_route.slug)
+                    let page_context_var = if let Some(TemplateValue::Object(posts)) =
+                        self.context.lookup(&dyn_route.list_var_name)
+                        && let Some(template_value) = posts.get(&dyn_route.page_var_key)
                     {
                         template_value
                     } else {
@@ -298,7 +349,7 @@ impl Router {
                 if let Some(parent_path) = &template.parent {
                     match templates
                         .get(parent_path)
-                        .expect("Parent template not found: {parent_path}")
+                        .unwrap_or_else(|| panic!(r#"Parent template not found: {parent_path}"#))
                     {
                         Ok(parent_template) => {
                             if parent_template.parent.is_some() {

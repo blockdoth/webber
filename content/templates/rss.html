@@ -6,7 +6,7 @@
     <description>blockdoth's blog</description>
     <language>en-us</language>
     <lastBuildDate>{{ last_build_date }}</lastBuildDate>
-    {{ for post in posts }}
+    {{ for _,post in posts }}
     <item>
       <title>{{ post.title }}</title>
       <link>https://{{ domain }}/posts/{{ post.slug }}</link>

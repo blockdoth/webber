@@ -52,3 +52,33 @@ impl From<io::Error> for JpegError {
         JpegError::WriteError(error)
     }
 }
+
+impl From<JpegError> for ImageParseError {
+    // Clanker generated, todo, clean up
+    fn from(error: JpegError) -> Self {
+        match error {
+            JpegError::FileToShort | JpegError::UnexpectedEndOfFile => Self::BinaryBlobToShort,
+            JpegError::NotAJpeg => Self::InvalidPngSignature,
+            JpegError::NotSufficientInfoToDecode
+            | JpegError::MetadataNotFound
+            | JpegError::ComponentNotFound
+            | JpegError::QuantTableNotFound
+            | JpegError::HuffmanTableNotFound => Self::DimensionsNotFound,
+            JpegError::FailedToParseQuantizationTable
+            | JpegError::FailedToParseHuffmanTable
+            | JpegError::FailedToParseScan
+            | JpegError::FailedToParseScanHeader
+            | JpegError::FailedToParseSof0
+            | JpegError::FailedToDecodeEntropyData
+            | JpegError::UknownColorSpace
+            | JpegError::ComponentCountDontMatch
+            | JpegError::UnexpectedRepeatedSegment
+            | JpegError::ToManyQuantizationTables
+            | JpegError::ToManyHuffmanTables => Self::InvalidSegmentLength,
+            JpegError::FileNotFound(_)
+            | JpegError::UnableToReadFile(_)
+            | JpegError::FailedToHuffmanEncode(_)
+            | JpegError::WriteError(_) => Self::UnexpectedEof,
+        }
+    }
+}

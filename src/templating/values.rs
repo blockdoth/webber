@@ -2,12 +2,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use std::fmt::Debug;
+use std::fs::Metadata;
 use std::hash::BuildHasher;
 use std::time::{Duration, SystemTime};
 
 use crate::runtime::assets::asset::AssetData;
-use crate::runtime::assets::content::GalleryImage;
-use crate::runtime::assets::content::Quote;
+use crate::runtime::assets::image::GalleryImage;
+use crate::runtime::config::parser::TomlishValue;
 use crate::runtime::db::db::{PageMetric, Stats};
 use crate::runtime::jpeg::exif::ExifMetadata;
 use crate::runtime::markdown::parser::{MarkdownFile, MarkdownPost, ParsedMarkdown};
@@ -122,17 +123,6 @@ impl ToTemplateValue for PageMetric {
     }
 }
 
-impl ToTemplateValue for Quote {
-    fn to_template_value(self) -> TemplateValue {
-        hash_map! {
-          "quote".to_string() => self.quote.to_template_value(),
-          "author".to_string() =>  self.author.to_template_value(),
-          "description".to_string() => self.description.to_template_value(),
-        }
-        .to_template_value()
-    }
-}
-
 impl ToTemplateValue for Stats {
     fn to_template_value(self) -> TemplateValue {
         hash_map! {
@@ -158,12 +148,27 @@ impl ToTemplateValue for AssetData {
     fn to_template_value(self) -> TemplateValue {
         use AssetData::*;
         match self {
-            Png(_) | Jpeg(_) | Ico(_) | Woff2(_) | Otf(_) | Unknown(_) => {
+            Png(_) => todo!(
+                "Cant insert png into context directly, use AssetData::to_template_value_with_path instead"
+            ),
+            Jpeg(_) => todo!(
+                "Cant insert jpeg into context directly, use AssetData::to_template_value_with_path instead"
+            ),
+
+            Ico(_) | Woff2(_) | Otf(_) | Unknown(_) => {
                 todo!("Cant insert binary assets into context yet")
             }
             Empty => todo!("not sure what to do with this"),
-            AssetData::Text(s) | Html(s) | Css(s) | Js(s) | UnknownText(s) => s.to_template_value(),
-
+            Html(s) | Css(s) | Js(s) => s.to_template_value(),
+            Text(base) | UnknownText(base) => {
+                if let Some(s) = base.strip_prefix("::::")
+                    && let Some((parse_grammar, rest)) = s.split_once("::::\n")
+                {
+                    TemplateValue::parse_from_grammar(&base, parse_grammar, rest)
+                } else {
+                    base.to_template_value()
+                }
+            }
             Markdown(parsed) => parsed.to_template_value(),
         }
     }
@@ -291,5 +296,33 @@ impl ToTemplateValue for ExifMetadata {
         }
 
         TemplateValue::Object(obj)
+    }
+}
+
+impl ToTemplateValue for TomlishValue {
+    fn to_template_value(self) -> TemplateValue {
+        match self {
+            TomlishValue::Number(n) => TemplateValue::Number(n),
+            TomlishValue::String(s) => TemplateValue::Text(s),
+            TomlishValue::Boolean(b) => TemplateValue::Bool(b),
+            TomlishValue::Array(values) => TemplateValue::List(
+                values
+                    .into_iter()
+                    .map(ToTemplateValue::to_template_value)
+                    .collect(),
+            ),
+            TomlishValue::Object(entries) => TemplateValue::Object(
+                entries
+                    .into_iter()
+                    .filter_map(|(key, mut values)| {
+                        values.pop().map(|value| (key, value.to_template_value()))
+                    })
+                    .collect(),
+            ),
+
+            TomlishValue::Path(path, _)
+            | TomlishValue::ContentPath(path, _)
+            | TomlishValue::Route(path) => TemplateValue::Text(path),
+        }
     }
 }

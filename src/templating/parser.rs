@@ -420,25 +420,16 @@ impl TemplateParser<'_> {
         let start_tok = self.consume(For)?;
         let whitespace_tok = self.consume(Whitespace)?;
 
-        let node = self.parse_var()?;
-        let node_span = node.pos.span.expect("msg");
-        let bind = if let TemplateNodeData::Variable(var) = node.data {
-            if var.indices.is_empty() {
-                var.base
-            } else {
-                return Err(self.error(
-                    TemplateErrorMsg::MultiLevelForLoopBind(Box::new(var)),
-                    self.range_to_position(whitespace_tok.end, node_span.end),
-                ));
-            }
+        let key_bind = self.consume(Identifier)?;
+        let bind = if self.try_consume(Comma).is_some() {
+            self.try_consume(Whitespace);
+            let value_bind = self.consume(Identifier)?;
+            ForIterBind::Object((
+                key_bind.to_str(self.input).to_string(),
+                value_bind.to_str(self.input).to_string(),
+            ))
         } else {
-            return Err(self.error(
-                TemplateErrorMsg::UnexpectedTemplateValueType(
-                    TemplateNodeKind::Variable,
-                    node.data.kind(),
-                ),
-                self.range_to_position(whitespace_tok.end, node_span.end),
-            ));
+            ForIterBind::Simple(key_bind.to_str(self.input).to_string())
         };
 
         self.consume(Whitespace)?;
@@ -601,7 +592,7 @@ pub enum TemplateNodeData {
         else_branch: Vec<TemplateNode>,
     },
     For {
-        iter_bind: String,
+        iter_bind: ForIterBind,
         iter_src: Var,
         body: Vec<TemplateNode>,
         skip: usize,
@@ -610,6 +601,12 @@ pub enum TemplateNodeData {
         ident: String,
         body: Vec<TemplateNode>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum ForIterBind {
+    Simple(String),
+    Object((String, String)),
 }
 
 #[derive(Debug, Clone)]
@@ -700,7 +697,7 @@ impl fmt::Display for TemplateNodeData {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                write!(f, "for {iter_bind} in {iter_src} {{\n{body_str}\n}}")
+                write!(f, "for {iter_bind:?} in {iter_src} {{\n{body_str}\n}}")
             }
             TemplateNodeData::Block { ident, body } => {
                 let body_str = body

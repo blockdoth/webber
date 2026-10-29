@@ -1,4 +1,4 @@
-{{extends "layout.html"}}
+{{extends "content/templates/layout.html"}}
 
 
 {{block css}}
@@ -103,7 +103,8 @@
         "{{quotes[random_quote_index].quote}}"
         
         <div class="quote_author">
-          ~{{quotes[random_quote_index].author}}{{if quotes[random_quote_index].description}}, {{endIf}} {{quotes[random_quote_index].description}}
+            
+          ~{{quotes[random_quote_index].author}}{{if quotes[random_quote_index].source}}, {{quotes[random_quote_index].source}}{{endIf}} 
         </div>
     </a>
 
@@ -114,36 +115,36 @@
 
 <div class="panel">
   
-  <a href="/posts/{{posts[0].slug}}" onmouseenter="prefetch(this)">
+  <a href="/posts/{ {posts[0].slug}}" onmouseenter="prefetch(this)">
     <h3>Writing</h3>
     <hr>    
-    <div class="featured_post">
-      {{if posts[0].images[0]}}  
-        <img class="featured_post_image" src="{{posts[0].images[0]}}">
-      {{endIf}}
+    <!--<div class="featured_post">
+      { {if posts[0].images[0]}}  
+        <img class="featured_post_image" src="{ {posts[0].images[0]}}">
+      { {endIf}}
 
       <div class="featured_post_text">
-        <h2>{{posts[0].title}}</h2>
+        <h2>{ {posts[0].title}}</h2>
         <div class="featured_text">
 
           <div class="featured_post_summary">
-            {{posts[0].summary}}
+            { {posts[0].summary}}
           </div>
           
           <div class="featured_post_date">
-            {{date posts[0].published "month-name-day-year"}}
+            { {date posts[0].published "month-name-day-year"}}
           </div>
         </div>
       </div>
 
-    </div>
+    </div>-->
   </a>
 
   
   <hr>
   <div class="posts_archive">
     <h3>Archive</h3>
-    {{for post in posts skip 1}}
+    {{for _,post in posts skip 1}}
     <ul>
       <li>{{date post.published "month-name-day-year"}} - <a class="link" href="posts/{{post.slug}}" onmouseenter="prefetch(this)"> {{post.title}} </a></li> 
     </ul>

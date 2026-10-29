@@ -33,6 +33,7 @@ pub enum TemplateToken {
     Identifier(Span),
     Literal(Span),
     Dot(Span),
+    Comma(Span),
     BracketOpen(Span),
     BracketClose(Span),
     Equals(Span),
@@ -70,6 +71,7 @@ pub enum TemplateTokenTyp {
     NewLine,
     Whitespace,
     Dot,
+    Comma,
     Date,
     Equals,
     BracketOpen,
@@ -102,6 +104,7 @@ impl TemplateToken {
             Token::NewLine(_) => Typ::NewLine,
             Token::Whitespace(_) => Typ::Whitespace,
             Token::Dot(_) => Typ::Dot,
+            Token::Comma(_) => Typ::Comma,
             Token::Date(_) => Typ::Date,
             Token::Equals(_) => Typ::Equals,
             Token::Literal(_) => Typ::Literal,
@@ -115,6 +118,7 @@ impl TemplateToken {
             | Self::Number(span)
             | Self::Identifier(span)
             | Self::Dot(span)
+            | Self::Comma(span)
             | Self::Equals(span)
             | Self::Whitespace(span)
             | Self::If(span)
@@ -245,6 +249,7 @@ impl<'a> TemplateLexer<'a> {
             if let Some((token, length)) =
                 match rest.chars().next().expect("non-empty rest invariant") {
                     '.' => Some((Dot(Span::from_double(cursor, cursor + 1)), 1)),
+                    ',' => Some((Comma(Span::from_double(cursor, cursor + 1)), 1)),
                     '[' => Some((BracketOpen(Span::from_double(cursor, cursor + 1)), 1)),
                     ']' => Some((BracketClose(Span::from_double(cursor, cursor + 1)), 1)),
 
@@ -327,12 +332,12 @@ impl<'a> TemplateLexer<'a> {
         let valid_before = input[..start]
             .chars()
             .next_back()
-            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}'));
+            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}' | ','));
 
         let valid_after = input[end..]
             .chars()
             .next()
-            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}'));
+            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}' | ','));
 
         valid_before && valid_after
     }
