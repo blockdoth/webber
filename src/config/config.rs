@@ -2,7 +2,7 @@ use std::{collections::HashMap, env, error::Error, fs};
 
 use crate::runtime::{
     assets::content::Content,
-    config::parser::{Tomlish, TomlishValue},
+    config::parser::{Tomlish, TomlishMap, TomlishValue},
     templating::values::{TemplateValue, ToTemplateValue},
 };
 
@@ -76,25 +76,27 @@ impl Config {
         }
     }
 
-    pub fn populate_file(mut self, path: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn from_file(path: &str) -> Result<Self, Box<dyn Error>> {
+        let mut base = Config::default();
+
         let string = fs::read_to_string(path)?;
-        let sections = Tomlish::parse_tomlish(&string)?;
+        let tomlish = Tomlish::parse_tomlish(&string)?;
 
         // Hack to make sure content_path is always set first
-        if let Some(list) = sections.get("data_dirs")
+        if let Some(list) = tomlish.get("data_dirs")
             && let Some((_, TomlishValue::Path(v, true))) =
                 list.iter().find(|(k, _)| *k == "content")
         {
-            self.content_path = v.into();
+            base.content_path = v.into();
         }
 
-        for (section, entries) in sections {
+        for (section, entries) in tomlish {
             for (key, value) in entries {
                 match section {
                     "server" => match (key, value) {
-                        ("host", TomlishValue::String(v)) => self.host = v,
-                        ("port", TomlishValue::Number(v)) => self.port = v.try_into()?,
-                        ("domain", TomlishValue::String(v)) => self.domain = v,
+                        ("host", TomlishValue::String(v)) => base.host = v,
+                        ("port", TomlishValue::Number(v)) => base.port = v.try_into()?,
+                        ("domain", TomlishValue::String(v)) => base.domain = v,
                         (key, _) => {
                             return Err(
                                 format!("Invalid value or unknown key in [server]: {key}").into()
@@ -103,15 +105,15 @@ impl Config {
                     },
 
                     "data_dirs" => match (key, value) {
-                        ("content", TomlishValue::Path(v, _)) => self.content_path = v,
+                        ("content", TomlishValue::Path(v, _)) => base.content_path = v,
                         ("templates", TomlishValue::ContentPath(v, _)) => {
-                            self.templates_path = format!("{}/{}", self.content_path, v)
+                            base.templates_path = format!("{}/{}", base.content_path, v)
                         }
                         ("assets", TomlishValue::ContentPath(v, _)) => {
-                            self.assets_path = format!("{}/{}", self.content_path, v)
+                            base.assets_path = format!("{}/{}", base.content_path, v)
                         }
                         ("generated", TomlishValue::ContentPath(v, _)) => {
-                            self.generated_path = format!("{}/{}", self.content_path, v)
+                            base.generated_path = format!("{}/{}", base.content_path, v)
                         }
                         (key, _) => {
                             return Err(
@@ -121,15 +123,15 @@ impl Config {
                     },
 
                     "structure" => match (key, value) {
-                        ("fallback", TomlishValue::Route(v)) => self.fallback_route = Some(v),
+                        ("fallback", TomlishValue::Route(v)) => base.fallback_route = Some(v),
                         // ("layout", TomlishValue::ContentPath(v, _)) => {
                         //     self.layout_template = Some(format!("{}/{}", self.content_path, v))
                         // }
                         ("error", TomlishValue::ContentPath(v, _)) => {
-                            self.error_template = Some(format!("{}/{}", self.content_path, v))
+                            base.error_template = Some(format!("{}/{}", base.content_path, v))
                         }
                         ("rss", TomlishValue::ContentPath(v, _)) => {
-                            self.rss_template = Some(format!("{}/{}", self.content_path, v))
+                            base.rss_template = Some(format!("{}/{}", base.content_path, v))
                         }
                         (key, _) => {
                             return Err(format!(
@@ -139,11 +141,11 @@ impl Config {
                         }
                     },
 
-                    "variables" => self.variables.push((
+                    "variables" => base.variables.push((
                         key.to_owned(),
                         match value {
                             TomlishValue::ContentPath(path, is_dir) => TomlishValue::ContentPath(
-                                format!("{}/{}", self.content_path, path),
+                                format!("{}/{}", base.content_path, path),
                                 is_dir,
                             ),
                             v => v,
@@ -151,9 +153,9 @@ impl Config {
                     )),
 
                     "static_routes" => match value {
-                        TomlishValue::ContentPath(v, _) => self
+                        TomlishValue::ContentPath(v, _) => base
                             .static_routes
-                            .push((key.to_owned(), format!("{}/{}", self.content_path, v))),
+                            .push((key.to_owned(), format!("{}/{}", base.content_path, v))),
                         _ => {
                             return Err(
                                 format!("Expected content path for static route: {key}").into()
@@ -166,7 +168,7 @@ impl Config {
                             let template = match fields.remove("template") {
                                 Some(mut values) => match values.pop() {
                                     Some(TomlishValue::ContentPath(v, _)) => {
-                                        format!("{}/{}", self.content_path, v)
+                                        format!("{}/{}", base.content_path, v)
                                     }
                                     _ => {
                                         return Err(
@@ -203,7 +205,7 @@ impl Config {
                                 None => return Err(format!("Missing bind for route {key}").into()),
                             };
 
-                            self.dynamic_routes.push((
+                            base.dynamic_routes.push((
                                 key.to_owned(),
                                 DynamicRouteConfig {
                                     template,
@@ -220,6 +222,6 @@ impl Config {
             }
         }
 
-        Ok(self)
+        Ok(base)
     }
 }

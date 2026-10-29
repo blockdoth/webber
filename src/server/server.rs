@@ -13,6 +13,7 @@ use crate::runtime::db::db::DB_SYNC_INTERVAL;
 use crate::runtime::misc::byte_stuff::{base64, sha1};
 use crate::runtime::misc::date::Date;
 use crate::runtime::misc::sighandlers::SHUTDOWN;
+use crate::runtime::server::error::{HttpResponseCode, HttpServerError, ServerError};
 use crate::runtime::server::router::Router;
 use crate::runtime::templating::error::TemplateError;
 
@@ -53,11 +54,7 @@ impl HttpServer {
         }
     }
 
-    pub fn serve(
-        &mut self,
-        listener: TcpListener,
-        mut router: Router,
-    ) -> Result<(), Box<dyn Error>> {
+    pub fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), ServerError> {
         let mut read_buffer: [u8; 8192] = [0; 8192]; // 8kb buffer,
         let mut template_cache: HashMap<String, String> = HashMap::new();
 
@@ -505,77 +502,5 @@ impl HttpServer {
             .unwrap_or(path.len());
 
         &path[..end]
-    }
-}
-
-#[derive(Debug)]
-pub enum HttpServerError {
-    Redirect(String),
-    TemplatingError(TemplateError),
-    StreamWriteFailed(std::io::Error),
-    MalformedRequest,
-    InvalidRequestType(String),
-    Todo,
-}
-
-impl Error for HttpServerError {}
-
-impl Display for HttpServerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Redirect(location) => write!(f, "redirect to {location}"),
-            Self::StreamWriteFailed(error) => write!(f, "failed to write to stream {error}"),
-            Self::TemplatingError(error) => write!(f, "templating error: {error}"),
-            Self::InvalidRequestType(request) => write!(f, "invalid request type {request}"),
-            Self::Todo => write!(f, "operation not implemented"),
-            Self::MalformedRequest => write!(f, "Malformed request"),
-        }
-    }
-}
-
-impl From<std::io::Error> for HttpServerError {
-    fn from(value: std::io::Error) -> Self {
-        HttpServerError::StreamWriteFailed(value)
-    }
-}
-
-impl From<TemplateError> for HttpServerError {
-    fn from(err: TemplateError) -> Self {
-        HttpServerError::TemplatingError(err)
-    }
-}
-
-#[derive(Debug)]
-pub enum HttpResponseCode<'a> {
-    Ok,
-    Redirect(&'a str),
-    BadRequest,
-    NotFound,
-    InternalServer,
-}
-
-impl HttpResponseCode<'_> {
-    pub const fn status_line(&self) -> &'static str {
-        match self {
-            Self::Ok => "200 OK",
-            Self::Redirect(_) => "303 See Other",
-            Self::BadRequest => "400 Bad Request",
-            Self::NotFound => "404 Not Found",
-            Self::InternalServer => "500 Internal Server Error",
-        }
-    }
-}
-
-impl fmt::Display for HttpResponseCode<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HttpResponseCode::Ok => write!(f, "200 OK"),
-            HttpResponseCode::Redirect(redirect) => {
-                write!(f, "303 See Other\r\nLocation: {redirect}")
-            }
-            HttpResponseCode::NotFound => write!(f, "404 Not Found"),
-            HttpResponseCode::BadRequest => write!(f, "400 Bad Request"),
-            HttpResponseCode::InternalServer => write!(f, "500 Internal Server Error"),
-        }
     }
 }

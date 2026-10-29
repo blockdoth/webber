@@ -13,8 +13,8 @@
 // #![allow(clippy::cast_possible_wrap)]
 // #![allow(clippy::enum_glob_use)]
 
+use crate::runtime::server::error::ServerError;
 use std::env;
-use std::error::Error;
 
 pub const CONFIG_PATH: &str = "./content/server.tomlish";
 
@@ -24,7 +24,7 @@ mod comptime;
 #[path = "src/runtime.rs"]
 mod runtime;
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), ServerError> {
     if std::env::args().any(|arg| arg.contains("build-script-build")) {
         comptime::comptime()
     } else {

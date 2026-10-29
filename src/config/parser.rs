@@ -5,13 +5,13 @@ use crate::runtime::{
     templating::values::{TemplateValue, ToTemplateValue},
 };
 
+pub type TomlishMap<'a> = HashMap<&'a str, Vec<(&'a str, TomlishValue)>>;
+
 pub struct Tomlish {}
 
 impl Tomlish {
     #[allow(clippy::type_complexity)]
-    pub fn parse_tomlish(
-        string: &str,
-    ) -> Result<HashMap<&str, Vec<(&str, TomlishValue)>>, Box<dyn Error>> {
+    pub fn parse_tomlish(string: &str) -> Result<TomlishMap<'_>, Box<dyn Error>> {
         let lines = string.lines();
 
         let mut keys = HashMap::new();

@@ -20,7 +20,7 @@ use crate::{
             date::Date,
             sighandlers::{self},
         },
-        server::{router::Router, server::HttpServer},
+        server::{error::ServerError, router::Router, server::HttpServer},
         templating::context::Context,
     },
 };
@@ -32,24 +32,29 @@ use crate::comptime::GIT_HASH_SHORT;
 #[cfg(generated)]
 use crate::comptime::last_build_date;
 
-pub fn runtime() -> Result<(), Box<dyn Error>> {
+pub fn runtime() -> Result<(), ServerError> {
     let args = std::env::args();
     if cli::run_arg_tools(args)? {
         return Ok(());
     }
     #[cfg(generated)]
-    let config = Config::load_embeded_config().populate_env();
+    let mut config = Config::load_embeded_config();
     #[cfg(not(generated))]
-    let config = Config::default().populate_env();
+    let mut config = Config::default();
 
     // println!("Config:\n{config:#?}");
-    start_server(config)?;
-    Ok(())
-}
 
-pub fn start_server(config: Config) -> Result<(), Box<dyn Error>> {
     sighandlers::register_signal_handlers();
 
+    loop {
+        match start_server(config.populate_env()) {
+            Err(ServerError::ReloadConfig(new_config)) => config = *new_config,
+            e => return e,
+        }
+    }
+}
+
+pub fn start_server(config: Config) -> Result<(), ServerError> {
     let mut db = Db::init()?;
     // db.test_counter()?;
     // db.sync()?;
@@ -58,6 +63,7 @@ pub fn start_server(config: Config) -> Result<(), Box<dyn Error>> {
 
     let context = construct_context(&content, &config);
     let socket_addr = format!("{}:{}", config.host, config.port);
+
     let router = Router::from_config(config, content, context, db);
 
     let listener: TcpListener = TcpListener::bind(&socket_addr).expect("Unable to bind to socket");

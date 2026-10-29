@@ -4,15 +4,21 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::Debug;
 use std::fs;
+use std::fs::metadata;
+use std::io::read_to_string;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use std::vec;
 
+use crate::CONFIG_PATH;
 #[cfg(generated)]
 use crate::comptime::{load_embedded_assets, load_embedded_templates};
 use crate::runtime::assets::asset::{Asset, AssetData};
 use crate::runtime::assets::image::GalleryImage;
 use crate::runtime::assets::trie::Trie;
+use crate::runtime::config::config::Config;
+use crate::runtime::config::parser::Tomlish;
 use crate::runtime::config::parser::insert_nested;
 use crate::runtime::jpeg::errors::ImageParseError;
 use crate::runtime::jpeg::errors::JpegError;
@@ -23,6 +29,7 @@ use crate::runtime::markdown::parser::MarkdownPost;
 use crate::runtime::markdown::parser::ParsedMarkdown;
 use crate::runtime::misc::byte_stuff::split_mix_64_hash;
 use crate::runtime::misc::date::Date;
+use crate::runtime::server::error::ServerError;
 use crate::runtime::server::router::DynamicRoute;
 use crate::runtime::server::router::Router;
 use crate::runtime::templating::context::Context;
@@ -37,6 +44,7 @@ use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 pub struct Content {
     pub assets: Trie<Asset>,
     pub templates: HashMap<String, Result<Template, TemplateError>>,
+    pub last_server_config_update: SystemTime,
 }
 
 impl Content {
@@ -51,7 +59,11 @@ impl Content {
         #[cfg(not(generated))]
         let templates = HashMap::new();
 
-        Self { assets, templates }
+        Self {
+            assets,
+            templates,
+            last_server_config_update: SystemTime::now(),
+        }
     }
 
     pub fn check_update(
@@ -61,12 +73,13 @@ impl Content {
         asset_path: &str,
         template_path: &str,
         generated_path: &str,
-    ) -> Result<bool, TemplateError> {
+    ) -> Result<bool, ServerError> {
+        self.check_server_config_update()?;
+
         let (assets_changed, updated) = self.update_assets(asset_path, generated_path)?;
 
         if assets_changed {
-            self.update_asset_content(context, &updated, asset_path)
-                .expect("fix later");
+            self.update_asset_content(context, &updated, asset_path)?;
         }
 
         let templates_changed = self.update_templates(template_path)?;
@@ -74,8 +87,19 @@ impl Content {
         Ok(templates_changed || assets_changed)
     }
 
+    pub fn check_server_config_update(&self) -> Result<(), ServerError> {
+        let path = PathBuf::from(CONFIG_PATH);
+        if let Ok(metadata) = path.metadata()
+            && let Ok(modified) = metadata.modified()
+            && modified > self.last_server_config_update
+            && let Ok(config) = Config::from_file(&path.to_string_lossy())
+        {
+            Err(ServerError::ReloadConfig(Box::new(config)))
+        } else {
+            Ok(())
+        }
+    }
     pub fn update_templates(&mut self, template_path: &str) -> Result<bool, TemplateError> {
-        // TODO Delete and new logic
         let paths = walk_dir(template_path);
         let mut is_new = true;
         let mut changed = false;

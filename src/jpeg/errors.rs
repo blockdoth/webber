@@ -41,6 +41,12 @@ pub enum ImageParseError {
     InvalidExif,
 }
 
+impl fmt::Display for ImageParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
 impl fmt::Display for JpegError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")

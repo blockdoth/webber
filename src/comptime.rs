@@ -10,6 +10,7 @@ use crate::runtime::assets::content::walk_dir;
 use crate::runtime::config::config::Config;
 use crate::runtime::config::parser::TomlishValue;
 use crate::runtime::misc::date::Date;
+use crate::runtime::server::error::ServerError;
 use crate::runtime::templating::values::TemplateValue;
 
 #[cfg(generated)]
@@ -18,8 +19,8 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 pub const DEBUG_BIN_PATH: &str = "./target/debug/webber";
 pub const RELEASE_BIN_PATH: &str = "./target/release/webber";
 
-pub fn comptime() -> Result<(), Box<dyn Error>> {
-    let config = Config::default().populate_file(CONFIG_PATH)?;
+pub fn comptime() -> Result<(), ServerError> {
+    let config = Config::from_file(CONFIG_PATH)?;
     cargo_flags(&config);
 
     // === Init ===
