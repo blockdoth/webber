@@ -10,16 +10,27 @@ use crate::runtime::server::server::HttpRequestHeader;
 #[unsafe(no_mangle)]
 pub fn register_handlers() -> HashMap<String, ApiHandlerFn> {
     hash_map! {
-        "/api/testos".to_owned() => imported_handler as ApiHandlerFn,
+        "/api/balls".to_owned() => imported_handler_1 as ApiHandlerFn,
+        "/api/rocks".to_owned() => imported_handler_2 as ApiHandlerFn,
     }
 }
 
-pub fn imported_handler(
+pub fn imported_handler_1(
     header: &HttpRequestHeader,
     body: AssetData,
     db: &Db,
 ) -> Result<AssetData, HttpServerError> {
-    println!("ran imported handler");
+    println!("handler 1");
+
+    Ok(AssetData::Empty)
+}
+
+pub fn imported_handler_2(
+    header: &HttpRequestHeader,
+    body: AssetData,
+    db: &Db,
+) -> Result<AssetData, HttpServerError> {
+    println!("handler 2");
 
     Ok(AssetData::Empty)
 }

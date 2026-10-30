@@ -13,6 +13,9 @@ pub const CONFIG_PATH: &str =
     "placeholder, because it is defined in main.rs and required as import for runtime.rs";
 
 #[cfg(debug_assertions)]
+pub const API_DYN_LIB_PATH: &str = "same as above";
+
+#[cfg(debug_assertions)]
 #[path = "../../server/src/runtime.rs"]
 pub mod runtime;
 

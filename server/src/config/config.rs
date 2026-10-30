@@ -16,7 +16,7 @@ pub struct Config {
     pub templates_path: String,
     pub assets_path: String,
     pub generated_path: String,
-    pub api_code_path: String,
+    pub api_lib_path: String,
 
     pub fallback_route: Option<String>,
     // pub layout_template: Option<String>,
@@ -67,7 +67,7 @@ impl Config {
             templates_path: "content/templates".into(),
             assets_path: "content/assets".into(),
             generated_path: "content/gen".into(),
-            api_code_path: "content/api".into(),
+            api_lib_path: "api".into(),
             fallback_route: None,
             // layout_template: None,
             error_template: None,
@@ -106,7 +106,7 @@ impl Config {
                         }
                     },
 
-                    "data_dirs" => match (key, value) {
+                    "dirs" => match (key, value) {
                         ("content", TomlishValue::Path(v, _)) => base.content_path = v,
                         ("templates", TomlishValue::ContentPath(v, _)) => {
                             base.templates_path = format!("{}/{}", base.content_path, v)
@@ -117,9 +117,7 @@ impl Config {
                         ("generated", TomlishValue::ContentPath(v, _)) => {
                             base.generated_path = format!("{}/{}", base.content_path, v)
                         }
-                        ("api", TomlishValue::ContentPath(v, _)) => {
-                            base.api_code_path = format!("{}/{}", base.content_path, v)
-                        }
+                        ("api", TomlishValue::Path(v, _)) => base.api_lib_path = v,
                         (key, _) => {
                             return Err(
                                 format!("Invalid value or unknown key in [dirs]: {key}").into()

@@ -70,14 +70,14 @@ impl HttpServer {
         let mut check_db_sync_timer = Instant::now();
         let mut last_day = 0;
 
-        println!("Static Routes:");
-        for (route, page) in &router.static_routes {
-            println!(" {route:17}->\t{}", page.path);
-        }
-        println!("Dynamic Routes:");
-        for (route, page) in &router.dynamic_routes {
-            println!(" {route:17}->\t{}", page.template_path);
-        }
+        // println!("Static Routes:");
+        // for (route, page) in &router.static_routes {
+        //     println!(" {route:17}->\t{}", page.path);
+        // }
+        // println!("Dynamic Routes:");
+        // for (route, page) in &router.dynamic_routes {
+        //     println!(" {route:17}->\t{}", page.template_path);
+        // }
         // println!("Generated assets");
         // for (route, asset) in &router.content.assets.collect_kv_mut() {
         //     if asset.internal {
@@ -85,7 +85,7 @@ impl HttpServer {
         //     }
         // }
         // println!("{:#?}", router.context.global_context);
-        println!(" Fallback\t  ->\t{:?}", router.fallback);
+        // println!(" Fallback\t  ->\t{:?}", router.fallback);
 
         #[cfg(debug_assertions)]
         listener
@@ -226,13 +226,7 @@ impl HttpServer {
                 let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
                     check_fs_timer = Instant::now();
 
-                    router.content.check_update(
-                        &mut router.context,
-                        &mut router.dynamic_routes,
-                        &router.asset_path,
-                        &router.template_path,
-                        &router.generated_path,
-                    )?
+                    Content::check_update(&mut router)?
                 } else {
                     false
                 };

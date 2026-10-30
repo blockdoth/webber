@@ -136,7 +136,7 @@ fn gen_config(out: &mut String, config: &Config) {
             templates_path: {:?}.into(),
             assets_path: {:?}.into(),
             generated_path: {:?}.into(),
-            api_code_path: {:?}.into(),
+            api_lib_path: {:?}.into(),
             fallback_route: {:?}.map(Into::into),
             error_template: {:?}.map(Into::into),
             rss_template: {:?}.map(Into::into),
@@ -151,7 +151,7 @@ fn gen_config(out: &mut String, config: &Config) {
         config.templates_path,
         config.assets_path,
         config.generated_path,
-        config.api_code_path,
+        config.api_lib_path,
         config.fallback_route,
         // layout_template: {:?}.map(Into::into),
 

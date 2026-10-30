@@ -20,6 +20,7 @@ pub const DEBUG_BIN_PATH: &str = "./target/debug/webber";
 pub const RELEASE_BIN_PATH: &str = "./target/release/webber";
 
 pub const CONFIG_PATH: &str = "./server.tomlish";
+pub const API_DYN_LIB_PATH: &str = "target/debug/libapi.so";
 
 #[path = "src/comptime.rs"]
 mod comptime;

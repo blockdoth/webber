@@ -8,6 +8,7 @@ use std::fs::metadata;
 use std::io::read_to_string;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::SystemTime;
 use std::vec;
 
@@ -29,6 +30,7 @@ use crate::runtime::markdown::parser::MarkdownPost;
 use crate::runtime::markdown::parser::ParsedMarkdown;
 use crate::runtime::misc::byte_stuff::split_mix_64_hash;
 use crate::runtime::misc::date::Date;
+use crate::runtime::server::api::Api;
 use crate::runtime::server::error::ServerError;
 use crate::runtime::server::router::DynamicRoute;
 use crate::runtime::server::router::Router;
@@ -45,6 +47,7 @@ pub struct Content {
     pub assets: Trie<Asset>,
     pub templates: HashMap<String, Result<Template, TemplateError>>,
     pub last_server_config_update: SystemTime,
+    pub last_api_lib_update: SystemTime,
 }
 
 impl Content {
@@ -63,32 +66,33 @@ impl Content {
             assets,
             templates,
             last_server_config_update: SystemTime::now(),
+            last_api_lib_update: SystemTime::now(),
         }
     }
 
-    pub fn check_update(
-        &mut self,
-        context: &mut Context,
-        dynamic_routes: &mut HashMap<String, DynamicRoute>,
-        asset_path: &str,
-        template_path: &str,
-        generated_path: &str,
-    ) -> Result<bool, ServerError> {
-        self.check_server_config_update()?;
+    // TODO cleanup
+    pub fn check_update(router: &mut Router) -> Result<bool, ServerError> {
+        router.content.check_server_config_update()?;
+        Content::check_api_lib_update(router)?;
 
-        let (assets_changed, updated) = self.update_assets(asset_path, generated_path)?;
+        let (assets_changed, updated) = router
+            .content
+            .update_assets(&router.asset_path, &router.generated_path)?;
 
         if assets_changed {
-            self.update_asset_content(context, &updated, asset_path)?;
+            router.content.update_asset_content(
+                &mut router.context,
+                &updated,
+                &router.asset_path,
+            )?;
         }
 
-        let templates_changed = self.update_templates(template_path)?;
+        let templates_changed = router.content.update_templates(&router.template_path)?;
 
         Ok(templates_changed || assets_changed)
     }
 
     pub fn check_server_config_update(&self) -> Result<(), ServerError> {
-        // println!("{:?}",std::env::current_dir().expect("current dir") );
         let path = PathBuf::from(CONFIG_PATH);
         if let Ok(metadata) = path.metadata()
             && let Ok(modified) = metadata.modified()
@@ -99,6 +103,26 @@ impl Content {
         } else {
             Ok(())
         }
+    }
+
+    pub fn check_api_lib_update(router: &mut Router) -> Result<(), ServerError> {
+        let path = PathBuf::from(&router.api_lib_path);
+
+        let paths = walk_dir(path);
+
+        let mut updated = false;
+
+        for path in paths {
+            if let Ok(metadata) = path.metadata()
+                && let Ok(modified) = metadata.modified()
+                && modified > router.content.last_api_lib_update
+            {
+                router.content.last_api_lib_update = SystemTime::now();
+                router.api.reload_api();
+                return Ok(());
+            }
+        }
+        Ok(())
     }
     pub fn update_templates(&mut self, template_path: &str) -> Result<bool, TemplateError> {
         let paths = walk_dir(template_path);

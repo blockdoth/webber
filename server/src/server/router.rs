@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::vec;
 
+use crate::API_DYN_LIB_PATH;
 use crate::runtime::assets::asset::{AssetData, AssetDataRef};
 use crate::runtime::assets::content::Content;
 use crate::runtime::config::config::{Config, DynamicRouteConfig};
@@ -56,6 +57,7 @@ pub struct Router<'a> {
     pub asset_path: String,
     pub template_path: String,
     pub generated_path: String,
+    pub api_lib_path: String,
 
     pub api: Api,
 }
@@ -87,7 +89,8 @@ impl<'a> Router<'a> {
             asset_path: config.assets_path,
             template_path: config.templates_path,
             generated_path: config.generated_path,
-            api: Api::new(),
+            api_lib_path: config.api_lib_path,
+            api: Api::new(API_DYN_LIB_PATH, 0),
         };
 
         if let Some(fallback) = config.fallback_route {
@@ -382,6 +385,6 @@ impl<'a> Router<'a> {
         header: &HttpRequestHeader,
         body: AssetData,
     ) -> Result<AssetData, HttpServerError> {
-        self.api.handle(header, body, self.db)
+        self.api.handle_api(header, body, self.db)
     }
 }
