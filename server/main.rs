@@ -16,7 +16,10 @@
 use crate::runtime::server::error::ServerError;
 use std::env;
 
-pub const CONFIG_PATH: &str = "./content/server.tomlish";
+pub const DEBUG_BIN_PATH: &str = "./target/debug/webber";
+pub const RELEASE_BIN_PATH: &str = "./target/release/webber";
+
+pub const CONFIG_PATH: &str = "./server.tomlish";
 
 #[path = "src/comptime.rs"]
 mod comptime;

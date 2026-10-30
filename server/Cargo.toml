@@ -1,0 +1,12 @@
+[package]
+name = "webber"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "webber"
+path = "main.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(generated)'] }
+

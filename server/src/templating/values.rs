@@ -7,7 +7,7 @@ use std::hash::BuildHasher;
 use std::time::{Duration, SystemTime};
 
 use crate::runtime::assets::asset::AssetData;
-use crate::runtime::assets::image::GalleryImage;
+use crate::runtime::assets::parsers::image::GalleryImage;
 use crate::runtime::config::parser::TomlishValue;
 use crate::runtime::db::db::{PageMetric, Stats};
 use crate::runtime::jpeg::exif::ExifMetadata;

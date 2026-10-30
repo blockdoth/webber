@@ -6,7 +6,7 @@ use std::io::{self};
 use std::path::Path;
 use std::time::SystemTime;
 
-use crate::runtime::assets::image::GalleryImage;
+use crate::runtime::assets::parsers::image::GalleryImage;
 use crate::runtime::config::parser::{Tomlish, TomlishMap, TomlishValue};
 use crate::runtime::jpeg::errors::ImageParseError;
 use crate::runtime::markdown::parser::{MarkdownParser, ParsedMarkdown};

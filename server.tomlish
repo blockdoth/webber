@@ -18,6 +18,7 @@ host        = "127.0.0.1"
 
 [data_dirs]
 content     = ./content
+api         = @api
 templates   = @templates
 assets      = @assets
 generated   = @gen
@@ -45,8 +46,11 @@ gallery             = @assets/gallery/
 /gallery    = @templates/pages/gallery.html
 /stats      = @templates/pages/stats.html
 /about      = @templates/pages/about.html
-/test      = @templates/pages/test.html
+/test       = @templates/pages/test.html
 
 // posts is the context var and each post will be bound to post
 [dynamic_routes]
 /posts = { template = @templates/pages/post.html, context_var = "posts", bind = "post" }
+
+[api]
+/api/metrics = "metrics_handler"

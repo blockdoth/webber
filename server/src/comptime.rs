@@ -6,6 +6,8 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use crate::CONFIG_PATH;
+use crate::DEBUG_BIN_PATH;
+use crate::RELEASE_BIN_PATH;
 use crate::runtime::assets::content::walk_dir;
 use crate::runtime::config::config::Config;
 use crate::runtime::config::parser::TomlishValue;
@@ -16,10 +18,14 @@ use crate::runtime::templating::values::TemplateValue;
 #[cfg(generated)]
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
-pub const DEBUG_BIN_PATH: &str = "./target/debug/webber";
-pub const RELEASE_BIN_PATH: &str = "./target/release/webber";
-
 pub fn comptime() -> Result<(), ServerError> {
+    // Build script needs to run from the same location as the main
+    let cwd = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(cwd.parent().unwrap())?;
+    let cwd = std::env::current_dir().expect("current dir");
+    let cwd = cwd.to_string_lossy();
+    // println!("cargo:warning=cwd \"{}\"",cwd);
+
     let config = Config::from_file(CONFIG_PATH)?;
     cargo_flags(&config);
 
@@ -27,11 +33,8 @@ pub fn comptime() -> Result<(), ServerError> {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let last_bin_path = Path::new(&out_dir).join("prev_bin");
     let generated_code_path = Path::new(&out_dir).join("generated.rs");
-    let cwd = std::env::current_dir().expect("current dir");
-    let cwd = cwd.to_string_lossy();
 
     let mut out = String::new();
-
     gen_imports(&mut out);
     gen_load_embedded_assets(&mut out, &cwd, &config);
     gen_load_embedded_templates(&mut out, &cwd, &config);
@@ -133,6 +136,7 @@ fn gen_config(out: &mut String, config: &Config) {
             templates_path: {:?}.into(),
             assets_path: {:?}.into(),
             generated_path: {:?}.into(),
+            api_code_path: {:?}.into(),
             fallback_route: {:?}.map(Into::into),
             error_template: {:?}.map(Into::into),
             rss_template: {:?}.map(Into::into),
@@ -147,6 +151,7 @@ fn gen_config(out: &mut String, config: &Config) {
         config.templates_path,
         config.assets_path,
         config.generated_path,
+        config.api_code_path,
         config.fallback_route,
         // layout_template: {:?}.map(Into::into),
 

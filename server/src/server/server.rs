@@ -17,8 +17,6 @@ use crate::runtime::server::error::{HttpResponseCode, HttpServerError, ServerErr
 use crate::runtime::server::router::Router;
 use crate::runtime::templating::error::TemplateError;
 
-// === Http Server ===
-
 #[derive(Debug)]
 pub struct HttpRequestHeader<'a> {
     _typ: HttpRequestType,
@@ -42,6 +40,12 @@ pub struct HttpServer {
     render_buffer: String,
     #[cfg(debug_assertions)]
     active_streams: Vec<TcpStream>,
+}
+
+impl Default for HttpServer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpServer {

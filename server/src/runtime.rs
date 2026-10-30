@@ -7,7 +7,7 @@ pub mod misc;
 pub mod server;
 pub mod templating;
 
-use std::{clone, error::Error, net::TcpListener, time::SystemTime};
+use std::{clone, error::Error, net::TcpListener, path::PathBuf, time::SystemTime};
 
 use crate::{
     CONFIG_PATH,
@@ -45,21 +45,25 @@ pub fn runtime() -> Result<(), ServerError> {
     // println!("Config:\n{config:#?}");
 
     sighandlers::register_signal_handlers();
-
+    let mut db = Db::init()?;
     loop {
-        match start_server(config.populate_env()) {
-            Err(ServerError::ReloadConfig(new_config)) => config = *new_config,
+        match start_server(config.populate_env(), &mut db) {
+            Err(ServerError::ReloadConfig(new_config)) => {
+                println!("Restarting server");
+                db.sync()?;
+                config = *new_config
+            }
             e => return e,
         }
     }
 }
 
-pub fn start_server(config: Config) -> Result<(), ServerError> {
-    let mut db = Db::init()?;
+pub fn start_server(config: Config, db: &mut Db) -> Result<(), ServerError> {
     // db.test_counter()?;
     // db.sync()?;
 
-    let content = Content::load_embedded();
+    let mut content = Content::load_embedded();
+    // println!("{:?}", content.assets.collect_kv_mut().iter().map(|(a,_)| a.to_string_lossy()).collect::<String>());
 
     let context = construct_context(&content, &config);
     let socket_addr = format!("{}:{}", config.host, config.port);

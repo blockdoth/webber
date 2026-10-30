@@ -1,14 +1,17 @@
-[package]
-name = "webber"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
 
-[[bin]]
-name = "webber"
-path = "main.rs"
+members = [
+    "server",
+    "api",
+]
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(generated)'] }
+[profile.dev]
+opt-level = 0
+debug = 0
+strip = "debuginfo"
+incremental = true
+codegen-units = 256
 
 [profile.release]
 opt-level = 3

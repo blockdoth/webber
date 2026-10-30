@@ -179,7 +179,7 @@ impl TomlishValue {
                 content
                     .assets
                     .get_ref(&path)
-                    .expect("todo")
+                    .unwrap_or_else(|| panic!("path {path:?} not found in assets"))
                     .data
                     .clone()
                     .to_template_value()

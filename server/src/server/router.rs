@@ -6,6 +6,7 @@ use crate::runtime::assets::asset::{AssetData, AssetDataRef};
 use crate::runtime::assets::content::Content;
 use crate::runtime::config::config::{Config, DynamicRouteConfig};
 use crate::runtime::db::db::Db;
+use crate::runtime::server::api::Api;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError};
 use crate::runtime::server::server::HttpRequestHeader;
 use crate::runtime::templating::context::{Context, LocalContext, TemplateContext};
@@ -41,10 +42,10 @@ impl StaticRoute {
 }
 
 #[derive(Debug)]
-pub struct Router {
+pub struct Router<'a> {
     pub content: Content,
     pub context: Context,
-    pub db: Db,
+    pub db: &'a mut Db,
     pub static_routes: HashMap<String, StaticRoute>,
     pub dynamic_routes: HashMap<String, DynamicRoute>,
 
@@ -55,9 +56,11 @@ pub struct Router {
     pub asset_path: String,
     pub template_path: String,
     pub generated_path: String,
+
+    pub api: Api,
 }
 
-impl Router {
+impl<'a> Router<'a> {
     // pub fn new(content: Content, context: Context, db: Db) -> Self {
     //     Router {
     //         content,
@@ -71,7 +74,7 @@ impl Router {
     //     }
     // }
 
-    pub fn from_config(config: Config, content: Content, context: Context, db: Db) -> Self {
+    pub fn from_config(config: Config, content: Content, context: Context, db: &'a mut Db) -> Self {
         let mut router = Router {
             content,
             context,
@@ -84,6 +87,7 @@ impl Router {
             asset_path: config.assets_path,
             template_path: config.templates_path,
             generated_path: config.generated_path,
+            api: Api::new(),
         };
 
         if let Some(fallback) = config.fallback_route {
@@ -233,7 +237,7 @@ impl Router {
         self
     }
 
-    pub fn serve_page<'a>(
+    pub fn serve_page(
         &self,
         header: &HttpRequestHeader,
         _body: AssetData,
@@ -312,12 +316,12 @@ impl Router {
         }
     }
 
-    fn render_template_cacheable<'a>(
+    fn render_template_cacheable(
         templates: &HashMap<String, Result<Template, TemplateError>>,
         context: &dyn TemplateContext,
         path: &str,
         slug: &str,
-        render_buffer: &mut String,
+        render_buffer: &'a mut String,
         path_cache: &'a mut HashMap<String, String>,
     ) -> Result<&'a str, TemplateError> {
         if !path_cache.contains_key(slug) {
@@ -332,7 +336,7 @@ impl Router {
         Ok(rendered)
     }
 
-    fn render_template<'a>(
+    fn render_template(
         templates: &HashMap<String, Result<Template, TemplateError>>,
         context: &dyn TemplateContext,
         path: &str,
@@ -375,9 +379,9 @@ impl Router {
 
     pub fn serve_api(
         &self,
-        _header: &HttpRequestHeader,
-        _body: AssetData,
+        header: &HttpRequestHeader,
+        body: AssetData,
     ) -> Result<AssetData, HttpServerError> {
-        Err(HttpServerError::Todo)
+        self.api.handle(header, body, self.db)
     }
 }

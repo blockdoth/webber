@@ -9,6 +9,12 @@ pub struct Context {
     pub generated_to_asset_map: HashMap<String, String>,
 }
 
+impl Default for Context {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Context {
     pub fn new() -> Self {
         Context {

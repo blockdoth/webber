@@ -15,7 +15,7 @@ use crate::CONFIG_PATH;
 #[cfg(generated)]
 use crate::comptime::{load_embedded_assets, load_embedded_templates};
 use crate::runtime::assets::asset::{Asset, AssetData};
-use crate::runtime::assets::image::GalleryImage;
+use crate::runtime::assets::parsers::image::GalleryImage;
 use crate::runtime::assets::trie::Trie;
 use crate::runtime::config::config::Config;
 use crate::runtime::config::parser::Tomlish;
@@ -88,6 +88,7 @@ impl Content {
     }
 
     pub fn check_server_config_update(&self) -> Result<(), ServerError> {
+        // println!("{:?}",std::env::current_dir().expect("current dir") );
         let path = PathBuf::from(CONFIG_PATH);
         if let Ok(metadata) = path.metadata()
             && let Ok(modified) = metadata.modified()
