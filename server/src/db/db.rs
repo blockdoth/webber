@@ -23,8 +23,8 @@ use crate::runtime::db::bindings::{
 use crate::runtime::db::blob::Blob;
 use crate::runtime::misc::byte_stuff::{self};
 
-pub const METRICS_CACHE_SIZE: usize = 1000;
-pub const DB_SYNC_INTERVAL: u64 = 60;
+pub const METRICS_CACHE_SIZE: usize = 5000;
+pub const DB_SYNC_INTERVAL: u64 = 120;
 
 #[derive(Debug)]
 pub struct Db {

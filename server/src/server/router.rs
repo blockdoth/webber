@@ -310,7 +310,7 @@ impl<'a> Router<'a> {
                 }
 
                 None if let Some(fallback) = &self.fallback => {
-                    println!("Path {} not found, redirecting to {fallback}", header.path);
+                    // println!("Path {} not found, redirecting to {fallback}", header.path);
 
                     Err(HttpServerError::Redirect(fallback.to_string()))
                 }

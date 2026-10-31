@@ -18,3 +18,8 @@ Problems:
 
 Requirements
 - In release mode the API code must be integrated into a single process, only in debug mode can it run seperatly
+
+
+Learned something:
+- The socket read and write buffer size is an important upper bound for request 
+- DB syncs can blow up the waiting buffer, causing a cascading failure

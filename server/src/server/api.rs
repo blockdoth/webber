@@ -12,13 +12,13 @@ use std::{
     mem::transmute,
 };
 
+const RESOLVE_ALL: c_int = 2;
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
 }
 
-const RTLD_NOW: c_int = 2;
 
 pub type ApiHandlerFn =
     fn(header: &HttpRequestHeader, body: AssetData, db: &Db) -> Result<AssetData, HttpServerError>;
@@ -38,7 +38,7 @@ impl Api {
             let path = CString::new(lib_path).unwrap();
             let handlers_str = CString::new("register_handlers").unwrap();
 
-            let api_lib_handle = dlopen(path.as_ptr(), RTLD_NOW);
+            let api_lib_handle = dlopen(path.as_ptr(), RESOLVE_ALL);
             assert!(!api_lib_handle.is_null(), "Failed to load plugin");
 
             let get_handler = dlsym(api_lib_handle, handlers_str.as_ptr());
@@ -73,8 +73,12 @@ impl Api {
 
     pub fn default_handlers() -> HashMap<String, ApiHandlerFn> {
         hash_map! {
-            // "/api/test".to_owned() => Api::test_handler as ApiHandlerFn,
+            "/api/health".to_owned() => Api::healh_check as ApiHandlerFn,
         }
+    }
+
+    pub fn healh_check(header: &HttpRequestHeader, body: AssetData, db: &Db) -> Result<AssetData, HttpServerError> {
+        Ok(AssetData::Empty)
     }
 
     pub fn handle_api(

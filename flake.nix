@@ -34,9 +34,11 @@
               toolchain
               sqlite
 
-              wrk # for benchmarking
-              hey # for benchmarking
               imagemagick
+              # bench
+              wrk 
+              hey 
+              k6
             ];
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
 

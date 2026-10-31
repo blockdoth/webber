@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::IntoRawFd;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use std::{fmt, vec};
@@ -41,11 +42,17 @@ pub struct HttpServer {
     #[cfg(debug_assertions)]
     active_streams: Vec<TcpStream>,
 }
+use std::{os::fd::AsRawFd, os::raw::c_int};
 
-impl Default for HttpServer {
-    fn default() -> Self {
-        Self::new()
+unsafe extern "C" {
+    fn listen(fd: c_int, backlog: c_int) -> c_int;
+}
+
+fn set_backlog(listener: &TcpListener, backlog: c_int) -> io::Result<()> {
+    if unsafe { listen(listener.as_raw_fd(), backlog) } == -1 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(())
 }
 
 impl HttpServer {
@@ -87,11 +94,14 @@ impl HttpServer {
         // println!("{:#?}", router.context.global_context);
         // println!(" Fallback\t  ->\t{:?}", router.fallback);
 
-        #[cfg(debug_assertions)]
+        // #[cfg(debug_assertions)]
         listener
             .set_nonblocking(true)
             .expect("Unable to set socket to nonblocking mode");
 
+        set_backlog(&listener, 4096)?;
+
+        
         'main: while !SHUTDOWN.load(Ordering::Relaxed) {
             match listener.accept() {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -109,14 +119,17 @@ impl HttpServer {
                     let n = loop {
                         match stream.read(&mut read_buffer) {
                             Ok(0) => {
-                                println!("[{peer_addr}] Disconnected");
+                                // println!("[{peer_addr}] Disconnected");
                                 continue 'main;
                             }
                             Ok(n) => break n,
                             Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
                                 std::hint::spin_loop();
                             }
-                            Err(error) => return Err(error.into()),
+                            Err(error) => {
+                                println!("[{peer_addr}] Timed out with {error:?}");
+                                return Err(error.into());
+                            }
                         };
                     };
 
@@ -300,7 +313,7 @@ impl HttpServer {
 
     fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), HttpServerError> {
         let mut frame = Vec::new();
-        frame.push(0x81); // first bit for FIN frame and 8th bit for message type text 
+        frame.push(0x81); // first bit for FIN frame and 8th bit for message type text
         frame.push(msg.len() as u8); // should technically u7, but not needed for my use case
         frame.extend_from_slice(msg.as_bytes());
         stream.write_all(&frame)?;
