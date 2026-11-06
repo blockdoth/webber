@@ -19,7 +19,6 @@ unsafe extern "C" {
     fn dlclose(handle: *mut c_void) -> c_int;
 }
 
-
 pub type ApiHandlerFn =
     fn(header: &HttpRequestHeader, body: AssetData, db: &Db) -> Result<AssetData, HttpServerError>;
 pub type GetApiHandlersFn = fn() -> HashMap<String, ApiHandlerFn>;
@@ -77,7 +76,11 @@ impl Api {
         }
     }
 
-    pub fn healh_check(header: &HttpRequestHeader, body: AssetData, db: &Db) -> Result<AssetData, HttpServerError> {
+    pub fn healh_check(
+        header: &HttpRequestHeader,
+        body: AssetData,
+        db: &Db,
+    ) -> Result<AssetData, HttpServerError> {
         Ok(AssetData::Empty)
     }
 

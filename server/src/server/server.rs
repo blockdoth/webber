@@ -7,52 +7,32 @@ use std::os::fd::IntoRawFd;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use std::{fmt, vec};
+use std::{os::fd::AsRawFd, os::raw::c_int};
 
 use crate::runtime::assets::asset::{AssetData, AssetDataRef, AssetTyp};
 use crate::runtime::assets::content::Content;
 use crate::runtime::db::db::DB_SYNC_INTERVAL;
 use crate::runtime::misc::byte_stuff::{base64, sha1};
 use crate::runtime::misc::date::Date;
-use crate::runtime::misc::sighandlers::SHUTDOWN;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError, ServerError};
 use crate::runtime::server::router::Router;
 use crate::runtime::templating::error::TemplateError;
-
-#[derive(Debug)]
-pub struct HttpRequestHeader<'a> {
-    _typ: HttpRequestType,
-    pub path: &'a str,
-    _origin: Option<&'a str>,
-    _user_agent: Option<&'a str>,
-    pub sec_websocket_key: Option<&'a str>,
-    pub sec_websocket_version: Option<&'a str>,
-    pub upgrade: Option<&'a str>,
-    pub content_typ: AssetTyp,
-}
-
-#[derive(Debug)]
-#[allow(clippy::upper_case_acronyms)]
-pub enum HttpRequestType {
-    GET,
-}
-
-pub struct HttpServer {
-    response_buffer: Vec<u8>,
-    render_buffer: String,
-    #[cfg(debug_assertions)]
-    active_streams: Vec<TcpStream>,
-}
-use std::{os::fd::AsRawFd, os::raw::c_int};
 
 unsafe extern "C" {
     fn listen(fd: c_int, backlog: c_int) -> c_int;
 }
 
-fn set_backlog(listener: &TcpListener, backlog: c_int) -> io::Result<()> {
-    if unsafe { listen(listener.as_raw_fd(), backlog) } == -1 {
-        return Err(io::Error::last_os_error());
+pub struct HttpServer {
+    pub response_buffer: Vec<u8>,
+    pub render_buffer: String,
+    #[cfg(debug_assertions)]
+    pub active_streams: Vec<TcpStream>,
+}
+
+impl Default for HttpServer {
+    fn default() -> Self {
+        Self::new()
     }
-    Ok(())
 }
 
 impl HttpServer {
@@ -64,222 +44,13 @@ impl HttpServer {
             active_streams: vec![],
         }
     }
-
-    pub fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), ServerError> {
-        let mut read_buffer: [u8; 8192] = [0; 8192]; // 8kb buffer,
-        let mut template_cache: HashMap<String, String> = HashMap::new();
-
-        #[cfg(debug_assertions)]
-        let mut check_alive_timer = Instant::now();
-        #[cfg(debug_assertions)]
-        let mut check_fs_timer = Instant::now();
-
-        let mut check_db_sync_timer = Instant::now();
-        let mut last_day = 0;
-
-        // println!("Static Routes:");
-        // for (route, page) in &router.static_routes {
-        //     println!(" {route:17}->\t{}", page.path);
-        // }
-        // println!("Dynamic Routes:");
-        // for (route, page) in &router.dynamic_routes {
-        //     println!(" {route:17}->\t{}", page.template_path);
-        // }
-        // println!("Generated assets");
-        // for (route, asset) in &router.content.assets.collect_kv_mut() {
-        //     if asset.internal {
-        //         println!(" {route:?}\t\t->\t{}", asset.data.html_typ_string());
-        //     }
-        // }
-        // println!("{:#?}", router.context.global_context);
-        // println!(" Fallback\t  ->\t{:?}", router.fallback);
-
-        // #[cfg(debug_assertions)]
-        listener
-            .set_nonblocking(true)
-            .expect("Unable to set socket to nonblocking mode");
-
-        set_backlog(&listener, 4096)?;
-
-        
-        'main: while !SHUTDOWN.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if check_db_sync_timer.elapsed() > Duration::from_secs(DB_SYNC_INTERVAL) {
-                        router.db.sync()?;
-                        check_db_sync_timer = Instant::now();
-                    }
-                }
-                Err(e) => return Err(e.into()),
-                Ok((mut stream, peer_addr)) => {
-                    stream
-                        .set_nonblocking(true)
-                        .expect("Failed to change blocking of stream");
-
-                    let n = loop {
-                        match stream.read(&mut read_buffer) {
-                            Ok(0) => {
-                                // println!("[{peer_addr}] Disconnected");
-                                continue 'main;
-                            }
-                            Ok(n) => break n,
-                            Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
-                                std::hint::spin_loop();
-                            }
-                            Err(error) => {
-                                println!("[{peer_addr}] Timed out with {error:?}");
-                                return Err(error.into());
-                            }
-                        };
-                    };
-
-                    let start_timer = Instant::now();
-
-                    let (header, body) = match HttpServer::parse_request(&read_buffer[..n]) {
-                        Ok(request) => request,
-                        Err(err) => {
-                            eprintln!("Failed to parse request: {err}");
-                            continue;
-                        }
-                    };
-
-                    let mut is_ws = false;
-                    match header.path {
-                        #[cfg(debug_assertions)]
-                        "/ws" => {
-                            self.upgrade_websocket(header, &mut stream)?;
-                            is_ws = true;
-                        }
-                        path => {
-                            let result = if path.starts_with("/api") {
-                                match router.serve_api(&header, body) {
-                                    Ok(content) => Self::send_response(
-                                        HttpResponseCode::Ok,
-                                        content.as_ref(),
-                                        &mut self.response_buffer,
-                                        &mut stream,
-                                    ),
-                                    Err(err) => {
-                                        self.build_error_response(&router, err, &mut stream)
-                                    }
-                                }
-                            } else if let Some(asset) = router.content.assets.get_ref(&format!("{}{}", router.asset_path ,header.path)) //TODO remove allocation
-                                && !asset.internal
-                            {
-                                Self::send_response(
-                                    HttpResponseCode::Ok,
-                                    asset.data.as_ref(),
-                                    &mut self.response_buffer,
-                                    &mut stream,
-                                )
-                            } else {
-                                match router.serve_page(
-                                    &header,
-                                    body,
-                                    &mut self.render_buffer,
-                                    &mut template_cache,
-                                ) {
-                                    Ok(content) => Self::send_response(
-                                        HttpResponseCode::Ok,
-                                        content,
-                                        &mut self.response_buffer,
-                                        &mut stream,
-                                    ),
-                                    Err(err) => {
-                                        self.build_error_response(&router, err, &mut stream)
-                                    }
-                                }
-                            };
-
-                            if let Err(err) = result {
-                                match err {
-                                    HttpServerError::StreamWriteFailed(ref io_err)
-                                        if matches!(
-                                            io_err.kind(),
-                                            ErrorKind::BrokenPipe
-                                                | ErrorKind::ConnectionReset
-                                                | ErrorKind::ConnectionAborted
-                                        ) =>
-                                    {
-                                        // browser/client disappeared.
-                                        continue 'main;
-                                    }
-
-                                    err => {
-                                        eprintln!("[{peer_addr}] request failed: {err}");
-                                        continue 'main;
-                                    }
-                                }
-                            }
-
-                            let end_timer = Instant::now();
-                            let duration = end_timer - start_timer;
-
-                            router.db.save_page_hit(path, duration).expect("in measure");
-                        }
-                    };
-
-                    #[cfg(debug_assertions)]
-                    {
-                        if is_ws {
-                            self.active_streams.push(stream);
-                        }
-                    }
-                }
-            };
-
-            // let day = Date::days();
-            // if day != last_day {
-            //     last_day = day;
-            //     router.content.update_random_quote(&mut router.context, day);
-            // }
-
-            #[cfg(debug_assertions)]
-            {
-                let reload = if check_fs_timer.elapsed() > Duration::from_millis(50) {
-                    check_fs_timer = Instant::now();
-
-                    Content::check_update(&mut router)?
-                } else {
-                    false
-                };
-
-                if reload || check_alive_timer.elapsed() > Duration::from_secs(1) {
-                    check_alive_timer = Instant::now();
-                    if reload {
-                        template_cache.clear();
-                    }
-                    self.active_streams.retain(|mut stream| {
-                        let connection_is_alive = match stream.read(&mut [0]) {
-                            Ok(0) => false,
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
-                            _ => false,
-                        };
-
-                        if connection_is_alive && let Ok(_peer_addr) = stream.peer_addr() {
-                            if reload {
-                                let _ = HttpServer::send_ws_message(stream, "reload");
-                                // println!("[{_peer_addr:?}] Reloaded");
-                            }
-                            true
-                        } else {
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-
-                            false
-                        }
-                    });
-                }
-            }
-            std::hint::spin_loop();
+    pub fn set_backlog(listener: &TcpListener, backlog: c_int) -> io::Result<()> {
+        if unsafe { listen(listener.as_raw_fd(), backlog) } == -1 {
+            return Err(io::Error::last_os_error());
         }
-
-        // Exit routine
-
-        router.db.sync()?;
         Ok(())
     }
-
-    fn upgrade_websocket(
+    pub fn upgrade_websocket(
         &mut self,
         header: HttpRequestHeader,
         stream: &mut TcpStream,
@@ -311,7 +82,7 @@ impl HttpServer {
         Ok(())
     }
 
-    fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), HttpServerError> {
+    pub fn send_ws_message(mut stream: &TcpStream, msg: &str) -> Result<(), HttpServerError> {
         let mut frame = Vec::new();
         frame.push(0x81); // first bit for FIN frame and 8th bit for message type text
         frame.push(msg.len() as u8); // should technically u7, but not needed for my use case
@@ -321,7 +92,7 @@ impl HttpServer {
         Ok(())
     }
 
-    fn parse_request<'a>(
+    pub fn parse_request<'a>(
         buffer: &'a [u8],
     ) -> Result<(HttpRequestHeader<'a>, AssetData), HttpServerError> {
         if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -329,7 +100,7 @@ impl HttpServer {
                 .map_err(|_| HttpServerError::MalformedRequest)
                 .expect("fix after 0 alloc");
 
-            let header = Self::parse_header(header_str).expect("Unable to parse header");
+            let header = HttpRequestHeader::parse(header_str).expect("Unable to parse header");
 
             let content = AssetData::from_asset_type(&buffer[pos + 4..], &header.content_typ);
 
@@ -339,7 +110,7 @@ impl HttpServer {
         }
     }
 
-    fn send_response<'a>(
+    pub fn send_response<'a>(
         code: HttpResponseCode,
         content: AssetDataRef<'a>,
         response_buffer: &'a mut Vec<u8>,
@@ -392,7 +163,8 @@ impl HttpServer {
 
         Ok(())
     }
-    fn build_error_response(
+
+    pub fn build_error_response(
         &mut self,
         router: &Router,
         err: HttpServerError,
@@ -434,8 +206,28 @@ impl HttpServer {
             }
         }
     }
+}
 
-    fn parse_header<'a>(header_str: &'a str) -> Result<HttpRequestHeader<'a>, HttpServerError> {
+#[derive(Debug)]
+pub struct HttpRequestHeader<'a> {
+    _typ: HttpRequestType,
+    pub path: &'a str,
+    _origin: Option<&'a str>,
+    _user_agent: Option<&'a str>,
+    pub sec_websocket_key: Option<&'a str>,
+    pub sec_websocket_version: Option<&'a str>,
+    pub upgrade: Option<&'a str>,
+    pub content_typ: AssetTyp,
+}
+
+#[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum HttpRequestType {
+    GET,
+}
+
+impl<'a> HttpRequestHeader<'a> {
+    fn parse(header_str: &'a str) -> Result<HttpRequestHeader<'a>, HttpServerError> {
         let mut lines = header_str.lines();
 
         let first_line = lines.next().expect("Unable to get next line");
@@ -504,7 +296,6 @@ impl HttpServer {
             content_typ,
         })
     }
-
     fn clean_path(path: &str) -> &str {
         let end = path
             .as_bytes()
