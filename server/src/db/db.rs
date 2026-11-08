@@ -33,6 +33,7 @@ pub struct Db {
     unsynced: bool,
     metric_cache: HashMap<String, Vec<CachedPageHit>>,
     current_cache_count: usize,
+    path_string_intern_cache: HashMap<String, i64>,
 }
 
 impl Db {
@@ -73,7 +74,9 @@ impl Db {
                 unreachable!();
             }
         };
+
         let mut db = Self {
+            path_string_intern_cache: Self::init_path_intern_cache(&conn)?,
             connection: conn,
             executable_path: current_executable_path,
             unsynced: true,
@@ -84,8 +87,23 @@ impl Db {
         Ok(db)
     }
 
+    pub fn init_path_intern_cache(
+        conn: &Connection,
+    ) -> Result<HashMap<String, i64>, Box<dyn Error>> {
+        let res = conn.querry(
+            "SELECT path, id FROM page_path_id_map",
+            &[],
+            &[ColumnTyp::Text, ColumnTyp::Int],
+        )?;
+
+        let keys = res.get_text_column(0)?;
+        let values = res.get_int_column(1)?;
+
+        Ok(keys.into_iter().zip(values).collect())
+    }
+
     pub fn sync(&mut self) -> Result<(), Box<dyn Error>> {
-        if !self.metric_cache.is_empty() {
+        if self.current_cache_count != 0 {
             self.sync_metric_cache()?;
         }
 
@@ -119,26 +137,32 @@ impl Db {
         conn.execute(
             "
             CREATE TABLE page_metrics (
-              id INTEGER PRIMARY KEY,
-              page TEXT,
-              load_time INTEGER,
-              timestamp TIMESTAMP
+                page_id NOT NULL,
+                load_time INTEGER NOT NULL,
+                timestamp TIMESTAMP NOT NULL
             );",
         )?;
         conn.execute(
             "
-          CREATE TABLE page_metrics_aggregate (
-            page TEXT PRIMARY KEY,
-            total_load_time INTEGER,
-            total_hits INTEGER
-          );",
+            CREATE TABLE page_metrics_aggregate (
+                page_id INTEGER PRIMARY KEY,
+                total_load_time INTEGER NOT NULL,
+                total_hits INTEGER NOT NULL
+            );",
         )?;
         conn.execute(
             "
-          CREATE TABLE global_stats (
-            id INTEGER PRIMARY KEY,
-            start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-          );",
+            CREATE TABLE page_path_id_map (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE
+            );",
+        )?;
+        conn.execute(
+            "
+            CREATE TABLE global_stats (
+                id INTEGER PRIMARY KEY,
+                start_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
         )?;
         conn.execute(
             "
@@ -202,29 +226,43 @@ impl Db {
         Ok(())
     }
 
-    // TODO wrap both inserts into transaction
     fn sync_metric_cache(&mut self) -> Result<(), Box<dyn Error>> {
-        // let start = Instant::now();
         let conn = &self.connection;
 
-        let aggregates: Vec<(&str, i64, i64)> = self
+        let page_binds = self
             .metric_cache
-            .iter()
-            .map(|(key, hits)| {
-                let total_loadtime = hits.iter().map(|hit| hit.loadtime).sum();
-                let count = hits.len() as i64;
-
-                (key.as_str(), total_loadtime, count)
-            })
+            .keys()
+            .map(|key| vec![Bind::Text(key)])
             .collect();
+
+        // Update path string intern map
+        conn.transaction(|| {
+            let res = conn.insert_rows_unchecked_returning(
+                "INSERT INTO page_path_id_map (path) VALUES (?) ON CONFLICT(path) DO NOTHING RETURNING path, id",
+                page_binds,
+                &[ColumnTyp::Text, ColumnTyp::Int]
+            )?;
+
+            let keys = res.get_text_column(0)?;
+            let values = res.get_int_column(1)?;
+
+            self.path_string_intern_cache.extend(keys.into_iter()
+                .zip(values));
+
+            Ok(())
+        })?;
 
         let multi_binds_metrics = self
             .metric_cache
             .iter()
             .flat_map(|(key, hits)| {
                 hits.iter().map(|hit| {
+                    let id = *self
+                        .path_string_intern_cache
+                        .get(key)
+                        .expect("string intern failure");
                     vec![
-                        Bind::Text(key),
+                        Bind::Int(id),
                         Bind::Int(hit.loadtime),
                         Bind::Int(hit.timestamp),
                     ]
@@ -232,25 +270,40 @@ impl Db {
             })
             .collect();
 
+        let aggregates: Vec<(i64, i64, i64)> = self
+            .metric_cache
+            .iter()
+            .map(|(key, hits)| {
+                let total_loadtime = hits.iter().map(|hit| hit.loadtime).sum();
+                let count = hits.len() as i64;
+                let id = *self
+                    .path_string_intern_cache
+                    .get(key)
+                    .expect("string intern failure");
+
+                (id, total_loadtime, count)
+            })
+            .collect();
+
         let multi_binds_metrics_aggregate = aggregates
             .iter()
-            .map(|b| vec![Bind::Text(b.0), Bind::Int(b.1), Bind::Int(b.2)])
+            .map(|b| vec![Bind::Int(b.0), Bind::Int(b.1), Bind::Int(b.2)])
             .collect();
 
         conn.transaction(|| {
             conn.insert_rows_unchecked(
-                "INSERT INTO page_metrics (page, load_time, timestamp) VALUES (?,?,?)",
+                "INSERT INTO page_metrics (page_id, load_time, timestamp) VALUES (?,?,?)",
                 multi_binds_metrics,
             )?;
             conn.insert_rows_unchecked(
                 "
                 INSERT INTO page_metrics_aggregate (
-                  page,
+                  page_id,
                   total_load_time,
                   total_hits
                 )
                 VALUES (?, ?, ?)
-                ON CONFLICT(page)
+                ON CONFLICT(page_id)
                   DO UPDATE SET
                     total_load_time = total_load_time + excluded.total_load_time,
                     total_hits = total_hits + excluded.total_hits;",
@@ -263,8 +316,6 @@ impl Db {
             .for_each(|(_, hits)| hits.clear());
 
         self.unsynced = true;
-        // let duration = start.elapsed();
-        // println!("Synced {} entries in metric cache in {duration:?}",self.current_cache_count );
         self.current_cache_count = 0;
 
         Ok(())
@@ -285,8 +336,14 @@ impl Db {
 
         let res = conn.querry(
             "
-                SELECT page, total_load_time, total_hits
-                FROM page_metrics_aggregate",
+                SELECT
+                    page_path_id_map.path,
+                    page_metrics_aggregate.total_load_time,
+                    page_metrics_aggregate.total_hits
+                FROM page_metrics_aggregate
+                JOIN page_path_id_map
+                ON page_metrics_aggregate.page_id = page_path_id_map.id;
+                ",
             &[],
             &[ColumnTyp::Text, ColumnTyp::Int, ColumnTyp::Int],
         )?;
@@ -338,6 +395,7 @@ impl Db {
 
         let connection = Connection::import_db(path)?;
         let mut db = Db {
+            path_string_intern_cache: Self::init_path_intern_cache(&connection)?,
             connection,
             executable_path,
             unsynced: true,
@@ -486,6 +544,31 @@ impl Connection {
             statement.reset_binds()?;
         }
         Ok(())
+    }
+
+    fn insert_rows_unchecked_returning(
+        &self,
+        sql: &str,
+        multi_binds: Vec<Vec<Bind>>,
+        return_typ: &[ColumnTyp],
+    ) -> Result<SqlResult, Box<dyn Error>> {
+        let mut statement = self.prepare(sql)?;
+        let mut res = vec![vec![]; return_typ.len()];
+
+        for binds in multi_binds {
+            statement.bind_all(&binds)?;
+
+            while statement.step()? {
+                for (i, typ) in return_typ.iter().enumerate() {
+                    let value = typ.get_from_statement(&statement, i)?;
+
+                    res.get_mut(i).expect("invariant").push(value);
+                }
+            }
+
+            statement.reset_binds()?;
+        }
+        Ok(SqlResult { inner: res })
     }
 
     fn querry(

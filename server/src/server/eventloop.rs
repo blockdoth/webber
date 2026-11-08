@@ -36,21 +36,14 @@ impl HttpServer {
         scheduler.schedule_repeating(ScheduledTaskType::UpdateContent, Duration::from_millis(50));
 
         let mut last_request = Instant::now();
-        let mut bounded_average_time_between_requests = Duration::from_millis(5);
+        let mut average_time_between_requests = Duration::from_secs(1);
 
         while !SHUTDOWN.load(Ordering::Relaxed) {
-            let iter_timer = Instant::now();
+            let now = Instant::now();
             match listener.accept() {
                 Ok((stream, peer_addr)) => {
                     let now = Instant::now();
-                    let duration_since_last_request = now.duration_since(last_request);
                     last_request = now;
-
-                    bounded_average_time_between_requests = compute_running_average_delay_bounded(
-                        bounded_average_time_between_requests,
-                        duration_since_last_request,
-                        Duration::from_secs(1),
-                    );
 
                     self.handle_connection(
                         stream,
@@ -63,12 +56,18 @@ impl HttpServer {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error.into()),
             }
+            let duration_since_last_request = now.duration_since(last_request);
 
+            average_time_between_requests = compute_running_average_delay_bounded(
+                average_time_between_requests,
+                duration_since_last_request,
+                Duration::from_secs(1),
+            );
             scheduler.execute_due_tasks_with_budget(
                 self,
                 &mut router,
                 &mut template_cache,
-                bounded_average_time_between_requests,
+                average_time_between_requests,
             );
 
             // print!("{:?}\r", bounded_average_time_between_requests);
@@ -174,8 +173,7 @@ impl HttpServer {
 
         router
             .db
-            .save_page_hit(header.path, start_timer.elapsed())
-            .expect("in measure");
+            .save_page_hit(header.path, start_timer.elapsed())?;
 
         Ok(())
     }
@@ -239,6 +237,7 @@ impl HttpServer {
         Ok(())
     }
 
+    #[cfg(debug_assertions)]
     pub fn reload_websockets(&mut self) {
         self.active_streams.retain(|mut stream| {
             let alive = match stream.peek(&mut [0]) {

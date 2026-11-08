@@ -12,6 +12,7 @@ use crate::runtime::server::server::HttpServer;
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum ScheduledTaskType {
     SyncDatabase,
+    #[cfg(debug_assertions)]
     UpdateContent,
 }
 #[derive(Debug)]
@@ -54,6 +55,9 @@ impl Default for Scheduler {
     }
 }
 
+const EXPECTED_TASK_DURATION_BOUND: Duration = Duration::from_secs(1);
+const MAX_POSTPONE: Duration = Duration::from_secs(60);
+
 impl Scheduler {
     pub fn new() -> Self {
         Self {
@@ -93,7 +97,7 @@ impl Scheduler {
             && task.deadline <= Instant::now()
         {
             let mut task = self.queue.pop().unwrap();
-            if task.expected_duration >= budget {
+            if task.expected_duration >= budget && task.deadline + MAX_POSTPONE >= Instant::now() {
                 out_of_budget.push(task);
                 // println!("skipped task because expected duration is not within budget");
                 continue;
@@ -104,6 +108,7 @@ impl Scheduler {
                 ScheduledTaskType::SyncDatabase => {
                     router.db.sync()?;
                 }
+                #[cfg(debug_assertions)]
                 ScheduledTaskType::UpdateContent => {
                     if Content::check_update(router)? {
                         template_cache.clear();
@@ -114,11 +119,10 @@ impl Scheduler {
 
             if task.repeating {
                 let duration = task_duration_start.elapsed();
-
                 task.expected_duration = compute_running_average_delay_bounded(
                     task.expected_duration,
                     duration,
-                    Duration::from_secs(1),
+                    EXPECTED_TASK_DURATION_BOUND,
                 );
                 task.deadline = Instant::now() + task.delay;
                 self.queue.push(task);

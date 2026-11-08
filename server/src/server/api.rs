@@ -62,7 +62,7 @@ impl Api {
         };
 
         handlers.extend(Self::default_handlers());
-        println!("Registered handlers {:#?}", handlers.keys());
+        // println!("Registered handlers {:#?}", handlers.keys());
         Self {
             handlers,
             api_lib_handle,
@@ -73,6 +73,7 @@ impl Api {
     pub fn default_handlers() -> HashMap<String, ApiHandlerFn> {
         hash_map! {
             "/api/health".to_owned() => Api::healh_check as ApiHandlerFn,
+            "/api/hello_world".to_owned() => Api::healh_world as ApiHandlerFn,
         }
     }
 
@@ -82,6 +83,14 @@ impl Api {
         db: &Db,
     ) -> Result<AssetData, HttpServerError> {
         Ok(AssetData::Empty)
+    }
+
+    pub fn healh_world(
+        header: &HttpRequestHeader,
+        body: AssetData,
+        db: &Db,
+    ) -> Result<AssetData, HttpServerError> {
+        Ok(AssetData::Text("Hello World".into()))
     }
 
     pub fn handle_api(
