@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use std::{fs, vec};
 
-use crate::runtime::db::db::Connection;
+use crate::runtime::db::connection::Connection;
 use crate::runtime::misc::byte_stuff::{self};
 
 const BLOB_MAGIC: &[u8; 11] = b"SQLITEBLOB\0";
