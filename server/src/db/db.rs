@@ -27,7 +27,6 @@ use crate::runtime::misc::byte_stuff::{self};
 pub const METRICS_CACHE_SIZE: usize = 5000;
 pub const DB_SYNC_INTERVAL: u64 = 120;
 
-
 #[derive(Debug, Clone)]
 pub struct CachedPageHit {
     pub loadtime: i64,
@@ -46,7 +45,6 @@ pub struct PageMetric {
     pub avg_loadtime: Duration,
     pub count: i64,
 }
-
 
 #[derive(Debug)]
 pub struct Db {

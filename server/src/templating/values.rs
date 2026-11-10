@@ -319,7 +319,6 @@ impl ToTemplateValue for TomlishValue {
                     })
                     .collect(),
             ),
-
             TomlishValue::Path(path, _)
             | TomlishValue::ContentPath(path, _)
             | TomlishValue::Route(path) => TemplateValue::Text(path),

@@ -1,19 +1,22 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::runtime::assets::content::Content;
+use crate::runtime::misc::date::Date;
 use crate::runtime::server;
 use crate::runtime::server::error::ServerError;
 use crate::runtime::server::router::Router;
 use crate::runtime::server::server::HttpServer;
+use crate::runtime::templating::values::TemplateValue;
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum ScheduledTaskType {
     SyncDatabase,
     #[cfg(debug_assertions)]
     UpdateContent,
+    UpdateNow,
 }
 #[derive(Debug)]
 
@@ -85,6 +88,29 @@ impl Scheduler {
         });
     }
 
+    pub fn schedule_daily(&mut self, typ: ScheduledTaskType, hour: u32, minute: u32) {
+        const SECONDS_IN_A_DAY: u64 = 86400;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+        let seconds_since_midnight = now.as_secs() % SECONDS_IN_A_DAY;
+        let target = (hour * 3600 + minute * 60) as u64;
+
+        let delay = if target > seconds_since_midnight {
+            target - seconds_since_midnight
+        } else {
+            SECONDS_IN_A_DAY - seconds_since_midnight + target
+        };
+
+        self.queue.push(ScheduledTask {
+            delay: Duration::from_secs(delay),
+            deadline: Instant::now() + Duration::from_secs(delay),
+            typ,
+            repeating: true,
+            expected_duration: Duration::ZERO,
+        });
+    }
+
     pub fn execute_due_tasks_with_budget(
         &mut self,
         server: &mut HttpServer,
@@ -113,6 +139,12 @@ impl Scheduler {
                     if Content::check_update(router)? {
                         template_cache.clear();
                         server.reload_websockets();
+                    }
+                }
+                ScheduledTaskType::UpdateNow => {
+                    if let Some(TemplateValue::Date(now_var)) = router.context.lookup_mut("now") {
+                        *now_var = Date::days().expect("todo better error handling");
+                        template_cache.clear();
                     }
                 }
             }

@@ -206,7 +206,6 @@ impl<'a> TemplateLexer<'a> {
         if text_start < input.len() {
             tokens.push(Text(Span::from_double(text_start, input.len())));
         }
-
         TemplateParser {
             file_path: lexer.file_path,
             input: lexer.input,
@@ -281,11 +280,10 @@ impl<'a> TemplateLexer<'a> {
                             tokens.push(Literal(Span::from_double(start, input.len())));
                             break;
                         };
-                        cursor += path_len;
                         start_ident = cursor;
                         Some((
                             Literal(Span::from_double(start, start + path_len)),
-                            path_len,
+                            path_len + 2,
                         ))
                     }
 
@@ -332,12 +330,12 @@ impl<'a> TemplateLexer<'a> {
         let valid_before = input[..start]
             .chars()
             .next_back()
-            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}' | ','));
+            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}' | ',' | '['));
 
         let valid_after = input[end..]
             .chars()
             .next()
-            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}' | ','));
+            .is_none_or(|c| matches!(c, ' ' | '\n' | '{' | '}' | ',' | ']'));
 
         valid_before && valid_after
     }

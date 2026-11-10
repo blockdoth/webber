@@ -2,8 +2,9 @@
 
 
 {{block body}}
-    {{for k,v in posts}}    
-        {{k}}
 
-    {{endFor}}
+{{date now "year"}}
+
+{{cool_blogs[date now "days"]}}
+
 {{endBlock}}

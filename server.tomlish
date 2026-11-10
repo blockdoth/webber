@@ -11,7 +11,7 @@
 // Content Path Folder  -> @path/ (folder)
 // Route                -> /path
 // Object               -> { key = value, key = value }
-// 
+//
 
 
 [server]
@@ -35,10 +35,6 @@ posts               = @gen/posts/
 cool_blogs          = @gen/cool_blogs
 quotes              = @gen/quotes_collection
 about               = @gen/about.md
-random_quote_index  = 0
-copyright_start     = 2026
-copyright_end       = 2026
-domain              = "blockdoth.dev"
 gallery             = @assets/gallery/
 
 [static_routes]
@@ -48,6 +44,7 @@ gallery             = @assets/gallery/
 /gallery    = @templates/pages/gallery.html
 /stats      = @templates/pages/stats.html
 /about      = @templates/pages/about.html
+/test       = @templates/pages/test.html
 
 // posts is the context var and each post will be bound to post
 [dynamic_routes]

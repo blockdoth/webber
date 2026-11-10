@@ -19,10 +19,17 @@ impl Date {
             second: 0,
         }
     }
-    pub fn days() -> i64 {
-        let date = Self::from_systemtime(SystemTime::now()).expect("really fucked");
+    pub fn days() -> Result<Date, SystemTimeError> {
+        let unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
-        date.day
+        let day = unix_seconds.div_euclid(86_400);
+
+        Ok(Date {
+            day,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        })
     }
 
     pub fn format(&self, format: &DateFormat) -> String {
@@ -83,6 +90,7 @@ impl Date {
             MonthShort => month_short.to_string(),
             MonthShortDay => format!("{} {}", month_short, day),
             Day => format!("{day:02}"),
+            Days => format!("{:02}", self.day),
             Weekday => weekday.to_string(),
             WeekdayShort => weekday_short.to_string(),
             MonthNameYearDay => format!("{month_name} {day:02}, {year:04}"),
@@ -166,6 +174,31 @@ impl Date {
 
         era * 146_097 + doe - 719_468
     }
+
+    pub fn get_numeric(&self, format: &DateFormat) -> Option<i64> {
+        let (year, month, day) = Self::civil_from_days(self.day);
+
+        match format {
+            DateFormat::Year => Some(year),
+            DateFormat::Month => Some(month as i64),
+            DateFormat::Day => Some(day as i64),
+            DateFormat::Days => Some(self.day),
+
+            DateFormat::Rfc1123
+            | DateFormat::Iso8601
+            | DateFormat::IsoDate
+            | DateFormat::DateTime
+            | DateFormat::Date
+            | DateFormat::Time
+            | DateFormat::MonthName
+            | DateFormat::MonthShort
+            | DateFormat::MonthShortDay
+            | DateFormat::Weekday
+            | DateFormat::WeekdayShort
+            | DateFormat::MonthNameYearDay
+            | DateFormat::MonthNameShortYearDay => None,
+        }
+    }
 }
 
 impl Display for Date {
@@ -174,7 +207,7 @@ impl Display for Date {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DateFormat {
     Rfc1123,
     Iso8601,
@@ -188,6 +221,7 @@ pub enum DateFormat {
     MonthShort,
     MonthShortDay,
     Day,
+    Days,
     Weekday,
     WeekdayShort,
     MonthNameYearDay,
@@ -234,6 +268,7 @@ impl DateFormat {
             "month-short-day" => Some(MonthShortDay),
 
             "day" => Some(Day),
+            "days" => Some(Days),
 
             "weekday" => Some(Weekday),
             "weekday-short" => Some(WeekdayShort),
@@ -243,5 +278,31 @@ impl DateFormat {
 
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for DateFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use DateFormat::*;
+
+        f.write_str(match self {
+            Rfc1123 => "rfc1123",
+            Iso8601 => "iso8601",
+            IsoDate => "iso-date",
+            DateTime => "datetime",
+            Date => "date",
+            Time => "time",
+            Year => "year",
+            Month => "month",
+            MonthName => "month-name",
+            MonthShort => "month-short",
+            MonthShortDay => "month-short-day",
+            Day => "day",
+            Days => "days",
+            Weekday => "weekday",
+            WeekdayShort => "weekday-short",
+            MonthNameYearDay => "month-name-day-year",
+            MonthNameShortYearDay => "month-name-short-day-year",
+        })
     }
 }

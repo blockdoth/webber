@@ -101,11 +101,11 @@
 
     <a href="/quotes">
         <h3>Quote of the day:</h3>
-        "{{quotes[random_quote_index].quote}}"
+        "{{quotes[date now "days"].quote}}"
         
         <div class="quote_author">
             
-          ~{{quotes[random_quote_index].author}}{{if quotes[random_quote_index].source}}, {{quotes[random_quote_index].source}}{{endIf}} 
+          ~{{quotes[date now "days"].author}}{{if quotes[date now "days"].source}}, {{quotes[date now "days"].source}}{{endIf}} 
         </div>
     </a>
 

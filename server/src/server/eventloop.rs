@@ -34,6 +34,7 @@ impl HttpServer {
         scheduler.schedule_repeating(ScheduledTaskType::SyncDatabase, Duration::from_secs(1));
         #[cfg(debug_assertions)]
         scheduler.schedule_repeating(ScheduledTaskType::UpdateContent, Duration::from_millis(50));
+        scheduler.schedule_daily(ScheduledTaskType::UpdateNow, 0, 0);
 
         let mut last_request = Instant::now();
         let mut average_time_between_requests = Duration::from_secs(1);
@@ -68,7 +69,7 @@ impl HttpServer {
                 &mut router,
                 &mut template_cache,
                 average_time_between_requests,
-            );
+            )?;
 
             // print!("{:?}\r", bounded_average_time_between_requests);
             std::hint::spin_loop();

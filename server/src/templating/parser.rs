@@ -1,4 +1,5 @@
 use crate::runtime::markdown::Span;
+use crate::runtime::misc::date::{Date, DateFormat};
 use crate::runtime::templating::error::{TemplateError, TemplateErrorMsg};
 use crate::runtime::templating::lexer::{TemplateInfo, TemplatePositionData};
 use crate::runtime::templating::lexer::{TemplateLexer, TemplateToken, TemplateTokenTyp};
@@ -48,8 +49,8 @@ impl TemplateParser<'_> {
             match tok {
                 TemplateToken::Text(_) => print!("{tok_str}, "),
                 TemplateToken::Number(_) => print!("{tok_str}, "),
-                TemplateToken::Identifier(_) => print!("'{tok_str}', "),
-                TemplateToken::Literal(_) => print!("~{tok_str}~, "),
+                TemplateToken::Identifier(_) => print!("{tok_str}, "),
+                TemplateToken::Literal(_) => print!("\"{tok_str}\", "),
                 _ => print!("{:?}, ", tok.typ()),
             }
         }
@@ -102,7 +103,7 @@ impl TemplateParser<'_> {
         let mut parsed_nodes = vec![];
 
         while self.cursor < self.tokens.len() {
-            let next_token = self.next_token()?;
+            let next_token = self.peek()?;
 
             if stop.contains(&next_token.typ()) {
                 break;
@@ -148,7 +149,7 @@ impl TemplateParser<'_> {
         Ok(parsed_nodes)
     }
 
-    fn next_token(&self) -> Result<&TemplateToken, TemplateError> {
+    fn peek(&self) -> Result<&TemplateToken, TemplateError> {
         if self.cursor >= self.tokens.len() {
             Err(self.error(
                 TemplateErrorMsg::UnexpectedEOF,
@@ -268,7 +269,7 @@ impl TemplateParser<'_> {
 
         let then_branch = self.parse_until(&[Else, EndIf])?;
 
-        let next_tok = self.next_token()?;
+        let next_tok = self.peek()?;
         let next_tok_span = next_tok.span();
         match next_tok.typ() {
             Else => {
@@ -347,34 +348,53 @@ impl TemplateParser<'_> {
             },
         ))
     }
-
     fn parse_index(&mut self) -> Result<(usize, VarIndex), TemplateError> {
         self.consume(TemplateTokenTyp::BracketOpen)?;
 
-        let index = if let Some(number_span) = self.try_consume(TemplateTokenTyp::Number) {
-            let number_str = number_span.to_str(self.input);
+        let next = self.peek()?;
+        let index = match next.typ() {
+            TemplateTokenTyp::Number => {
+                let span = self.consume(TemplateTokenTyp::Number)?;
+                let number_str = span.to_str(self.input);
 
-            let number = number_str.parse::<usize>().map_err(|_| {
-                self.error(
-                    TemplateErrorMsg::UnableToParseNumber(number_str.to_owned()),
-                    self.span_to_position(&number_span),
-                )
-            })?;
+                let idx = number_str.parse::<usize>().map_err(|_| {
+                    self.error(
+                        TemplateErrorMsg::UnableToParseNumber(number_str.to_owned()),
+                        self.span_to_position(&span),
+                    )
+                })?;
 
-            VarIndex::Index {
-                idx: number,
-                span: number_span,
+                VarIndex::Index { idx, span }
             }
-        } else {
-            let var_node = self.parse_var()?;
 
-            let TemplateNodeData::Variable(var) = var_node.data else {
-                unreachable!();
-            };
+            TemplateTokenTyp::Date => {
+                let date_node = self.parse_date()?;
+                let TemplateNodeData::Date { date_var, format } = date_node.data else {
+                    unreachable!();
+                };
 
-            VarIndex::Var {
-                var,
-                span: var_node.pos.span.expect("invariant"),
+                VarIndex::Date {
+                    date_var,
+                    format,
+                    span: date_node.pos.span.expect("invariant"),
+                }
+            }
+
+            TemplateTokenTyp::Identifier => {
+                let var_node = self.parse_var()?;
+
+                let TemplateNodeData::Variable(var) = var_node.data else {
+                    unreachable!();
+                };
+
+                VarIndex::Var {
+                    var,
+                    span: var_node.pos.span.expect("invariant"),
+                }
+            }
+
+            _ => {
+                todo!();
             }
         };
 
@@ -405,12 +425,16 @@ impl TemplateParser<'_> {
 
         self.consume(Whitespace)?;
         let format_span = self.consume(Literal)?;
+        let format_str = format_span.to_str(self.input);
+        let Some(format) = DateFormat::parse(format_str) else {
+            return Err(self.error(
+                TemplateErrorMsg::UnknownDateFormat(format_str.to_string()),
+                self.range_to_position(format_span.end, format_span.end),
+            ));
+        };
 
         Ok(TemplateNode {
-            data: TemplateNodeData::Date {
-                date_var,
-                format: format_span.to_str(self.input).to_owned(),
-            },
+            data: TemplateNodeData::Date { date_var, format },
             pos: self.range_to_position(start_tok.start - 1, format_span.end),
         })
     }
@@ -533,17 +557,32 @@ pub struct TemplateNode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VarIndex {
-    Field { field: String, span: Span },
-    Index { idx: usize, span: Span },
-    Var { var: Var, span: Span },
+    Field {
+        field: String,
+        span: Span,
+    },
+    Index {
+        idx: usize,
+        span: Span,
+    },
+    Var {
+        var: Var,
+        span: Span,
+    },
+    Date {
+        date_var: Var,
+        format: DateFormat,
+        span: Span,
+    },
 }
 
 impl Display for VarIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VarIndex::Field { field, .. } => write!(f, "{field}"),
+            VarIndex::Field { field, .. } => write!(f, ".{field}"),
             VarIndex::Index { idx, .. } => write!(f, "[{idx}]"),
             VarIndex::Var { var, .. } => write!(f, "[{var}]"),
+            VarIndex::Date { .. } => todo!(),
         }
     }
 }
@@ -554,6 +593,7 @@ impl VarIndex {
             VarIndex::Field { field, .. } => field.len(),
             VarIndex::Index { idx, .. } => idx.to_string().len() + 2, // [idx]
             VarIndex::Var { var, .. } => var.to_string().len() + 2,   // [idx]
+            VarIndex::Date { .. } => todo!(),
         }
     }
 }
@@ -568,11 +608,7 @@ impl Display for Var {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.base)?;
         for i in &self.indices {
-            match i {
-                VarIndex::Field { field, .. } => write!(f, ".{field}")?,
-                VarIndex::Index { idx, .. } => write!(f, "[{idx}]")?,
-                VarIndex::Var { var, .. } => write!(f, "[{var}]")?,
-            }
+            write!(f, "{i}");
         }
         Ok(())
     }
@@ -584,7 +620,7 @@ pub enum TemplateNodeData {
     Variable(Var),
     Date {
         date_var: Var,
-        format: String,
+        format: DateFormat,
     },
     If {
         condition: ConditionExpr,

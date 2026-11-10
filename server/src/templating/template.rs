@@ -221,7 +221,7 @@ impl Template {
                 TemplateNodeData::Date { date_var, format } => {
                     match Self::resolve_var(date_var, context, &node.pos)? {
                         Date(date) => {
-                            if let Some(dateformat) = DateFormat::parse(format) {
+                            if let Some(dateformat) = DateFormat::parse(&format.to_string()) {
                                 let date = date.format(&dateformat);
                                 out.push_str(&date)
                             } else {
@@ -265,13 +265,8 @@ impl Template {
             ));
         };
 
-        let node_span = pos.span.as_ref().expect("variable must have span");
-        let mut _access_start = node_span.start + var.base.len();
-
-        for access in &var.indices {
-            _access_start += 1;
-
-            current = match access {
+        for index in &var.indices {
+            current = match index {
                 VarIndex::Field { field, span } => {
                     let TemplateValue::Object(map) = current else {
                         return Err(TemplateError::new(
@@ -314,15 +309,7 @@ impl Template {
                         ));
                     };
 
-                    list.get(*idx).ok_or_else(|| {
-                        TemplateError::new(
-                            TemplateErrorMsg::IndexNotInRange(*idx as i64, list.len()),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        )
-                    })?
+                    &list[idx % list.len()]
                 }
 
                 VarIndex::Var { var, span } => {
@@ -341,7 +328,7 @@ impl Template {
 
                     let index_value = Self::resolve_var(var, context, pos)?;
 
-                    let TemplateValue::Number(index) = index_value else {
+                    let TemplateValue::Number(idx) = index_value else {
                         return Err(TemplateError::new(
                             TemplateErrorMsg::TemplateValueNotOfExptectedType(
                                 index_value.kind(),
@@ -354,21 +341,53 @@ impl Template {
                         ));
                     };
 
-                    if *index < 0 || *index as usize >= list.len() {
+                    &list[(idx % list.len() as i64) as usize]
+                }
+                VarIndex::Date {
+                    date_var,
+                    format,
+                    span,
+                } => {
+                    let TemplateValue::List(list) = current else {
                         return Err(TemplateError::new(
-                            TemplateErrorMsg::IndexNotInRange(*index, list.len()),
+                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                current.kind(),
+                                TemplateValueKind::List,
+                            ),
                             TemplatePositionData {
                                 file: pos.file.clone(),
                                 span: Some(span.clone()),
                             },
                         ));
-                    }
+                    };
 
-                    &list[*index as usize]
+                    let index_value = Self::resolve_var(date_var, context, pos)?;
+
+                    let TemplateValue::Date(date) = index_value else {
+                        return Err(TemplateError::new(
+                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
+                                index_value.kind(),
+                                TemplateValueKind::Date,
+                            ),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
+                            },
+                        ));
+                    };
+
+                    let Some(idx) = date.get_numeric(format) else {
+                        return Err(TemplateError::new(
+                            TemplateErrorMsg::DateFormatNotNumeric(format.clone()),
+                            TemplatePositionData {
+                                file: pos.file.clone(),
+                                span: Some(span.clone()),
+                            },
+                        ));
+                    };
+                    &list[(idx % list.len() as i64) as usize]
                 }
             };
-
-            _access_start += access.len();
         }
 
         Ok(current)

@@ -6,6 +6,7 @@ use std::fmt;
 use std::time::SystemTime;
 
 use crate::runtime::markdown::Span;
+use crate::runtime::misc::date::DateFormat;
 use crate::runtime::templating::context::Context;
 use crate::runtime::templating::lexer::{
     Position, TemplateInfo, TemplatePositionData, TemplateTokenTyp,
@@ -224,6 +225,7 @@ pub enum TemplateErrorMsg {
     IndexNotInRange(i64, usize),
     UnableToParseNumber(String),
     ExtendsNotFirstLine,
+    DateFormatNotNumeric(DateFormat),
     WrongIterBindForList,
     UnexpectedEOF,
 }
@@ -240,6 +242,7 @@ impl TemplateErrorMsg {
             | TemplateValueNotOfExptectedType(_, _)
             | CantCompareTemplateValues(_, _)
             | IndexNotInRange(_, _)
+            | DateFormatNotNumeric(_)
             | CantCompareWithLiteral(_) => Render,
 
             UnexpectedToken(_, _)
@@ -264,6 +267,12 @@ impl Display for TemplateErrorMsg {
         match self {
             VariableNotFound(var) => {
                 write!(f, "{error_kind}: Variable '{var}' was not found in context")
+            }
+            DateFormatNotNumeric(date) => {
+                write!(
+                    f,
+                    "{error_kind}: Dateformat '{date:?}' is not numeric and can therefore not be used for indexing"
+                )
             }
             WrongIterBindForList => {
                 write!(f, "Lists dont support non simple iter binds")

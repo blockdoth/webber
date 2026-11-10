@@ -97,6 +97,7 @@ fn gen_config(out: &mut String, config: &Config) {
 
                 format!("TomlishValue::Object([{entries}].into_iter().collect())")
             }
+
             TomlishValue::Path(path, flag) => {
                 format!("TomlishValue::Path({path:?}.into(), {flag})")
             }

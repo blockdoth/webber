@@ -98,6 +98,7 @@ fn construct_context(content: &Content, config: &Config) -> Context {
             "last_build_date",
             Date::from_systemtime(last_build_date()).expect("invariant"),
         );
+        context.insert_global("now", Date::days().expect("invariant"));
         context.insert_global("git_hash_short", GIT_HASH_SHORT.to_string());
         context.insert_global("git_hash_long", GIT_HASH_LONG.to_string());
     }
