@@ -1,13 +1,16 @@
 use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::hash::RandomState;
 use std::io::{ErrorKind, Read};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-
 use std::time::Instant;
+use std::vec;
 
 use crate::runtime::assets::asset::AssetData;
 use crate::runtime::assets::content::Content;
+use crate::runtime::db::connection;
 use crate::runtime::db::db::DB_SYNC_INTERVAL;
 use crate::runtime::misc::sighandlers::SHUTDOWN;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError};
@@ -19,12 +22,18 @@ use crate::runtime::server::{error::ServerError, router::Router, server::HttpSer
 
 const READ_BUFFER_SIZE: usize = 8192;
 
+pub struct Connection {
+    stream: TcpStream,
+    last_polled: Instant,
+}
+
 impl HttpServer {
     pub fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), ServerError> {
         listener
             .set_nonblocking(true)
             .expect("Unable to set socket to nonblocking mode");
         Self::set_backlog(&listener, 4096)?;
+        Self::increase_max_fds();
 
         let mut read_buffer = [0u8; READ_BUFFER_SIZE];
         let mut template_cache = HashMap::new();
@@ -39,24 +48,40 @@ impl HttpServer {
         let mut last_request = Instant::now();
         let mut average_time_between_requests = Duration::from_secs(1);
 
+        let mut connections: Vec<Connection> = vec![];
+
+        let polling = false;
+
         while !SHUTDOWN.load(Ordering::Relaxed) {
             let now = Instant::now();
-            match listener.accept() {
-                Ok((stream, peer_addr)) => {
-                    let now = Instant::now();
-                    last_request = now;
 
-                    self.handle_connection(
-                        stream,
-                        peer_addr,
-                        &mut router,
-                        &mut read_buffer,
-                        &mut template_cache,
-                    )?;
+            let mut streams = vec![];
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, peer_addr)) => {
+                        let now = Instant::now();
+                        last_request = now;
+                        stream
+                            .set_nonblocking(true)
+                            .expect("Failed to change blocking mode");
+                        streams.push(stream);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {break}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
+                
             }
+
+            for mut stream in streams {
+                self.handle_request(
+                    &mut stream,
+                    &mut router,
+                    &mut read_buffer,
+                    &mut template_cache,
+                )?;             
+            }
+
+
             let duration_since_last_request = now.duration_since(last_request);
 
             average_time_between_requests = compute_running_average_delay_bounded(
@@ -79,61 +104,80 @@ impl HttpServer {
         Ok(())
     }
 
-    fn handle_connection(
+    fn random_samples(len: usize, n: usize) -> Vec<usize> {
+        let n = n.min(len);
+        let rng = RandomState::new();
+
+        let mut indices: Vec<usize> = (0..len).collect();
+
+        for i in 0..n {
+            let j = i + (rng.hash_one(i) as usize % (len - i));
+            indices.swap(i, j);
+        }
+
+        indices.truncate(n);
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+
+        indices
+    }
+
+    fn poll_connections(
         &mut self,
-        mut stream: TcpStream,
-        peer_addr: std::net::SocketAddr,
+        connections: &mut Vec<Connection>,
         router: &mut Router,
         read_buffer: &mut [u8],
         template_cache: &mut HashMap<String, String>,
     ) -> Result<(), ServerError> {
-        stream
-            .set_nonblocking(true)
-            .expect("Failed to change blocking mode");
+        print!("open connections {}\r", connections.len());
+        let mut i = 0;
 
-        let request_slice = match Self::read_request(&mut stream, read_buffer, peer_addr) {
+        let samples: Vec<usize> = Self::random_samples(connections.len(), connections.len() / 4);
+
+        for sample in samples {
+            let connection = &mut connections[i];
+
+            match connection.stream.peek(&mut [0]) {
+                Ok(0) => {
+                    connections.swap_remove(i);
+                    continue;
+                }
+
+                Ok(_) => {
+                    self.handle_request(
+                        &mut connection.stream,
+                        router,
+                        read_buffer,
+                        template_cache,
+                    )?;
+
+                    connection.last_polled = Instant::now();
+                }
+
+                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
+                    connection.last_polled = Instant::now();
+                }
+                Err(_) => {
+                    connections.swap_remove(i);
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+    fn handle_request(
+        &mut self,
+        stream: &mut TcpStream,
+        router: &mut Router,
+        read_buffer: &mut [u8],
+        template_cache: &mut HashMap<String, String>,
+    ) -> Result<(), ServerError> {
+        let request_slice = match Self::read_request(stream, read_buffer) {
             Ok(n) => n,
             Err(()) => return Ok(()),
         };
 
-        self.handle_request(
-            &mut stream,
-            peer_addr,
-            request_slice,
-            router,
-            template_cache,
-        )
-    }
-
-    fn read_request<'a>(
-        stream: &mut TcpStream,
-        buffer: &'a mut [u8],
-        peer_addr: std::net::SocketAddr,
-    ) -> Result<&'a [u8], ()> {
-        loop {
-            match stream.read(buffer) {
-                Ok(0) => return Err(()),
-                Ok(n) => return Ok(&buffer[..n]),
-                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::hint::spin_loop();
-                }
-                Err(error) => {
-                    println!("[{peer_addr}] Timed out with {error:?}");
-                    return Err(());
-                }
-            }
-        }
-    }
-
-    fn handle_request(
-        &mut self,
-        stream: &mut TcpStream,
-        peer_addr: std::net::SocketAddr,
-        request: &[u8],
-        router: &mut Router,
-        template_cache: &mut HashMap<String, String>,
-    ) -> Result<(), ServerError> {
-        let (header, body) = match Self::parse_request(request) {
+        let (header, body) = match Self::parse_request(request_slice) {
             Ok(request) => request,
             Err(err) => {
                 eprintln!("Failed to parse request: {err}");
@@ -166,7 +210,7 @@ impl HttpServer {
                 }
 
                 err => {
-                    eprintln!("[{peer_addr}] request failed: {err}");
+                    eprintln!("[{}] request failed: {err}", stream.peer_addr().unwrap());
                     return Ok(());
                 }
             }
@@ -177,6 +221,22 @@ impl HttpServer {
             .save_page_hit(header.path, start_timer.elapsed())?;
 
         Ok(())
+    }
+
+    fn read_request<'a>(stream: &mut TcpStream, buffer: &'a mut [u8]) -> Result<&'a [u8], ()> {
+        loop {
+            match stream.read(buffer) {
+                Ok(0) => return Err(()),
+                Ok(n) => return Ok(&buffer[..n]),
+                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::hint::spin_loop();
+                }
+                Err(error) => {
+                    println!("[{}] Timed out with {error:?}", stream.peer_addr().unwrap());
+                    return Err(());
+                }
+            }
+        }
     }
 
     fn route_request(

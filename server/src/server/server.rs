@@ -15,6 +15,7 @@ use crate::runtime::db::db::DB_SYNC_INTERVAL;
 use crate::runtime::misc::byte_stuff::{base64, sha1};
 use crate::runtime::misc::date::Date;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError, ServerError};
+use crate::runtime::server::eventloop::Connection;
 use crate::runtime::server::router::Router;
 use crate::runtime::templating::error::TemplateError;
 
@@ -48,6 +49,40 @@ impl HttpServer {
         if unsafe { listen(listener.as_raw_fd(), backlog) } == -1 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    pub fn increase_max_fds() -> std::io::Result<()> {
+        #[repr(C)]
+        struct RLimit {
+            current: u64,
+            maximum: u64,
+        }
+
+        unsafe extern "C" {
+            fn getrlimit(resource: i32, limit: *mut RLimit) -> i32;
+            fn setrlimit(resource: i32, limit: *const RLimit) -> i32;
+        }
+
+        const RLIMIT_NOFILE: i32 = 7;
+
+        unsafe {
+            let mut limit = RLimit {
+                current: 0,
+                maximum: 0,
+            };
+
+            if getrlimit(RLIMIT_NOFILE, &mut limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            limit.current = limit.maximum;
+
+            if setrlimit(RLIMIT_NOFILE, &limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
         Ok(())
     }
     pub fn upgrade_websocket(
