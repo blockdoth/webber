@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{error::Error, fmt::Display};
+use std::{error::Error, fmt::Display, io};
 
 use crate::runtime::{
     config::config::Config, jpeg::errors::ImageParseError, templating::error::TemplateError,
@@ -134,4 +134,14 @@ impl fmt::Display for HttpResponseCode<'_> {
             HttpResponseCode::InternalServer => write!(f, "500 Internal Server Error"),
         }
     }
+}
+
+
+
+#[derive(Debug)]
+pub enum IoError {
+    WouldBlock,
+    ConnectionClosed,
+    Timeout,
+    Io(io::Error)
 }
