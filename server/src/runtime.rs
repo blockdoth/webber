@@ -7,22 +7,20 @@ pub mod misc;
 pub mod server;
 pub mod templating;
 
-use std::{clone, error::Error, net::TcpListener, path::PathBuf, time::SystemTime};
+#[cfg(generated)]
+use crate::runtime::misc::date::Date;
+use std::net::TcpListener;
 
-use crate::{
-    CONFIG_PATH,
-    runtime::{
-        assets::content::Content,
-        config::{config::Config, parser::TomlishValue},
-        db::db::Db,
-        misc::{
-            cli::{self},
-            date::Date,
-            sighandlers::{self},
-        },
-        server::{error::ServerError, router::Router, server::HttpServer},
-        templating::context::Context,
+use crate::runtime::{
+    assets::content::Content,
+    config::{config::Config, parser::TomlishValue},
+    db::db::Db,
+    misc::{
+        cli::{self},
+        sighandlers::{self},
     },
+    server::{error::ServerError, router::Router, server::HttpServer},
+    templating::context::Context,
 };
 
 #[cfg(generated)]
@@ -62,7 +60,7 @@ pub fn start_server(config: Config, db: &mut Db) -> Result<(), ServerError> {
     // db.test_counter()?;
     // db.sync()?;
 
-    let mut content = Content::load_embedded();
+    let content = Content::load_embedded();
     // println!("{:?}", content.assets.collect_kv_mut().iter().map(|(a,_)| a.to_string_lossy()).collect::<String>());
 
     let context = construct_context(&content, &config);

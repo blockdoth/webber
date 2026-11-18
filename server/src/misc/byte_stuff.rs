@@ -68,7 +68,7 @@ pub fn sha1(input: &str) -> [u8; 20] {
 
     let mut words = [0u32; 80];
 
-    for chunk in bytes.chunks_exact(64) {
+    for chunk in bytes.as_chunks::<64>().0 {
         // Chunks of 512 bits
         for i in 0..16 {
             words[i] = (u32::from(chunk[4 * i]) << 24)

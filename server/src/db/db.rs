@@ -1,31 +1,19 @@
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::ffi::{CStr, CString, c_int};
 use std::fmt::Debug;
 use std::iter::zip;
 use std::path::PathBuf;
-use std::ptr::{null, null_mut};
-use std::slice;
-use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 use std::{fs, vec};
 
 #[cfg(generated)]
 use crate::comptime::{PREV_BIN_PATH, PREV_BIN_TYPE};
-use crate::runtime::db::bindings::{
-    SQLITE_DESERIALIZE_FLAG_FREEONCLOSE, SQLITE_DESERIALIZE_FLAG_RESIZEABLE, SQLITE_DONE,
-    SQLITE_OK, SQLITE_ROW, sqlite3_bind_blob, sqlite3_bind_int64, sqlite3_bind_text, sqlite3_close,
-    sqlite3_column_blob, sqlite3_column_bytes, sqlite3_column_int64, sqlite3_column_text,
-    sqlite3_deserialize, sqlite3_errmsg, sqlite3_finalize, sqlite3_handle, sqlite3_malloc64,
-    sqlite3_open, sqlite3_prepare_v2, sqlite3_reset, sqlite3_serialize, sqlite3_step, sqlite3_stmt,
-};
 use crate::runtime::db::blob::Blob;
 use crate::runtime::db::connection::{Bind, ColumnTyp, Connection};
 use crate::runtime::misc::byte_stuff::{self};
 
 pub const METRICS_CACHE_SIZE: usize = 5000;
-pub const DB_SYNC_INTERVAL: u64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct CachedPageHit {
@@ -95,7 +83,7 @@ impl Db {
             }
         };
 
-        let mut db = Self {
+        let db = Self {
             path_string_intern_cache: Self::init_path_intern_cache(&conn)?,
             connection: conn,
             executable_path: current_executable_path,
@@ -403,7 +391,7 @@ impl Db {
             })
             .collect();
 
-        metrics.sort_unstable_by(|a, b| b.count.cmp(&a.count));
+        metrics.sort_unstable_by_key(|a| std::cmp::Reverse(a.count));
         Ok(Stats {
             pages: metrics,
             start_time,

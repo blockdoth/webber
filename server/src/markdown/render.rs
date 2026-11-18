@@ -1,7 +1,4 @@
-use crate::runtime::markdown::{
-    parser::{MarkdownNode, MarkdownParser, ParsedMarkdown},
-    syntax::SyntaxHighlightLang,
-};
+use crate::runtime::markdown::{parser::MarkdownNode, syntax::SyntaxHighlightLang};
 
 pub struct MarkdownRenderer;
 

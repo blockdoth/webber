@@ -1,23 +1,13 @@
-use std::collections::HashMap;
-use std::error::Error;
-use std::fmt::{Debug, Display};
-use std::io::{self, ErrorKind, Read, Write};
+use std::fmt::Debug;
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::IntoRawFd;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-use std::{fmt, vec};
+use std::vec;
 use std::{os::fd::AsRawFd, os::raw::c_int};
 
 use crate::runtime::assets::asset::{AssetData, AssetDataRef, AssetTyp};
-use crate::runtime::assets::content::Content;
-use crate::runtime::db::db::DB_SYNC_INTERVAL;
 use crate::runtime::misc::byte_stuff::{base64, sha1};
-use crate::runtime::misc::date::Date;
-use crate::runtime::server::error::{HttpResponseCode, HttpServerError, ServerError};
-use crate::runtime::server::eventloop::Connection;
+use crate::runtime::server::error::{HttpResponseCode, HttpServerError};
 use crate::runtime::server::router::Router;
-use crate::runtime::templating::error::TemplateError;
 
 unsafe extern "C" {
     fn listen(fd: c_int, backlog: c_int) -> c_int;

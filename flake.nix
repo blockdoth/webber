@@ -35,7 +35,6 @@
               sqlite
 
               imagemagick
-              # bench
               wrk 
               hey 
               k6

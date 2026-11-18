@@ -1,20 +1,13 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
-use std::error::Error;
-use std::hash::BuildHasher;
-use std::hash::RandomState;
 use std::io::{ErrorKind, Read};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
-use std::vec;
 
 use crate::runtime::assets::asset::AssetData;
-use crate::runtime::assets::content::Content;
-use crate::runtime::db::connection;
-use crate::runtime::db::db::DB_SYNC_INTERVAL;
 use crate::runtime::misc::sighandlers::SHUTDOWN;
 use crate::runtime::server::error::IoError;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError};
@@ -32,7 +25,7 @@ impl HttpServer {
             .set_nonblocking(true)
             .expect("Unable to set socket to nonblocking mode");
         Self::set_backlog(&listener, 4096)?;
-        Self::increase_max_fds();
+        Self::increase_max_fds()?;
 
         let mut read_buffer = [0u8; READ_BUFFER_SIZE];
         let mut template_cache = HashMap::new();
@@ -59,7 +52,7 @@ impl HttpServer {
 
             while start_loop_iter.elapsed() < max_accept_time {
                 match listener.accept() {
-                    Ok((mut stream, peer_addr)) => {
+                    Ok((stream, _peer_addr)) => {
                         let now = Instant::now();
                         last_request = now;
                         stream
@@ -234,22 +227,9 @@ impl HttpServer {
         }
     }
 
-    fn sync_database(
-        &mut self,
-        router: &mut Router,
-        timer: &mut Instant,
-    ) -> Result<(), ServerError> {
-        if timer.elapsed() > Duration::from_secs(DB_SYNC_INTERVAL) {
-            router.db.sync()?;
-            *timer = Instant::now();
-        }
-
-        Ok(())
-    }
-
     #[cfg(debug_assertions)]
     pub fn reload_websockets(&mut self) {
-        self.active_streams.retain(|mut stream| {
+        self.active_streams.retain(|stream| {
             let alive = match stream.peek(&mut [0]) {
                 Ok(0) => false,
                 Ok(_) => true,

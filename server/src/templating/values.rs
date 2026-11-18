@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use std::fmt::Debug;
-use std::fs::Metadata;
 use std::hash::BuildHasher;
+use std::hash_map;
 use std::time::{Duration, SystemTime};
 
 use crate::runtime::assets::asset::AssetData;

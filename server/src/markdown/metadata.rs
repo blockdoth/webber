@@ -1,8 +1,5 @@
 use crate::runtime::{
-    markdown::{
-        parser::{MarkdownNode, MarkdownParser, ParsedMarkdown},
-        render::MarkdownRenderer,
-    },
+    markdown::{parser::MarkdownNode, render::MarkdownRenderer},
     misc::date::Date,
 };
 
@@ -62,8 +59,6 @@ pub struct PostMetadata {
 
 impl PostMetadata {
     pub fn parse_metadata(input: &str) -> Option<(PostMetadataPartial, &str)> {
-        let mut cursor = 0;
-
         let first_line_end = input.find('\n').unwrap_or(input.len());
         let first_line = &input[..first_line_end];
 
@@ -71,7 +66,7 @@ impl PostMetadata {
             return None;
         }
 
-        cursor = if first_line_end < input.len() {
+        let mut cursor = if first_line_end < input.len() {
             first_line_end + 1
         } else {
             first_line_end

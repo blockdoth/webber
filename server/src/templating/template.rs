@@ -3,13 +3,14 @@ use std::fmt::Debug;
 use std::fmt::Write as FmtWrite;
 
 use std::fs;
+use std::hash_map;
 use std::path::Path;
 use std::time::SystemTime;
 
 use crate::runtime::misc::date::DateFormat;
 use crate::runtime::templating::context::{LocalContext, TemplateContext};
 use crate::runtime::templating::error::TemplateErrorMsg;
-use crate::runtime::templating::lexer::{TemplateInfo, TemplatePositionData};
+use crate::runtime::templating::lexer::TemplatePositionData;
 use crate::runtime::templating::parser::ForIterBind;
 use crate::runtime::templating::parser::{
     ConditionExpr, TemplateNode, TemplateNodeData, TemplateParser, Var, VarIndex,
@@ -74,7 +75,7 @@ impl Template {
 
         Self::render_helper(&parent.template, context, &self.blocks, render_buffer).map_err(
             |e| match &e.pos {
-                Some(pos) => {
+                Some(_) => {
                     // todo, something here idk
                     e.enhance_error(self)
                 }
@@ -164,7 +165,7 @@ impl Template {
                                 Self::render_helper(body, &child_context, blocks, out)?;
                             }
                         }
-                        (List(iter), ForIterBind::Object(_)) => {
+                        (List(_), ForIterBind::Object(_)) => {
                             return Err(TemplateError::new(
                                 TemplateErrorMsg::WrongIterBindForList,
                                 node.pos.clone(),
@@ -200,7 +201,7 @@ impl Template {
                             }
                         }
 
-                        (other, bind) => {
+                        (other, _) => {
                             return Err(TemplateError::new(
                                 TemplateErrorMsg::TemplateValueNotOfExptectedType(
                                     other.kind(),

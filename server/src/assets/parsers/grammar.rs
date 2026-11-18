@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash_map};
 
-use crate::runtime::templating::values::{self, TemplateValue};
+use crate::runtime::templating::values::TemplateValue;
 
 #[derive(Debug, Clone)]
 enum Grammar {
@@ -186,7 +186,7 @@ impl TemplateValue {
                 // println!("Grammar {grammar:#?}");
                 match parse_with_grammar(&grammar, content) {
                     Ok((Some(template_value), "")) => template_value,
-                    Ok((gram, remaining)) => TemplateValue::Text(base.to_string()),
+                    Ok((_gram, _remaining)) => TemplateValue::Text(base.to_string()),
                     Err(err) => {
                         println!("Err {err}");
                         TemplateValue::Text(base.to_string())
@@ -246,7 +246,7 @@ fn parse_with_grammar<'a>(
                 Some(remaining) => Ok((Some(TemplateValue::Text(literal.clone())), remaining)),
                 None => Err(format!(
                     "Expected {literal:?} at the start of {:?}",
-                    &content.get(..literal.len()).unwrap_or(content)
+                    content.get(..literal.len()).unwrap_or(content)
                 )),
             }
         }

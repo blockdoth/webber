@@ -1,8 +1,4 @@
-use crate::runtime::jpeg::{
-    errors::{ImageParseError, JpegError},
-    exif::ExifMetadata,
-    jpeg::Jpeg,
-};
+use crate::runtime::jpeg::{errors::ImageParseError, exif::ExifMetadata, jpeg::Jpeg};
 
 #[derive(Debug)]
 pub struct GalleryImage {
@@ -14,7 +10,7 @@ pub struct GalleryImage {
 
 impl GalleryImage {
     pub fn from_png_bytes(path: &str, bytes: &[u8]) -> Result<Self, ImageParseError> {
-        let (metadata, width, height) = Png::decode_metadata(bytes)?;
+        let (_metadata, width, height) = Png::decode_metadata(bytes)?;
         Ok(Self {
             path: path.to_owned(),
             width,
@@ -24,7 +20,7 @@ impl GalleryImage {
     }
 
     pub fn from_jpeg_bytes(path: &str, bytes: &[u8]) -> Result<Self, ImageParseError> {
-        let (metadata, mut width, mut height) = Jpeg::decode_metadata(bytes)?;
+        let (metadata, width, height) = Jpeg::decode_metadata(bytes)?;
         Ok(GalleryImage {
             path: path.to_owned(),
             width,

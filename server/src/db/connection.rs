@@ -1,18 +1,12 @@
-use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::ffi::{CStr, CString, c_int};
 use std::fmt::Debug;
-use std::iter::zip;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
 use std::{fs, vec};
 
-#[cfg(generated)]
-use crate::comptime::{PREV_BIN_PATH, PREV_BIN_TYPE};
 use crate::runtime::db::bindings::{
     SQLITE_DESERIALIZE_FLAG_FREEONCLOSE, SQLITE_DESERIALIZE_FLAG_RESIZEABLE, SQLITE_DONE,
     SQLITE_OK, SQLITE_ROW, sqlite3_bind_blob, sqlite3_bind_int64, sqlite3_bind_text, sqlite3_close,

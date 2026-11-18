@@ -1,14 +1,9 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::error::Error;
 use std::fmt::Debug;
 use std::fs;
-use std::fs::metadata;
-use std::io::read_to_string;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::SystemTime;
 use std::vec;
 
@@ -16,29 +11,16 @@ use crate::CONFIG_PATH;
 #[cfg(generated)]
 use crate::comptime::{load_embedded_assets, load_embedded_templates};
 use crate::runtime::assets::asset::{Asset, AssetData};
-use crate::runtime::assets::parsers::image::GalleryImage;
 use crate::runtime::assets::trie::Trie;
 use crate::runtime::config::config::Config;
-use crate::runtime::config::parser::Tomlish;
 use crate::runtime::config::parser::insert_nested;
 use crate::runtime::jpeg::errors::ImageParseError;
-use crate::runtime::jpeg::errors::JpegError;
-use crate::runtime::jpeg::exif::ExifMetadata;
-use crate::runtime::jpeg::jpeg::Jpeg;
-use crate::runtime::markdown;
-use crate::runtime::markdown::parser::MarkdownPost;
-use crate::runtime::markdown::parser::ParsedMarkdown;
-use crate::runtime::misc::byte_stuff::split_mix_64_hash;
-use crate::runtime::misc::date::Date;
-use crate::runtime::server::api::Api;
 use crate::runtime::server::error::ServerError;
-use crate::runtime::server::router::DynamicRoute;
 use crate::runtime::server::router::Router;
 use crate::runtime::templating::context::Context;
-use crate::runtime::templating::context::TemplateContext;
 use crate::runtime::templating::error::TemplateError;
 use crate::runtime::templating::template::Template;
-use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
+use crate::runtime::templating::values::ToTemplateValue;
 
 // === Content ===
 
@@ -110,7 +92,7 @@ impl Content {
 
         let paths = walk_dir(path);
 
-        let mut updated = false;
+        let _updated = false;
 
         for path in paths {
             if let Ok(metadata) = path.metadata()
@@ -257,7 +239,7 @@ impl Content {
                 .collect();
 
             if !candidates.is_empty()
-                && let Some(mut var) = context.lookup_mut(var_name)
+                && let Some(var) = context.lookup_mut(var_name)
             {
                 let assets = self.assets.get_partial(var_asset_path_str);
 

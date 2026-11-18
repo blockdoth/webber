@@ -1,10 +1,7 @@
-use std::{iter::Peekable, str::CharIndices, vec::IntoIter};
+use std::{iter::Peekable, str::CharIndices};
 
 use crate::runtime::markdown::{
-    Span,
-    metadata::{self, PostMetadata},
-    render::MarkdownRenderer,
-    syntax::SyntaxHighlightLang,
+    Span, metadata::PostMetadata, render::MarkdownRenderer, syntax::SyntaxHighlightLang,
 };
 
 pub struct MarkdownParser {}
@@ -23,7 +20,7 @@ impl MarkdownParser {
         let images = Self::get_images(&ast);
         let html = MarkdownRenderer::to_html(&ast);
 
-        if let Some(mut metadata_partial) = metadata_partial {
+        if let Some(metadata_partial) = metadata_partial {
             let metadata = metadata_partial.finalize(ast);
             ParsedMarkdown::Post(MarkdownPost {
                 html,

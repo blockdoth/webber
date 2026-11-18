@@ -1,11 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::runtime::assets::content::Content;
 use crate::runtime::misc::date::Date;
-use crate::runtime::server;
 use crate::runtime::server::error::ServerError;
 use crate::runtime::server::router::Router;
 use crate::runtime::server::server::HttpServer;

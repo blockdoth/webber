@@ -4,8 +4,9 @@ use crate::runtime::{
     db::db::Db,
     server::{error::HttpServerError, server::HttpRequestHeader},
 };
+use std::collections::HashMap;
+use std::hash_map;
 use std::process::Command;
-use std::{collections::HashMap, error::Error};
 
 use std::{
     ffi::{CString, c_char, c_int, c_void},
@@ -49,7 +50,7 @@ impl Api {
 
             let register_handlers: GetApiHandlersFn = transmute(get_handler);
 
-            let mut handlers = register_handlers();
+            let handlers = register_handlers();
             (handlers, Some(api_lib_handle))
         };
         #[cfg(not(debug_assertions))]
@@ -78,17 +79,17 @@ impl Api {
     }
 
     pub fn healh_check(
-        header: &HttpRequestHeader,
-        body: AssetData,
-        db: &Db,
+        _header: &HttpRequestHeader,
+        _body: AssetData,
+        _db: &Db,
     ) -> Result<AssetData, HttpServerError> {
         Ok(AssetData::Empty)
     }
 
     pub fn healh_world(
-        header: &HttpRequestHeader,
-        body: AssetData,
-        db: &Db,
+        _header: &HttpRequestHeader,
+        _body: AssetData,
+        _db: &Db,
     ) -> Result<AssetData, HttpServerError> {
         Ok(AssetData::Text("Hello World".into()))
     }
@@ -107,9 +108,9 @@ impl Api {
     }
 
     pub fn test_handler(
-        header: &HttpRequestHeader,
-        body: AssetData,
-        db: &Db,
+        _header: &HttpRequestHeader,
+        _body: AssetData,
+        _db: &Db,
     ) -> Result<AssetData, HttpServerError> {
         println!("ran test handler");
         Ok(AssetData::Empty)

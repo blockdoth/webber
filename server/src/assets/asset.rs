@@ -1,4 +1,3 @@
-use core::panic;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::fs;
@@ -7,7 +6,6 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use crate::runtime::assets::parsers::image::GalleryImage;
-use crate::runtime::config::parser::{Tomlish, TomlishMap, TomlishValue};
 use crate::runtime::jpeg::errors::ImageParseError;
 use crate::runtime::markdown::parser::{MarkdownParser, ParsedMarkdown};
 use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
@@ -54,7 +52,6 @@ pub enum AssetDataRef<'a> {
     Html(&'a str),
     Css(&'a str),
     Js(&'a str),
-    MdRaw(&'a str),
     Unknown(&'a [u8]),
     UnknownText(&'a str),
     Png(&'a [u8]),
@@ -78,9 +75,7 @@ impl AssetDataRef<'_> {
             AssetDataRef::Woff2(_) => "font/woff2",
             AssetDataRef::Otf(_) => "font/otf",
             AssetDataRef::Markdown(_) => "text/html; charset=utf-8",
-            AssetDataRef::Text(_) | AssetDataRef::MdRaw(_) | AssetDataRef::UnknownText(_) => {
-                "text/plain; charset=utf-8"
-            }
+            AssetDataRef::Text(_) | AssetDataRef::UnknownText(_) => "text/plain; charset=utf-8",
             AssetDataRef::Unknown(_) => todo!(),
             AssetDataRef::Empty => "",
         }
@@ -97,7 +92,6 @@ impl AssetDataRef<'_> {
             | AssetDataRef::Html(s)
             | AssetDataRef::Css(s)
             | AssetDataRef::Js(s)
-            | AssetDataRef::MdRaw(s)
             | AssetDataRef::UnknownText(s) => s.as_bytes(),
             AssetDataRef::Markdown(m) => m.as_bytes(),
             AssetDataRef::Empty => &[],
@@ -115,7 +109,6 @@ impl AssetDataRef<'_> {
             | AssetDataRef::Html(s)
             | AssetDataRef::Css(s)
             | AssetDataRef::Js(s)
-            | AssetDataRef::MdRaw(s)
             | AssetDataRef::UnknownText(s) => Some(s),
             AssetDataRef::Markdown(m) => Some(m.as_str()),
             AssetDataRef::Empty => None,

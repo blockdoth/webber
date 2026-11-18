@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::vec;
+use std::{hash_map, vec};
 
 use crate::API_DYN_LIB_PATH;
 use crate::runtime::assets::asset::{AssetData, AssetDataRef};
@@ -11,7 +11,7 @@ use crate::runtime::server::api::Api;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError};
 use crate::runtime::server::server::HttpRequestHeader;
 use crate::runtime::templating::context::{Context, LocalContext, TemplateContext};
-use crate::runtime::templating::error::{self, TemplateError};
+use crate::runtime::templating::error::TemplateError;
 use crate::runtime::templating::template::Template;
 use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 
@@ -19,7 +19,7 @@ use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 
 #[derive(Debug)]
 pub struct DynamicRoute {
-    pub base_dir: String,
+    pub _base_dir: String,
     pub page_var_name: String,
     pub page_var_key: String,
     pub list_var_name: String,
@@ -150,12 +150,6 @@ impl<'a> Router<'a> {
         self
     }
 
-    pub fn route_static_hidden(mut self, path: &str, template: &str) -> Self {
-        self.static_routes
-            .insert(path.into(), StaticRoute::new(template, true));
-        self
-    }
-
     pub fn route_dynamic_pages(
         mut self,
         path: &str,
@@ -183,7 +177,7 @@ impl<'a> Router<'a> {
                 let url = format!("{path}/{slug}");
 
                 let dyn_route = DynamicRoute {
-                    base_dir: path.to_owned(),
+                    _base_dir: path.to_owned(),
                     page_var_name: page_var_name.to_owned(),
                     page_var_key: key,
                     list_var_name: list_var_name.to_owned(),

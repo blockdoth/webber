@@ -1,7 +1,4 @@
-#![feature(tcp_linger)]
-#![feature(if_let_guard)]
 #![feature(hash_map_macro)]
-#![feature(allocator_api)]
 #![allow(clippy::module_inception)]
 #![allow(unused)]
 #![allow(dead_code)]

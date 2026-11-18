@@ -46,9 +46,9 @@ impl<T> Trie<T> {
         let mut current_node = &mut self.root;
 
         for key in path.split('/').filter(|part| !part.is_empty()) {
-            match current_node.children.get_mut(key) {
-                Some(node) => current_node = node,
-                None => return None,
+            {
+                let node = current_node.children.get_mut(key)?;
+                current_node = node
             }
         }
 
@@ -59,9 +59,9 @@ impl<T> Trie<T> {
         let mut current_node = &self.root;
 
         for path_component in path.split('/').filter(|part| !part.is_empty()) {
-            match current_node.children.get(path_component) {
-                Some(node) => current_node = node,
-                None => return None,
+            {
+                let node = current_node.children.get(path_component)?;
+                current_node = node
             }
         }
 

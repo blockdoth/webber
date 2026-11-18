@@ -1,5 +1,5 @@
 use crate::runtime::markdown::Span;
-use crate::runtime::misc::date::{Date, DateFormat};
+use crate::runtime::misc::date::DateFormat;
 use crate::runtime::templating::error::{TemplateError, TemplateErrorMsg};
 use crate::runtime::templating::lexer::{TemplateInfo, TemplatePositionData};
 use crate::runtime::templating::lexer::{TemplateLexer, TemplateToken, TemplateTokenTyp};
@@ -442,7 +442,7 @@ impl TemplateParser<'_> {
     fn parse_for(&mut self) -> Result<TemplateNode, TemplateError> {
         use TemplateTokenTyp::*;
         let start_tok = self.consume(For)?;
-        let whitespace_tok = self.consume(Whitespace)?;
+        let _whitespace_tok = self.consume(Whitespace)?;
 
         let key_bind = self.consume(Identifier)?;
         let bind = if self.try_consume(Comma).is_some() {
@@ -608,7 +608,7 @@ impl Display for Var {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.base)?;
         for i in &self.indices {
-            write!(f, "{i}");
+            write!(f, "{i}")?;
         }
         Ok(())
     }

@@ -3,9 +3,7 @@ use std::error::Error;
 use std::fmt::{Debug, Display};
 
 use std::fmt;
-use std::time::SystemTime;
 
-use crate::runtime::markdown::Span;
 use crate::runtime::misc::date::DateFormat;
 use crate::runtime::templating::context::Context;
 use crate::runtime::templating::lexer::{

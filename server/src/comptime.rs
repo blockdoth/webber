@@ -11,9 +11,7 @@ use crate::RELEASE_BIN_PATH;
 use crate::runtime::assets::content::walk_dir;
 use crate::runtime::config::config::Config;
 use crate::runtime::config::parser::TomlishValue;
-use crate::runtime::misc::date::Date;
 use crate::runtime::server::error::ServerError;
-use crate::runtime::templating::values::TemplateValue;
 
 #[cfg(generated)]
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
@@ -118,7 +116,6 @@ fn gen_config(out: &mut String, config: &Config) {
     let dynamic_routes =
         config.dynamic_routes.iter()
             .map(|(a, b)| {
-                    let route = format!("{b:?}");
                     format!("({a:?}.into(), DynamicRouteConfig {{ template: {:?}.into(), context_var: {:?}.into(), bind: {:?}.into()}})", b.template, b.context_var, b.bind)
                 }
             )
@@ -205,7 +202,7 @@ fn gen_load_embedded_assets(out: &mut String, cwd: &str, config: &Config) {
 
     out.push_str("\tpaths.into_iter().for_each(|(key, content)| assets.insert(key, Asset::new(content, false)));\n");
 
-    let mut generated_paths = walk_dir(&config.generated_path);
+    let generated_paths = walk_dir(&config.generated_path);
 
     out.push_str("\tlet paths: Vec<(String, AssetData)> = vec![\n");
     for generated_path in generated_paths {
@@ -221,8 +218,6 @@ fn gen_load_embedded_assets(out: &mut String, cwd: &str, config: &Config) {
     out.push_str("\t];\n");
 
     out.push_str("\tpaths.into_iter().for_each(|(key, content)| assets.insert(key, Asset::new(content, true)));\n");
-
-    let generated_paths = walk_dir(&config.generated_path);
 
     out.push_str("\tassets\n");
     out.push_str("}\n\n");
@@ -240,9 +235,6 @@ fn gen_load_embedded_templates(out: &mut String, cwd: &str, config: &Config) {
     for template_path in template_paths {
         let path_key = template_path.to_string_lossy();
         let global_path = format!("{cwd}/{path_key}");
-        let stripped_key = &path_key
-            .strip_prefix(&config.templates_path)
-            .expect("Failed to find prefix");
 
         let content_str = match template_path.extension().and_then(|s| s.to_str()) {
             Some("html") => &format!("include_str!({global_path:?})"),
