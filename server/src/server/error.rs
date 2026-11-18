@@ -136,12 +136,9 @@ impl fmt::Display for HttpResponseCode<'_> {
     }
 }
 
-
-
 #[derive(Debug)]
 pub enum IoError {
     WouldBlock,
     ConnectionClosed,
-    Timeout,
-    Io(io::Error)
+    Io(io::Error),
 }

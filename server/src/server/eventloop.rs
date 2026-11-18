@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::error::Error;
@@ -25,30 +26,6 @@ use crate::runtime::server::{error::ServerError, router::Router, server::HttpSer
 
 const READ_BUFFER_SIZE: usize = 8192;
 
-pub struct Connection {
-    stream: TcpStream,
-    last_polled: Instant,
-}
-
-impl PartialEq for Connection {
-    fn eq(&self, other: &Self) -> bool {
-        self.last_polled == other.last_polled
-    }
-}
-
-impl Eq for Connection {}
-impl PartialOrd for Connection {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.last_polled.partial_cmp(&other.last_polled)
-    }
-}
-
-impl Ord for Connection {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.last_polled.cmp(&other.last_polled)
-    }
-}
-
 impl HttpServer {
     pub fn serve(&mut self, listener: TcpListener, mut router: Router) -> Result<(), ServerError> {
         listener
@@ -70,18 +47,17 @@ impl HttpServer {
         let mut last_request = Instant::now();
         let mut average_time_between_requests = Duration::from_secs(1);
 
-        let polling = false;
+        let accept_division = 0.1;
+        let time_slice = Duration::from_millis(10);
 
+        let max_accept_time = time_slice.mul_f64(accept_division);
+        let max_handle_time = time_slice.mul_f64(1.0 - accept_division);
+
+        let mut connections: BinaryHeap<Reverse<Connection>> = BinaryHeap::new();
         while !SHUTDOWN.load(Ordering::Relaxed) {
-            let now = Instant::now();
+            let start_loop_iter = Instant::now();
 
-
-            let mut connections: BinaryHeap<Connection> = BinaryHeap::new();
-            let mut streams: Vec<TcpStream> = vec![];
-
-            let max_streams_handled = 500;
-            
-            while streams.len() < max_streams_handled {
+            while start_loop_iter.elapsed() < max_accept_time {
                 match listener.accept() {
                     Ok((mut stream, peer_addr)) => {
                         let now = Instant::now();
@@ -89,42 +65,43 @@ impl HttpServer {
                         stream
                             .set_nonblocking(true)
                             .expect("Failed to change blocking mode");
-                        // self.handle_request(
-                        //     &mut stream,
-                        //     &mut router,
-                        //     &mut read_buffer,
-                        //     &mut template_cache,
-                        // )?;
-                        streams.push(stream);
+
+                        connections.push(Reverse(Connection::new(stream)));
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                     Err(error) => return Err(error.into()),
                 }
             }
 
-            // println!("connections {}\r", streams.len());
+            while start_loop_iter.elapsed() < max_handle_time {
+                if let Some(Reverse(mut conn)) = connections.pop() {
+                    let request_slice = match Self::read_request(&mut conn.stream, &mut read_buffer)
+                    {
+                        Ok(slice) => slice,
+                        Err(IoError::WouldBlock) => {
+                            conn.polled();
+                            connections.push(Reverse(conn));
+                            continue;
+                        }
+                        Err(IoError::ConnectionClosed) => continue,
+                        Err(IoError::Io(err)) => {
+                            println!("{err:?}");
+                            continue;
+                        }
+                    };
 
-            streams.retain_mut(|mut stream| {
-                let request_slice = match Self::read_request(stream, &mut read_buffer)
-                {
-                    Ok(slice) => slice,
-                    Err(IoError::WouldBlock) => return true,
-                    Err(IoError::Timeout) => return true,
-                    Err(IoError::ConnectionClosed) => return false,
-                    Err(IoError::Io(err)) => return false,
-                };
-                
-                self.handle_request(
-                    request_slice,
-                    stream,
-                    &mut router,
-                    &mut template_cache,
-                ).expect("idk");
+                    self.handle_request(
+                        request_slice,
+                        &mut conn.stream,
+                        &mut router,
+                        &mut template_cache,
+                    )?;
+                } else {
+                    break;
+                }
+            }
 
-                false
-            });
-
-            let duration_since_last_request = now.duration_since(last_request);
+            let duration_since_last_request = start_loop_iter.duration_since(last_request);
 
             average_time_between_requests = compute_running_average_delay_bounded(
                 average_time_between_requests,
@@ -146,24 +123,18 @@ impl HttpServer {
         Ok(())
     }
 
-    fn random_samples(len: usize, n: usize) -> Vec<usize> {
-        let n = n.min(len);
-        let rng = RandomState::new();
-
-        let mut indices: Vec<usize> = (0..len).collect();
-
-        for i in 0..n {
-            let j = i + (rng.hash_one(i) as usize % (len - i));
-            indices.swap(i, j);
+    fn read_request<'a>(stream: &mut TcpStream, buffer: &'a mut [u8]) -> Result<&'a [u8], IoError> {
+        match stream.read(buffer) {
+            Ok(0) => Err(IoError::ConnectionClosed),
+            Ok(n) => Ok(&buffer[..n]),
+            Err(ref error) if error.kind() == ErrorKind::WouldBlock => Err(IoError::WouldBlock),
+            Err(error) => {
+                println!("[{}] Read {error:?}", stream.peer_addr().unwrap());
+                Err(IoError::Io(error))
+            }
         }
-
-        indices.truncate(n);
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-
-        indices
     }
 
-    
     fn handle_request(
         &mut self,
         request_slice: &[u8],
@@ -215,38 +186,6 @@ impl HttpServer {
             .save_page_hit(header.path, start_timer.elapsed())?;
 
         Ok(())
-    }
-
-    fn read_request<'a>(stream: &mut TcpStream, buffer: &'a mut [u8]) -> Result<&'a [u8], IoError> {
-        let start = Instant::now();
-        let max_duration = Duration::from_millis(5);
-        let mut loops  = 0;
-        loop {
-            match stream.read(buffer) {
-                Ok(0) => return Err(IoError::ConnectionClosed),
-                Ok(n) => return {
-                    // if loops > 0 {
-                    //     println!("Completed in {} loops", loops);
-                        
-                    // }
-
-                    Ok(&buffer[..n])},
-                Err(ref error) if error.kind() == ErrorKind::WouldBlock => {
-                    if Instant::now() - start > max_duration{
-                        // println!("Timeout after {} loops", loops);
-                        
-                        return Err(IoError::WouldBlock);
-                    }else {
-                        std::hint::spin_loop();
-                    }
-                }
-                Err(error) => {
-                    println!("[{}] Read {error:?}", stream.peer_addr().unwrap());
-                    return Err(IoError::Io(error));
-                }
-            }
-            loops += 1;
-        }
     }
 
     fn route_request(
@@ -326,5 +265,51 @@ impl HttpServer {
                 false
             }
         });
+    }
+}
+
+pub struct Connection {
+    stream: TcpStream,
+    last_polled: Option<Instant>,
+    polled_count: u64,
+}
+
+impl Connection {
+    pub fn new(stream: TcpStream) -> Self {
+        Connection {
+            stream,
+            last_polled: None,
+            polled_count: 0,
+        }
+    }
+
+    pub fn polled(&mut self) {
+        self.last_polled = Some(Instant::now());
+        self.polled_count += 1;
+    }
+
+    fn priority(&self) -> Option<Instant> {
+        self.last_polled.map(|last| {
+            last - Duration::from_millis(self.polled_count) // Some heuristic
+        })
+    }
+}
+
+impl PartialEq for Connection {
+    fn eq(&self, other: &Self) -> bool {
+        self.last_polled == other.last_polled && self.polled_count == other.polled_count
+    }
+}
+
+impl Eq for Connection {}
+impl PartialOrd for Connection {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Connection {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority().cmp(&other.priority())
     }
 }

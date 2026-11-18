@@ -85,7 +85,7 @@ impl HttpServer {
             // if getrlimit(RLIMIT_NOFILE, &mut limit) != 0 {
             //     return Err(io::Error::last_os_error());
             // }
-            // println!("current fd limit {}", limit.current);            
+            // println!("current fd limit {}", limit.current);
         }
 
         Ok(())
