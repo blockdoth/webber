@@ -41,7 +41,7 @@ pub struct Db {
     unsynced: bool,
     metric_cache: HashMap<String, Vec<CachedPageHit>>,
     current_cache_count: usize,
-    path_string_intern_cache: HashMap<String, i64>,
+    pub path_string_intern_cache: HashMap<String, i64>,
 }
 
 impl Db {
