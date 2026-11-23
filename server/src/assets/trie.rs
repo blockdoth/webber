@@ -133,7 +133,7 @@ impl<T> Trie<T> {
         current_node.asset.is_some()
     }
 
-    pub fn remove(&mut self, path: &String) -> bool {
+    pub fn remove(&mut self, path: &str) -> bool {
         let mut current_node = &mut self.root;
 
         for key in path.split('/').filter(|part| !part.is_empty()) {

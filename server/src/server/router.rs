@@ -5,11 +5,13 @@ use std::{hash_map, vec};
 use crate::API_DYN_LIB_PATH;
 use crate::runtime::assets::asset::{AssetData, AssetDataRef};
 use crate::runtime::assets::content::Content;
-use crate::runtime::config::config::{Config, DynamicRouteConfig};
+use crate::runtime::config::config::{Config, DynamicRouteConfig, StaticRouteConfig};
 use crate::runtime::db::db::Db;
 use crate::runtime::server::api::Api;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError};
+use crate::runtime::server::ratelimiter::RateLimiter;
 use crate::runtime::server::server::HttpRequestHeader;
+use crate::runtime::server::string_cache::{InternedString, StringCache};
 use crate::runtime::templating::context::{Context, LocalContext, TemplateContext};
 use crate::runtime::templating::error::TemplateError;
 use crate::runtime::templating::template::Template;
@@ -19,7 +21,6 @@ use crate::runtime::templating::values::{TemplateValue, ToTemplateValue};
 
 #[derive(Debug)]
 pub struct DynamicRoute {
-    pub _base_dir: String,
     pub page_var_name: String,
     pub page_var_key: String,
     pub list_var_name: String,
@@ -34,11 +35,8 @@ pub struct StaticRoute {
 }
 
 impl StaticRoute {
-    pub fn new(path: &str, hidden: bool) -> Self {
-        Self {
-            path: path.to_owned(),
-            hidden,
-        }
+    pub fn new(path: String, hidden: bool) -> Self {
+        Self { path, hidden }
     }
 }
 
@@ -47,8 +45,9 @@ pub struct Router<'a> {
     pub content: Content,
     pub context: Context,
     pub db: &'a mut Db,
-    pub static_routes: HashMap<String, StaticRoute>,
-    pub dynamic_routes: HashMap<String, DynamicRoute>,
+    pub static_routes: HashMap<InternedString, StaticRoute>,
+    pub dynamic_routes: HashMap<InternedString, DynamicRoute>,
+    pub rate_limiter: RateLimiter,
 
     pub fallback: Option<String>,
     pub error_page: Option<String>,
@@ -60,22 +59,10 @@ pub struct Router<'a> {
     pub api_lib_path: String,
 
     pub api: Api,
+    pub string_cache: StringCache,
 }
 
 impl<'a> Router<'a> {
-    // pub fn new(content: Content, context: Context, db: Db) -> Self {
-    //     Router {
-    //         content,
-    //         context,
-    //         db,
-    //         static_routes: HashMap::new(),
-    //         dynamic_routes: HashMap::new(),
-    //         fallback: None,
-    //         error_page: None,
-    //         rss_template: None,
-    //     }
-    // }
-
     pub fn from_config(config: Config, content: Content, context: Context, db: &'a mut Db) -> Self {
         let mut router = Router {
             content,
@@ -83,7 +70,8 @@ impl<'a> Router<'a> {
             db,
             static_routes: HashMap::new(),
             dynamic_routes: HashMap::new(),
-            fallback: None,
+            rate_limiter: RateLimiter::from_config(&config),
+            fallback: config.fallback_route,
             error_page: None,
             rss_template: None,
             asset_path: config.assets_path,
@@ -91,33 +79,25 @@ impl<'a> Router<'a> {
             generated_path: config.generated_path,
             api_lib_path: config.api_lib_path,
             api: Api::new(API_DYN_LIB_PATH, 0),
-        };
-
-        if let Some(fallback) = config.fallback_route {
-            router = router.fallback(&fallback)
+            string_cache: StringCache::new(),
         };
 
         if let Some(error) = config.error_template {
-            router = router.error_page(&error)
+            router = router.error_page(error)
         };
 
-        for (route, template_path) in config.static_routes {
-            router = router.route_static_page(&route, &template_path);
+        for (route, static_route_config) in config.static_routes {
+            let path: InternedString = router.string_cache.intern(&route);
+            router = router.route_static_page(path, static_route_config);
         }
 
-        for (
-            route,
-            DynamicRouteConfig {
-                template,
-                context_var,
-                bind,
-            },
-        ) in config.dynamic_routes
-        {
-            router = router.route_dynamic_pages(&route, &context_var, &bind, &template);
+        for (route, dyn_route_config) in config.dynamic_routes {
+            let path: InternedString = router.string_cache.intern(&route);
+            router = router.route_dynamic_pages(path, dyn_route_config);
         }
+
         if let Some(rss) = config.rss_template {
-            router = router.rss(&rss)
+            router = router.rss(rss)
         };
 
         router
@@ -134,9 +114,12 @@ impl<'a> Router<'a> {
         }
     }
 
-    pub fn route_static_page(mut self, path: &str, template: &str) -> Self {
-        let route = StaticRoute::new(template, false);
-        self.static_routes.insert(path.into(), route.clone());
+    pub fn route_static_page(
+        mut self,
+        path: InternedString,
+        static_route_config: StaticRouteConfig,
+    ) -> Self {
+        let route = StaticRoute::new(static_route_config.path, false);
         let name = path.split('/').next_back().expect("valid path");
 
         let obj = hash_map! {
@@ -147,20 +130,32 @@ impl<'a> Router<'a> {
 
         Self::add_to_static_pages(&mut self.context, obj.to_template_value());
 
+        self.static_routes.insert(path.clone(), route);
+
+        self.rate_limiter
+            .insert_path_limit(path, static_route_config.rate_limit);
+
         self
     }
-
+    // list_var_name: &str,
+    // page_var_name: &str,
+    // base_template_path: &str,
     pub fn route_dynamic_pages(
         mut self,
-        path: &str,
-        list_var_name: &str,
-        page_var_name: &str,
-        base_template_path: &str,
+        path: InternedString,
+        dyn_route_config: DynamicRouteConfig,
     ) -> Self {
+        let DynamicRouteConfig {
+            template,
+            context_var,
+            bind,
+            rate_limit,
+        } = dyn_route_config;
+
         let template_value = self
             .context
-            .lookup(list_var_name)
-            .unwrap_or_else(|| panic!("Failed to find var {} in context", list_var_name))
+            .lookup(&context_var)
+            .unwrap_or_else(|| panic!("Failed to find var {} in context", context_var))
             .clone();
 
         let page_object = match template_value {
@@ -174,31 +169,26 @@ impl<'a> Router<'a> {
             if let TemplateValue::Object(ref object) = page
                 && let Some(TemplateValue::Text(slug)) = object.get("slug")
             {
-                let url = format!("{path}/{slug}");
+                let url = self.string_cache.intern(&format!("{path}/{slug}"));
 
                 let dyn_route = DynamicRoute {
-                    _base_dir: path.to_owned(),
-                    page_var_name: page_var_name.to_owned(),
+                    page_var_name: bind.to_owned(),
                     page_var_key: key,
-                    list_var_name: list_var_name.to_owned(),
-                    template_path: base_template_path.to_owned(),
+                    list_var_name: context_var.to_owned(),
+                    template_path: template.to_owned(),
                     slug: slug.to_string(),
                 };
 
-                self.dynamic_routes.insert(url, dyn_route);
+                self.dynamic_routes.insert(url.clone(), dyn_route);
+                self.rate_limiter.insert_path_limit(url, rate_limit.clone());
             }
         }
 
         self
     }
 
-    pub fn fallback(mut self, page: &str) -> Self {
-        self.fallback = Some(page.to_string());
-        self
-    }
-
-    pub fn error_page(mut self, template: &str) -> Self {
-        match self.content.templates.get(template) {
+    pub fn error_page(mut self, template: String) -> Self {
+        match self.content.templates.get(&template) {
             None => panic!("Error template page: \"{template}\" must be in the templates"),
             Some(Err(err)) => {
                 panic!(
@@ -210,8 +200,8 @@ impl<'a> Router<'a> {
         self
     }
 
-    pub fn rss(mut self, template: &str) -> Self {
-        match self.content.templates.get(template) {
+    pub fn rss(mut self, template: String) -> Self {
+        match self.content.templates.get(&template) {
             None => {
                 let keys = self.content.templates.keys();
                 panic!("RSS template page: \"{template}\" must be in the templates {keys:?}")
@@ -221,8 +211,10 @@ impl<'a> Router<'a> {
             }
             Some(Ok(_)) => self.rss_template = Some(template.to_owned()),
         }
-        self.static_routes
-            .insert("/rss".into(), StaticRoute::new(template, false));
+        self.static_routes.insert(
+            self.string_cache.intern("/rss"),
+            StaticRoute::new(template, false),
+        );
 
         let obj = TemplateValue::Object(hash_map! {
           "url".to_string() => TemplateValue::Text("/rss".to_string()),
@@ -240,8 +232,17 @@ impl<'a> Router<'a> {
         _body: AssetData,
         render_buffer: &'a mut String,
         template_cache: &'a mut HashMap<String, String>,
+        string_cache: &StringCache,
     ) -> Result<AssetDataRef<'a>, HttpServerError> {
-        match self.static_routes.get(header.path) {
+        let interned_path = match string_cache.get(header.path) {
+            Some(str) => str,
+            None if let Some(fallback) = &self.fallback => {
+                return Err(HttpServerError::Redirect(fallback.to_string()));
+            }
+            _ => return Ok(AssetDataRef::Text(HttpResponseCode::NotFound.status_line())),
+        };
+
+        match self.static_routes.get(&interned_path) {
             Some(route) if header.path == "/stats" => {
                 let stats = self
                     .db
@@ -275,7 +276,7 @@ impl<'a> Router<'a> {
                 }
             }
 
-            _ => match self.dynamic_routes.get(header.path) {
+            _ => match self.dynamic_routes.get(&interned_path) {
                 Some(dyn_route) => {
                     let page_context_var = if let Some(TemplateValue::Object(posts)) =
                         self.context.lookup(&dyn_route.list_var_name)

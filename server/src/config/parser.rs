@@ -50,7 +50,7 @@ impl Tomlish {
 pub enum TomlishValue {
     Number(i64),
     String(String),
-    Object(HashMap<String, Vec<TomlishValue>>),
+    Object(HashMap<String, TomlishValue>),
     Boolean(bool),
     Array(Vec<TomlishValue>),
 
@@ -115,10 +115,7 @@ impl TomlishValue {
                     .split_once('=')
                     .ok_or("Expected key = value in object")?;
 
-                object.insert(
-                    key.trim().to_owned(),
-                    vec![TomlishValue::parse(value.trim())?],
-                );
+                object.insert(key.trim().to_owned(), TomlishValue::parse(value.trim())?);
             }
 
             return Ok(Object(object));
@@ -141,11 +138,7 @@ impl TomlishValue {
             TomlishValue::Object(entries) => TemplateValue::Object(
                 entries
                     .into_iter()
-                    .filter_map(|(key, mut values)| {
-                        values
-                            .pop()
-                            .map(|value| (key, value.resolve(content, asset_path)))
-                    })
+                    .map(|(key, value)| (key, value.resolve(content, asset_path)))
                     .collect(),
             ),
 

@@ -8,6 +8,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::runtime::assets::asset::AssetData;
+use crate::runtime::assets::asset::AssetDataRef;
 use crate::runtime::misc::sighandlers::SHUTDOWN;
 use crate::runtime::server::error::IoError;
 use crate::runtime::server::error::{HttpResponseCode, HttpServerError};
@@ -47,9 +48,9 @@ impl HttpServer {
         let max_handle_time = time_slice.mul_f64(1.0 - accept_division);
 
         let mut connections: BinaryHeap<Reverse<Connection>> = BinaryHeap::new();
+
         while !SHUTDOWN.load(Ordering::Relaxed) {
             let start_loop_iter = Instant::now();
-
             while start_loop_iter.elapsed() < max_accept_time {
                 match listener.accept() {
                     Ok((stream, _peer_addr)) => {
@@ -101,6 +102,7 @@ impl HttpServer {
                 duration_since_last_request,
                 Duration::from_secs(1),
             );
+
             scheduler.execute_due_tasks_with_budget(
                 self,
                 &mut router,
@@ -143,15 +145,7 @@ impl HttpServer {
             }
         };
 
-        #[cfg(debug_assertions)]
-        if header.path == "/ws" {
-            self.upgrade_websocket(header, stream)?;
-            self.active_streams.push(stream.try_clone()?);
-            return Ok(());
-        }
-
         let start_timer = Instant::now();
-
         let result = self.route_request(&header, body, stream, router, template_cache);
 
         if let Err(err) = result {
@@ -166,7 +160,6 @@ impl HttpServer {
                 {
                     return Ok(());
                 }
-
                 err => {
                     eprintln!("[{}] request failed: {err}", stream.peer_addr().unwrap());
                     return Ok(());
@@ -189,7 +182,30 @@ impl HttpServer {
         router: &mut Router,
         template_cache: &mut HashMap<String, String>,
     ) -> Result<(), HttpServerError> {
-        let path = header.path;
+        let path = router.string_cache.intern(header.path);
+
+        if let Ok(ip) = stream.peer_addr() {
+            if !router
+                .rate_limiter
+                .allow(ip.ip(), header.path, &router.string_cache)
+            {
+                return Self::send_response(
+                    HttpResponseCode::RateLimit,
+                    AssetDataRef::Empty,
+                    &mut self.response_buffer,
+                    stream,
+                );
+            }
+        } else {
+            return Err(HttpServerError::UnexpectedDisconnect);
+        }
+
+        #[cfg(debug_assertions)]
+        if header.path == "/ws" {
+            self.upgrade_websocket(header, stream)?;
+            self.active_streams.push(stream.try_clone()?);
+            return Ok(());
+        }
 
         if path.starts_with("/api") {
             return match router.serve_api(header, body) {
@@ -216,7 +232,13 @@ impl HttpServer {
             );
         }
 
-        match router.serve_page(header, body, &mut self.render_buffer, template_cache) {
+        match router.serve_page(
+            header,
+            body,
+            &mut self.render_buffer,
+            template_cache,
+            &router.string_cache,
+        ) {
             Ok(content) => Self::send_response(
                 HttpResponseCode::Ok,
                 content,

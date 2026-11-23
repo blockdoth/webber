@@ -70,6 +70,7 @@ pub enum HttpServerError {
     TemplatingError(TemplateError),
     StreamWriteFailed(std::io::Error),
     MalformedRequest,
+    UnexpectedDisconnect,
     InvalidRequestType(String),
     Todo,
 }
@@ -85,6 +86,7 @@ impl Display for HttpServerError {
             Self::InvalidRequestType(request) => write!(f, "invalid request type {request}"),
             Self::Todo => write!(f, "operation not implemented"),
             Self::MalformedRequest => write!(f, "Malformed request"),
+            Self::UnexpectedDisconnect => write!(f, "Unexpected disconnect"),
         }
     }
 }
@@ -108,15 +110,17 @@ pub enum HttpResponseCode<'a> {
     BadRequest,
     NotFound,
     InternalServer,
+    RateLimit,
 }
 
 impl HttpResponseCode<'_> {
     pub const fn status_line(&self) -> &'static str {
         match self {
-            Self::Ok => "200 OK",
             Self::Redirect(_) => "303 See Other",
+            Self::Ok => "200 OK",
             Self::BadRequest => "400 Bad Request",
             Self::NotFound => "404 Not Found",
+            Self::RateLimit => "429 Too Many Requests",
             Self::InternalServer => "500 Internal Server Error",
         }
     }
@@ -131,6 +135,7 @@ impl fmt::Display for HttpResponseCode<'_> {
             }
             HttpResponseCode::NotFound => write!(f, "404 Not Found"),
             HttpResponseCode::BadRequest => write!(f, "400 Bad Request"),
+            HttpResponseCode::RateLimit => write!(f, "429 Too Many Requests"),
             HttpResponseCode::InternalServer => write!(f, "500 Internal Server Error"),
         }
     }

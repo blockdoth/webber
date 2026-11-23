@@ -314,9 +314,7 @@ impl ToTemplateValue for TomlishValue {
             TomlishValue::Object(entries) => TemplateValue::Object(
                 entries
                     .into_iter()
-                    .filter_map(|(key, mut values)| {
-                        values.pop().map(|value| (key, value.to_template_value()))
-                    })
+                    .map(|(key, value)| (key, value.to_template_value()))
                     .collect(),
             ),
             TomlishValue::Path(path, _)

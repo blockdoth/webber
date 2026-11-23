@@ -1,27 +1,40 @@
 use std::{env, error::Error, fs};
 
-use crate::runtime::config::parser::{Tomlish, TomlishValue};
+use crate::runtime::{
+    config::parser::{Tomlish, TomlishValue},
+    server::ratelimiter::{RateLimit, RateLimiter},
+};
 
 #[derive(Debug)]
 pub struct Config {
     pub host: String,
     pub port: u16,
     pub domain: String,
+    pub rate_limit_ip: Option<u64>,
+    pub burst_limit_ip: Option<u64>,
+    pub rate_limit_path: Option<u64>,
+    pub burst_limit_path: Option<u64>,
 
     pub content_path: String,
     pub templates_path: String,
     pub assets_path: String,
     pub generated_path: String,
     pub api_lib_path: String,
-
+    // pub path_rate_limits: HashMap<String, u16>,
     pub fallback_route: Option<String>,
     // pub layout_template: Option<String>,
     pub error_template: Option<String>,
     pub rss_template: Option<String>,
 
     pub variables: Vec<(String, TomlishValue)>,
-    pub static_routes: Vec<(String, String)>,
+    pub static_routes: Vec<(String, StaticRouteConfig)>,
     pub dynamic_routes: Vec<(String, DynamicRouteConfig)>,
+}
+
+#[derive(Debug)]
+pub struct StaticRouteConfig {
+    pub path: String,
+    pub rate_limit: Option<RateLimit>,
 }
 
 #[derive(Debug)]
@@ -29,6 +42,7 @@ pub struct DynamicRouteConfig {
     pub template: String,
     pub context_var: String,
     pub bind: String,
+    pub rate_limit: Option<RateLimit>,
 }
 
 impl Config {
@@ -59,6 +73,10 @@ impl Config {
             domain: format!("{host}:{port}"),
             host,
             port,
+            rate_limit_ip: None,
+            burst_limit_ip: None,
+            rate_limit_path: None,
+            burst_limit_path: None,
             content_path: "content".into(),
             templates_path: "content/templates".into(),
             assets_path: "content/assets".into(),
@@ -71,6 +89,7 @@ impl Config {
             variables: vec![],
             static_routes: vec![],
             dynamic_routes: vec![],
+            // path_rate_limits: HashMap::new()
         }
     }
 
@@ -95,13 +114,50 @@ impl Config {
                         ("host", TomlishValue::String(v)) => base.host = v,
                         ("port", TomlishValue::Number(v)) => base.port = v.try_into()?,
                         ("domain", TomlishValue::String(v)) => base.domain = v,
+
                         (key, _) => {
                             return Err(
                                 format!("Invalid value or unknown key in [server]: {key}").into()
                             );
                         }
                     },
-
+                    "rate_limits" => match (key, value) {
+                        ("ip_rate", TomlishValue::Number(n)) => {
+                            if n > 0 {
+                                base.rate_limit_ip = Some(n as u64);
+                            } else {
+                                return Err(format!("Ip rate limit must be positive: {n}").into());
+                            }
+                        }
+                        ("ip_burst", TomlishValue::Number(n)) => {
+                            if n > 0 {
+                                base.burst_limit_ip = Some(n as u64);
+                            } else {
+                                return Err(format!("Ip burst limit must be positive: {n}").into());
+                            }
+                        }
+                        ("path_rate", TomlishValue::Number(n)) => {
+                            if n > 0 {
+                                base.rate_limit_path = Some(n as u64);
+                            } else {
+                                return Err(format!("Path rate limit must be positive: {n}").into());
+                            }
+                        }
+                        ("path_burst", TomlishValue::Number(n)) => {
+                            if n > 0 {
+                                base.burst_limit_path = Some(n as u64);
+                            } else {
+                                return Err(
+                                    format!("Path burst limit must be positive: {n}").into()
+                                );
+                            }
+                        }
+                        (key, _) => {
+                            return Err(
+                                format!("Invalid value or unknown key in [server]: {key}").into()
+                            );
+                        }
+                    },
                     "dirs" => match (key, value) {
                         ("content", TomlishValue::Path(v, _)) => base.content_path = v,
                         ("templates", TomlishValue::ContentPath(v, _)) => {
@@ -152,9 +208,59 @@ impl Config {
                     )),
 
                     "static_routes" => match value {
-                        TomlishValue::ContentPath(v, _) => base
-                            .static_routes
-                            .push((key.to_owned(), format!("{}/{}", base.content_path, v))),
+                        TomlishValue::ContentPath(v, _) => base.static_routes.push((
+                            key.to_owned(),
+                            StaticRouteConfig {
+                                path: format!("{}/{}", base.content_path, v),
+                                rate_limit: None,
+                            },
+                        )),
+                        TomlishValue::Object(obj) => {
+                            let path = match obj.get("path") {
+                                Some(TomlishValue::ContentPath(v, _)) => {
+                                    format!("{}/{}", base.content_path, v)
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "Expected content path for static route: {key}"
+                                    )
+                                    .into());
+                                }
+                            };
+
+                            let rate_limit = match obj.get("rate_limit") {
+                                Some(TomlishValue::Number(n)) if *n >= 0 => Some(*n as u64),
+                                None => None,
+                                _ => {
+                                    return Err(format!(
+                                        "Invalid rate limit for static route: {key}"
+                                    )
+                                    .into());
+                                }
+                            };
+
+                            let burst_limit = match obj.get("burst_limit") {
+                                Some(TomlishValue::Number(n)) if *n >= 0 => Some(*n as u64),
+                                None => None,
+                                _ => {
+                                    return Err(format!(
+                                        "Invalid burst limit for static route: {key}"
+                                    )
+                                    .into());
+                                }
+                            };
+
+                            base.static_routes.push((
+                                key.to_owned(),
+                                StaticRouteConfig {
+                                    path,
+                                    rate_limit: RateLimiter::make_rate_limit(
+                                        rate_limit,
+                                        burst_limit,
+                                    ),
+                                },
+                            ));
+                        }
                         _ => {
                             return Err(
                                 format!("Expected content path for static route: {key}").into()
@@ -164,31 +270,30 @@ impl Config {
 
                     "dynamic_routes" => match value {
                         TomlishValue::Object(mut fields) => {
-                            let template = match fields.remove("template") {
-                                Some(mut values) => match values.pop() {
-                                    Some(TomlishValue::ContentPath(v, _)) => {
-                                        format!("{}/{}", base.content_path, v)
-                                    }
-                                    _ => {
-                                        return Err(
-                                            format!("Invalid template for route {key}").into()
-                                        );
-                                    }
-                                },
+                            let template = match fields.get("template") {
+                                Some(TomlishValue::ContentPath(v, _)) => {
+                                    format!("{}/{}", base.content_path, v)
+                                }
+                                Some(tomlish) => {
+                                    return Err(format!(
+                                        "Invalid value for route config {key}: {tomlish:?}"
+                                    )
+                                    .into());
+                                }
                                 None => {
                                     return Err(format!("Missing template for route {key}").into());
                                 }
                             };
 
                             let context_var = match fields.remove("context_var") {
-                                Some(mut values) => match values.pop() {
-                                    Some(TomlishValue::String(v)) => v,
-                                    _ => {
-                                        return Err(
-                                            format!("Invalid context_var for route {key}").into()
-                                        );
-                                    }
-                                },
+                                Some(TomlishValue::String(v)) => v,
+
+                                Some(tomlish) => {
+                                    return Err(format!(
+                                        "Invalid context_var for route {key}: {tomlish:?}"
+                                    )
+                                    .into());
+                                }
                                 None => {
                                     return Err(
                                         format!("Missing context_var for route {key}").into()
@@ -197,19 +302,47 @@ impl Config {
                             };
 
                             let bind = match fields.remove("bind") {
-                                Some(mut values) => match values.pop() {
-                                    Some(TomlishValue::String(v)) => v,
-                                    _ => return Err(format!("Invalid bind for route {key}").into()),
-                                },
+                                Some(TomlishValue::String(v)) => v,
+                                Some(tomlish) => {
+                                    return Err(format!(
+                                        "Invalid bind for route {key}: {tomlish:?}"
+                                    )
+                                    .into());
+                                }
                                 None => return Err(format!("Missing bind for route {key}").into()),
                             };
 
+                            let rate_limit = match fields.get("rate_limit") {
+                                Some(TomlishValue::Number(n)) if *n >= 0 => Some(*n as u64),
+                                None => None,
+                                _ => {
+                                    return Err(format!(
+                                        "Invalid rate limit for static route: {key}"
+                                    )
+                                    .into());
+                                }
+                            };
+
+                            let burst_limit = match fields.get("burst_limit") {
+                                Some(TomlishValue::Number(n)) if *n >= 0 => Some(*n as u64),
+                                None => None,
+                                _ => {
+                                    return Err(format!(
+                                        "Invalid burst limit for static route: {key}"
+                                    )
+                                    .into());
+                                }
+                            };
                             base.dynamic_routes.push((
                                 key.to_owned(),
                                 DynamicRouteConfig {
                                     template,
                                     context_var,
                                     bind,
+                                    rate_limit: RateLimiter::make_rate_limit(
+                                        rate_limit,
+                                        burst_limit,
+                                    ),
                                 },
                             ));
                         }

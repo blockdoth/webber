@@ -59,7 +59,12 @@ fn gen_config(out: &mut String, config: &Config) {
     let static_routes = config
         .static_routes
         .iter()
-        .map(|(a, b)| format!("({a:?}.into(), {b:?}.into())"))
+        .map(|(a, b)| {
+            format!(
+                "({a:?}.into(), StaticRouteConfig {{ path: {:?}.into(), rate_limit: {:?} }})",
+                b.path, b.rate_limit
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -83,11 +88,7 @@ fn gen_config(out: &mut String, config: &Config) {
                     .map(|(key, value)| {
                         format!(
                             "({key:?}.into(), vec![{}])",
-                            value
-                                .iter()
-                                .map(tomlish_value_to_owned_str)
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            tomlish_value_to_owned_str(value)
                         )
                     })
                     .collect::<Vec<_>>()
@@ -116,7 +117,7 @@ fn gen_config(out: &mut String, config: &Config) {
     let dynamic_routes =
         config.dynamic_routes.iter()
             .map(|(a, b)| {
-                    format!("({a:?}.into(), DynamicRouteConfig {{ template: {:?}.into(), context_var: {:?}.into(), bind: {:?}.into()}})", b.template, b.context_var, b.bind)
+                    format!("({a:?}.into(), DynamicRouteConfig {{ template: {:?}.into(), context_var: {:?}.into(), bind: {:?}.into(), rate_limit: None}})", b.template, b.context_var, b.bind)
                 }
             )
             .collect::<Vec<_>>()
@@ -129,6 +130,10 @@ fn gen_config(out: &mut String, config: &Config) {
         "\t\tConfig {{
             host: {:?}.into(),
             port: {},
+            rate_limit_ip: {:?},
+            burst_limit_ip: {:?},
+            rate_limit_path: {:?},
+            burst_limit_path: {:?},
             domain: {:?}.into(),
             content_path: {:?}.into(),
             templates_path: {:?}.into(),
@@ -144,6 +149,10 @@ fn gen_config(out: &mut String, config: &Config) {
         }}\n",
         config.host,
         config.port,
+        config.rate_limit_ip,
+        config.burst_limit_ip,
+        config.rate_limit_path,
+        config.burst_limit_path,
         config.domain,
         config.content_path,
         config.templates_path,
@@ -176,6 +185,8 @@ fn gen_imports(out: &mut String) {
     out.push_str("use crate::runtime::templating::error::TemplateError;\n");
     out.push_str("use crate::runtime::markdown::parser::MarkdownParser;\n");
     out.push_str("use crate::runtime::config::config::DynamicRouteConfig;\n");
+    out.push_str("use crate::runtime::config::config::StaticRouteConfig;\n");
+    out.push_str("use crate::runtime::server::ratelimiter::RateLimit;\n");
     out.push_str("use std::collections::HashMap;\n");
     out.push_str("use std::borrow::Cow;\n");
     out.push_str("use std::time::{UNIX_EPOCH, Duration};\n");

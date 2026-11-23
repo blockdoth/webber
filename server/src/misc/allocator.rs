@@ -6,10 +6,10 @@ use std::fmt::{Debug, Display};
 use crate::runtime::misc::byte_stuff;
 
 // #[global_allocator]
-// static GLOBAL: CountingAllocator = CountingAllocator::new();
+// pub static GLOBAL: CountingAllocator = CountingAllocator::new();
 
 #[derive(Debug, Clone, Copy)]
-struct AllocationInfo {
+pub struct AllocationInfo {
     count_total: usize,
     count_current: usize,
     count_max: usize,
@@ -82,7 +82,7 @@ impl AllocationInfo {
     }
 }
 
-struct AllocationUsage {
+pub struct AllocationUsage {
     bytes: usize,
     count: usize,
 }
@@ -99,7 +99,7 @@ impl fmt::Display for AllocationUsage {
 }
 
 impl AllocationUsage {
-    fn diff(&self, previous: Self) -> AllocationUsage {
+    pub fn diff(&self, previous: Self) -> AllocationUsage {
         AllocationUsage {
             bytes: self.bytes - previous.bytes,
             count: self.count - previous.count,
@@ -107,7 +107,7 @@ impl AllocationUsage {
     }
 }
 
-struct CountingAllocator {
+pub struct CountingAllocator {
     info: UnsafeCell<AllocationInfo>,
 }
 
@@ -118,11 +118,11 @@ impl CountingAllocator {
         }
     }
 
-    fn snapshot(&self) -> AllocationInfo {
+    pub fn snapshot(&self) -> AllocationInfo {
         unsafe { *self.info.get() }
     }
 
-    fn usage_snapshot(&self) -> AllocationUsage {
+    pub fn usage_snapshot(&self) -> AllocationUsage {
         let info = unsafe { *self.info.get() };
 
         AllocationUsage {
@@ -136,7 +136,7 @@ impl CountingAllocator {
         unsafe { &mut *self.info.get() }
     }
 
-    fn measure<F, R>(&self, f: F) -> (R, AllocationUsage)
+    pub fn measure<F, R>(&self, f: F) -> (R, AllocationUsage)
     where
         F: FnOnce() -> R,
     {

@@ -82,7 +82,7 @@ impl HttpServer {
     }
     pub fn upgrade_websocket(
         &mut self,
-        header: HttpRequestHeader,
+        header: &HttpRequestHeader,
         stream: &mut TcpStream,
     ) -> Result<(), HttpServerError> {
         if let Some(_) = header.upgrade

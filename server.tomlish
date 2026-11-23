@@ -18,6 +18,12 @@
 port        = 4000
 host        = "127.0.0.1"
 
+[rate_limits]
+ip_rate = 50
+ip_burst = 100
+path_rate = 10
+path_burst = 30
+
 [dirs]
 content     = ./content
 api         = ./api
@@ -31,14 +37,15 @@ error       = @templates/error.html
 rss         = @templates/rss.html
 
 [variables]
-posts               = @gen/posts/
-cool_blogs          = @gen/cool_blogs
-quotes              = @gen/quotes_collection
-about               = @gen/about.md
-gallery             = @assets/gallery/
+posts       = @gen/posts/
+cool_blogs  = @gen/cool_blogs
+quotes      = @gen/quotes_collection
+about       = @gen/about.md
+gallery     = @assets/gallery/
+domain      = "blockdoth.dev"
 
 [static_routes]
-/home       = @templates/pages/home.html
+/home       = { path = @templates/pages/home.html, rate_limit = 1000 }
 /posts      = @templates/pages/posts.html
 /quotes     = @templates/pages/quotes.html
 /gallery    = @templates/pages/gallery.html
