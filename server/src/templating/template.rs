@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fmt::Write as FmtWrite;
@@ -5,16 +6,16 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::hash_map;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use crate::runtime::misc::date::DateFormat;
 use crate::runtime::templating::context::{LocalContext, TemplateContext};
 use crate::runtime::templating::error::TemplateErrorMsg;
-use crate::runtime::templating::lexer::TemplatePositionData;
+use crate::runtime::templating::parser::BinaryOperator;
 use crate::runtime::templating::parser::ForIterBind;
-use crate::runtime::templating::parser::{
-    ConditionExpr, TemplateNode, TemplateNodeData, TemplateParser, Var, VarIndex,
-};
+use crate::runtime::templating::parser::UnaryOperator;
+use crate::runtime::templating::parser::{TemplateNode, TemplateParser, TemplateStatement};
 use crate::runtime::templating::values::TemplateValueKind;
 use crate::runtime::templating::values::ToTemplateValue;
 use crate::runtime::templating::{error::TemplateError, values::TemplateValue};
@@ -24,7 +25,7 @@ pub struct Template {
     pub template: Vec<TemplateNode>,
     pub parent: Option<String>,
     pub blocks: HashMap<String, Vec<TemplateNode>>,
-    pub origin_file: String,
+    pub origin_file: Rc<str>,
     pub last_modified: SystemTime,
     pub input: String,
     pub newlines: Vec<usize>,
@@ -32,7 +33,7 @@ pub struct Template {
 
 impl Template {
     pub fn from_path<P: AsRef<Path> + Debug + Copy>(path: P) -> Result<Self, TemplateError> {
-        let path_string = path.as_ref().to_string_lossy().to_string();
+        let path_string = path.as_ref().to_string_lossy();
 
         let template_str = fs::read_to_string(path).expect("invariant");
 
@@ -43,13 +44,13 @@ impl Template {
         template: &mut Result<Template, TemplateError>,
         path: P,
     ) {
-        let path_string = path.as_ref().to_string_lossy().to_string();
+        let path_string = path.as_ref().to_string_lossy();
 
         *template = match fs::read_to_string(path) {
-            Ok(template_str) => TemplateParser::parse(&template_str, &path_string),
+            Ok(template_str) => TemplateParser::parse(&template_str, path_string.as_ref()),
             Err(e) => Err(TemplateError::only_file(
                 TemplateErrorMsg::GenericError(e.to_string()),
-                &path_string,
+                path_string.as_ref().into(),
             )),
         };
     }
@@ -73,93 +74,169 @@ impl Template {
     ) -> Result<&'a str, TemplateError> {
         render_buffer.clear();
 
-        Self::render_helper(&parent.template, context, &self.blocks, render_buffer).map_err(
-            |e| match &e.pos {
-                Some(_) => {
-                    // todo, something here idk
-                    e.enhance_error(self)
-                }
-                None => e.enhance_error(self),
-            },
-        )?;
+        Self::render_helper(&parent.template, context, &self.blocks, render_buffer)
+            .map_err(|e| e.enhance_error(self))?;
+
         Ok(render_buffer)
     }
 
+    fn eval<'a>(
+        expr: &'a TemplateNode,
+        context: &'a dyn TemplateContext,
+        blocks: &HashMap<String, Vec<TemplateNode>>,
+    ) -> Result<Cow<'a, TemplateValue>, TemplateError> {
+        use TemplateValue::*;
+
+        match &expr.expr {
+            TemplateStatement::BinaryOp { op, left, right } => {
+                Self::eval_binary(op, left, right, context, blocks)
+            }
+            TemplateStatement::UnaryOp { op, operand } => {
+                Self::eval_unary(op, operand, context, blocks)
+            }
+            TemplateStatement::Variable(var) => {
+                match context.lookup(var) {
+                    Some(var) => Ok(Cow::Borrowed(var)), // TODO remove clone
+                    None => {
+                        let mut pos = expr.pos.clone();
+
+                        if let Some(span) = &mut pos.span {
+                            span.end = span.start + var.len();
+                        }
+
+                        Err(TemplateError::new(
+                            TemplateErrorMsg::VariableNotFound(var.clone()),
+                            pos,
+                        ))
+                    }
+                }
+            }
+
+            TemplateStatement::Field {
+                parent,
+                name,
+                optional,
+            } => match Self::eval(parent, context, blocks)? {
+                Cow::Borrowed(TemplateValue::Object(obj)) => {
+                    if let Some(value) = obj.get(name) {
+                        Ok(Cow::Borrowed(value))
+                    } else if *optional {
+                        Ok(Cow::Owned(TemplateValue::Null))
+                    } else {
+                        todo!()
+                    }
+                }
+                Cow::Owned(TemplateValue::Object(mut obj)) => {
+                    if let Some(value) = obj.remove(name) {
+                        Ok(Cow::Owned(value))
+                    } else if *optional {
+                        Ok(Cow::Owned(TemplateValue::Null))
+                    } else {
+                        todo!()
+                    }
+                }
+                _ => todo!(),
+            },
+            TemplateStatement::Index { parent, name: idx } => {
+                match (
+                    Self::eval(parent, context, blocks)?,
+                    Self::eval(idx, context, blocks)?.as_ref(),
+                ) {
+                    (Cow::Borrowed(TemplateValue::List(list)), TemplateValue::Number(idx))
+                        if *idx >= 0 && *idx < list.len() as i64 =>
+                    {
+                        Ok(Cow::Borrowed(
+                            list.get(*idx as usize).expect("bounds invariant"),
+                        ))
+                    }
+                    (Cow::Owned(TemplateValue::List(list)), TemplateValue::Number(idx))
+                        if *idx >= 0 && *idx < list.len() as i64 =>
+                    {
+                        Ok(Cow::Owned(
+                            list.get(*idx as usize).expect("bounds invariant").clone(),
+                        ))
+                    }
+                    _ => todo!(),
+                }
+            }
+            TemplateStatement::Range { parent, start, end } => {
+                match (
+                    Self::eval(parent, context, blocks)?.as_ref(),
+                    Self::eval(start, context, blocks)?.as_ref(),
+                    Self::eval(end, context, blocks)?.as_ref(),
+                ) {
+                    (
+                        TemplateValue::List(list),
+                        TemplateValue::Number(start),
+                        TemplateValue::Number(end),
+                    ) if *start >= 0 && *end < list.len() as i64 && end <= start => {
+                        Ok(Cow::Owned(TemplateValue::List(
+                            list[*start as usize..*end as usize].to_vec(),
+                        ))) //TODO change
+                    }
+                    _ => todo!(),
+                }
+            }
+
+            TemplateStatement::Number(number) => Ok(Cow::Owned(TemplateValue::Number(*number))),
+            TemplateStatement::Bool(bool) => Ok(Cow::Owned(TemplateValue::Bool(*bool))),
+            TemplateStatement::Date { date_var, format } => {
+                match Self::eval(date_var, context, blocks)?.as_ref() {
+                    Date(date) => {
+                        if let Some(dateformat) = DateFormat::parse(&format.to_string()) {
+                            Ok(Cow::Owned(TemplateValue::Text(date.format(&dateformat))))
+                        } else {
+                            Err(TemplateError::new(
+                                TemplateErrorMsg::UnknownDateFormat(format.to_string()),
+                                expr.pos.clone(),
+                            ))
+                        }
+                    }
+                    _ => todo!(),
+                }
+            }
+            TemplateStatement::Expression(_template_nodes) => todo!(),
+            _ => unreachable!(),
+        }
+    }
+
     fn render_helper(
-        template: &[TemplateNode],
+        nodes: &Vec<TemplateNode>,
         context: &dyn TemplateContext,
         blocks: &HashMap<String, Vec<TemplateNode>>,
         out: &mut String,
     ) -> Result<(), TemplateError> {
         use TemplateValue::*;
-        for node in template {
-            match &node.data {
-                TemplateNodeData::Text(text) => out.push_str(text),
-                TemplateNodeData::Variable(var) => {
-                    match Self::resolve_var(var, context, &node.pos)? {
-                        Text(text) => out.push_str(text),
-                        Number(number) => out.push_str(&number.to_string()),
-                        Bool(bool_val) => write!(out, "{bool_val}")?,
-                        List(list) => write!(out, "{list:?}")?,
-                        Object(object) => write!(out, "{object:?}")?,
-                        Date(date) => write!(out, "{date}")?,
+        for node in nodes {
+            match &node.expr {
+                TemplateStatement::Text(text) => write!(out, "{text}")?,
+                TemplateStatement::Block { ident, body } => {
+                    if let Some(override_body) = blocks.get(ident) {
+                        Self::render_helper(override_body, context, blocks, out)?
+                    } else {
+                        Self::render_helper(body, context, blocks, out)?
                     }
                 }
-                TemplateNodeData::If {
+                TemplateStatement::If {
                     condition,
                     then_branch,
                     else_branch,
                 } => {
-                    let cond = match condition {
-                        ConditionExpr::Literal(bool_lit) => *bool_lit,
-                        ConditionExpr::Var(var) => Self::resolve_bool(var, context, node)?,
-                        ConditionExpr::VarComp(var_1, var_2) => {
-                            let var_1 = Self::resolve_var(var_1, context, &node.pos)?;
-                            let var_2 = Self::resolve_var(var_2, context, &node.pos)?;
-
-                            match (var_1, var_2) {
-                                (Text(text_1), Text(text_2)) => text_1 == text_2,
-                                _ => {
-                                    return Err(TemplateError::new(
-                                        TemplateErrorMsg::CantCompareTemplateValues(
-                                            var_1.kind(),
-                                            var_2.kind(),
-                                        ),
-                                        node.pos.clone(),
-                                    ));
-                                }
-                            }
-                        }
-                        ConditionExpr::LiteralComp(var, literal) => {
-                            let var = Self::resolve_var(var, context, &node.pos)?;
-                            match var {
-                                Text(var_text) => var_text == literal,
-                                _ => {
-                                    return Err(TemplateError::new(
-                                        TemplateErrorMsg::CantCompareWithLiteral(var.kind()),
-                                        node.pos.clone(),
-                                    ));
-                                }
-                            }
-                        }
-                    };
-
-                    if cond {
+                    if Self::eval_bool(condition, context, blocks)? {
                         Self::render_helper(then_branch, context, blocks, out)?
-                    } else {
+                    } else if let Some(else_branch) = else_branch {
                         Self::render_helper(else_branch, context, blocks, out)?
-                    };
+                    }
                 }
-                TemplateNodeData::For {
+                TemplateStatement::For {
                     iter_bind,
                     iter_src,
                     body,
-                    skip,
                 } => {
                     // Todo remove clone
-                    match (Self::resolve_var(iter_src, context, &node.pos)?, iter_bind) {
+                    match (Self::eval(iter_src, context, blocks)?.as_ref(), iter_bind) {
                         (List(iter), ForIterBind::Simple(iter_bind)) => {
-                            for it in iter.iter().skip(*skip) {
+                            for it in iter.iter() {
                                 let child_context = LocalContext::new(context, iter_bind, it);
 
                                 Self::render_helper(body, &child_context, blocks, out)?;
@@ -175,7 +252,7 @@ impl Template {
                         (Object(iter), ForIterBind::Object((key_bind, iter_bind))) => {
                             let mut sorted: Vec<(&String, &TemplateValue)> = iter.iter().collect();
                             sorted.sort_unstable_by_key(|(key, _)| *key);
-                            for (key, bind) in sorted.into_iter().skip(*skip) {
+                            for (key, bind) in sorted.into_iter() {
                                 let key = key.clone().to_template_value(); //todo remove clone
                                 let child_context = LocalContext::new(context, key_bind, &key);
                                 let child_context =
@@ -188,7 +265,7 @@ impl Template {
                         (Object(iter), ForIterBind::Simple(iter_bind)) => {
                             let mut sorted: Vec<(&String, &TemplateValue)> = iter.iter().collect();
                             sorted.sort_unstable_by_key(|(key, _)| *key);
-                            for (key, bind) in sorted.into_iter().skip(*skip) {
+                            for (key, bind) in sorted.into_iter() {
                                 let key = key.clone().to_template_value(); //todo remove clone
                                 let object = TemplateValue::Object(hash_map! {
                                     "key".to_string() => key,
@@ -212,218 +289,64 @@ impl Template {
                         }
                     }
                 }
-                TemplateNodeData::Block { ident, body } => {
-                    if let Some(override_body) = blocks.get(ident) {
-                        Self::render_helper(override_body, context, blocks, out)?;
-                    } else {
-                        Self::render_helper(body, context, blocks, out)?;
-                    }
-                }
-                TemplateNodeData::Date { date_var, format } => {
-                    match Self::resolve_var(date_var, context, &node.pos)? {
-                        Date(date) => {
-                            if let Some(dateformat) = DateFormat::parse(&format.to_string()) {
-                                let date = date.format(&dateformat);
-                                out.push_str(&date)
-                            } else {
-                                return Err(TemplateError::new(
-                                    TemplateErrorMsg::UnknownDateFormat(format.to_string()),
-                                    node.pos.clone(),
-                                ));
-                            }
-                        }
-                        other => {
-                            return Err(TemplateError::new(
-                                TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                                    other.kind(),
-                                    TemplateValueKind::Date,
-                                ),
-                                node.pos.clone(),
-                            ));
-                        }
-                    }
+
+                _ => {
+                    let str = Self::eval(node, context, blocks)?;
+                    write!(out, "{str}")?;
                 }
             };
         }
+
         Ok(())
     }
 
-    fn resolve_var<'a>(
-        var: &Var,
+    fn eval_unary<'a>(
+        op: &UnaryOperator,
+        expr: &TemplateNode,
         context: &'a dyn TemplateContext,
-        pos: &TemplatePositionData,
-    ) -> Result<&'a TemplateValue, TemplateError> {
-        let Some(mut current) = context.lookup(&var.base) else {
-            let mut pos = pos.clone();
-
-            if let Some(span) = &mut pos.span {
-                span.end = span.start + var.base.len();
+        blocks: &HashMap<String, Vec<TemplateNode>>,
+    ) -> Result<Cow<'a, TemplateValue>, TemplateError> {
+        match (op, Self::eval(expr, context, blocks)?.as_ref()) {
+            (UnaryOperator::Not, TemplateValue::Bool(bool)) => {
+                Ok(Cow::Owned(TemplateValue::Bool(!bool)))
             }
-
-            return Err(TemplateError::new(
-                TemplateErrorMsg::VariableNotFound(var.base.clone()),
-                pos,
-            ));
-        };
-
-        for index in &var.indices {
-            current = match index {
-                VarIndex::Field { field, span } => {
-                    let TemplateValue::Object(map) = current else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                                current.kind(),
-                                TemplateValueKind::Object,
-                            ),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        ));
-                    };
-
-                    map.get(field).ok_or_else(|| {
-                        TemplateError::new(
-                            TemplateErrorMsg::FieldNotFoundOnVariable(
-                                Box::new(var.clone()),
-                                field.to_string(),
-                            ),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        )
-                    })?
-                }
-
-                VarIndex::Index { idx, span } => {
-                    let TemplateValue::List(list) = current else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                                current.kind(),
-                                TemplateValueKind::List,
-                            ),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        ));
-                    };
-
-                    &list[idx % list.len()]
-                }
-
-                VarIndex::Var { var, span } => {
-                    let TemplateValue::List(list) = current else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                                current.kind(),
-                                TemplateValueKind::List,
-                            ),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        ));
-                    };
-
-                    let index_value = Self::resolve_var(var, context, pos)?;
-
-                    let TemplateValue::Number(idx) = index_value else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                                index_value.kind(),
-                                TemplateValueKind::Number,
-                            ),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        ));
-                    };
-
-                    &list[(idx % list.len() as i64) as usize]
-                }
-                VarIndex::Date {
-                    date_var,
-                    format,
-                    span,
-                } => {
-                    let TemplateValue::List(list) = current else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                                current.kind(),
-                                TemplateValueKind::List,
-                            ),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        ));
-                    };
-
-                    let index_value = Self::resolve_var(date_var, context, pos)?;
-
-                    let TemplateValue::Date(date) = index_value else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                                index_value.kind(),
-                                TemplateValueKind::Date,
-                            ),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        ));
-                    };
-
-                    let Some(idx) = date.get_numeric(format) else {
-                        return Err(TemplateError::new(
-                            TemplateErrorMsg::DateFormatNotNumeric(format.clone()),
-                            TemplatePositionData {
-                                file: pos.file.clone(),
-                                span: Some(span.clone()),
-                            },
-                        ));
-                    };
-                    &list[(idx % list.len() as i64) as usize]
-                }
-            };
+            _ => todo!(),
         }
-
-        Ok(current)
     }
 
-    fn resolve_bool(
-        var: &Var,
+    fn eval_binary<'a>(
+        op: &BinaryOperator,
+        left: &TemplateNode,
+        right: &TemplateNode,
+        context: &'a dyn TemplateContext,
+        blocks: &HashMap<String, Vec<TemplateNode>>,
+    ) -> Result<Cow<'a, TemplateValue>, TemplateError> {
+        use BinaryOperator::*;
+
+        match (
+            Self::eval(left, context, blocks)?.as_ref(),
+            op,
+            Self::eval(right, context, blocks)?.as_ref(),
+        ) {
+            (TemplateValue::Bool(left), Equals, TemplateValue::Bool(right)) => {
+                Ok(Cow::Owned(TemplateValue::Bool(left == right)))
+            }
+            _ => todo!(),
+        }
+    }
+
+    fn eval_bool(
+        expr: &TemplateNode,
         context: &dyn TemplateContext,
-        node: &TemplateNode,
+        blocks: &HashMap<String, Vec<TemplateNode>>,
     ) -> Result<bool, TemplateError> {
         use TemplateValue::*;
-        match Self::resolve_var(var, context, &node.pos) {
-            Ok(Bool(cond)) => Ok(*cond),
-            Ok(List(template_values)) => Ok(!template_values.is_empty()),
-            Ok(Text(text)) => Ok(!text.is_empty()),
-            Ok(Object(obj)) => Ok(!obj.is_empty()),
-
-            Err(TemplateError {
-                typ: TemplateErrorMsg::IndexNotInRange(_, _),
-                ..
-            }) => Ok(false),
-
-            Err(TemplateError {
-                typ: TemplateErrorMsg::FieldNotFoundOnVariable(_, _),
-                ..
-            }) => Ok(false),
-
-            Ok(other) => Err(TemplateError::new(
-                TemplateErrorMsg::TemplateValueNotOfExptectedType(
-                    other.kind(),
-                    TemplateValueKind::Bool,
-                ),
-                node.pos.clone(),
-            ))?,
-            Err(err) => Err(err),
+        match Self::eval(expr, context, blocks)?.as_ref() {
+            Bool(cond) => Ok(*cond),
+            List(template_values) => Ok(!template_values.is_empty()),
+            Text(text) => Ok(!text.is_empty()),
+            Object(obj) => Ok(!obj.is_empty()),
+            _ => todo!(),
         }
     }
 }

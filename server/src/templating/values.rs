@@ -1,11 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use std::fmt::Debug;
-use std::hash::BuildHasher;
-use std::hash_map;
-use std::time::{Duration, SystemTime};
-
 use crate::runtime::assets::asset::AssetData;
 use crate::runtime::assets::parsers::image::GalleryImage;
 use crate::runtime::config::parser::TomlishValue;
@@ -14,6 +9,11 @@ use crate::runtime::jpeg::exif::ExifMetadata;
 use crate::runtime::markdown::parser::{MarkdownFile, MarkdownPost, ParsedMarkdown};
 use crate::runtime::markdown::syntax::SyntaxHighlightLang;
 use crate::runtime::misc::date::Date;
+use std::fmt;
+use std::fmt::Debug;
+use std::hash::BuildHasher;
+use std::hash_map;
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug)]
 pub enum TemplateValue {
@@ -23,6 +23,7 @@ pub enum TemplateValue {
     Bool(bool),
     List(Vec<TemplateValue>),
     Object(HashMap<String, TemplateValue>),
+    Null,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,6 +34,7 @@ pub enum TemplateValueKind {
     Date,
     List,
     Object,
+    Null,
 }
 
 impl TemplateValue {
@@ -44,6 +46,21 @@ impl TemplateValue {
             TemplateValue::Date(_) => TemplateValueKind::Date,
             TemplateValue::List(_) => TemplateValueKind::List,
             TemplateValue::Object(_) => TemplateValueKind::Object,
+            TemplateValue::Null => TemplateValueKind::Object,
+        }
+    }
+}
+
+impl fmt::Display for TemplateValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemplateValue::Text(text) => write!(f, "{text}"),
+            TemplateValue::Number(number) => write!(f, "{number}"),
+            TemplateValue::Bool(boolean) => write!(f, "{boolean}"),
+            TemplateValue::List(list) => write!(f, "{list:?}"),
+            TemplateValue::Object(object) => write!(f, "{object:?}"),
+            TemplateValue::Date(date) => write!(f, "{date}"),
+            TemplateValue::Null => write!(f, ""),
         }
     }
 }

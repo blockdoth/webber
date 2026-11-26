@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use std::rc::Rc;
 use std::time::SystemTime;
 use std::vec;
 
@@ -15,8 +16,8 @@ pub struct TemplateInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct TemplatePositionData {
-    pub file: String,
+pub struct TemplatePosData {
+    pub file: Rc<str>,
     pub span: Option<Span>,
 }
 
@@ -135,8 +136,36 @@ impl TemplateToken {
             | Self::EndBlock(span)
             | Self::Date(span)
             | Self::Extends(span)
-            | Self::Literal(span) => span,
-            Self::Skip(span) => span,
+            | Self::Literal(span)
+            | Self::Skip(span) => span,
+        }
+    }
+
+    pub fn span_owned(self) -> Span {
+        match self {
+            Self::Text(span)
+            | Self::Number(span)
+            | Self::Identifier(span)
+            | Self::Dot(span)
+            | Self::Comma(span)
+            | Self::Equals(span)
+            | Self::Whitespace(span)
+            | Self::If(span)
+            | Self::Else(span)
+            | Self::For(span)
+            | Self::In(span)
+            | Self::EndIf(span)
+            | Self::BracketOpen(span)
+            | Self::BracketClose(span)
+            | Self::EndElse(span)
+            | Self::EndFor(span)
+            | Self::NewLine(span)
+            | Self::Block(span)
+            | Self::EndBlock(span)
+            | Self::Date(span)
+            | Self::Extends(span)
+            | Self::Literal(span)
+            | Self::Skip(span) => span,
         }
     }
 
@@ -151,13 +180,13 @@ impl TemplateToken {
 
 // === Template lexer
 pub struct TemplateLexer<'a> {
-    file_path: &'a str,
+    file_path: Rc<str>,
     input: &'a str,
     newlines: Vec<usize>,
 }
 
 impl<'a> TemplateLexer<'a> {
-    pub fn lex(file_path: &'a str, input: &'a str) -> TemplateParser<'a> {
+    pub fn lex(file_path: Rc<str>, input: &'a str) -> TemplateParser<'a> {
         use TemplateToken::*;
 
         let mut lexer = TemplateLexer {
@@ -211,8 +240,7 @@ impl<'a> TemplateLexer<'a> {
             input: lexer.input,
             newlines: lexer.newlines,
             blocks: HashMap::new(),
-            tokens,
-            cursor: 0,
+            stream: TokenStream::new(),
         }
     }
 
@@ -353,5 +381,51 @@ impl<'a> TemplateLexer<'a> {
         } else {
             tokens.push(TemplateToken::Identifier(span));
         }
+    }
+}
+
+pub struct TokenStream {
+    tokens: Vec<TemplateToken>,
+    cursor: usize,
+}
+
+impl TokenStream {
+    pub fn new() -> Self {
+        Self {
+            tokens: vec![],
+            cursor: 0,
+        }
+    }
+
+    pub fn peek(&self) -> Option<&TemplateToken> {
+        self.tokens.get(self.cursor)
+    }
+
+    pub fn next(&mut self) -> Option<&TemplateToken> {
+        let index = self.cursor;
+        self.cursor += 1;
+        self.tokens.get(index)
+    }
+
+    pub fn skip(&mut self, count: usize) {
+        self.cursor += count;
+    }
+
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn try_consume(&mut self, expected: TemplateTokenTyp) -> Option<&TemplateToken> {
+        if self.peek()?.typ() == expected {
+            self.next()
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for TokenStream {
+    fn default() -> Self {
+        Self::new()
     }
 }

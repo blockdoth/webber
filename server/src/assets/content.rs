@@ -118,7 +118,7 @@ impl Content {
             for (key, template_res) in &mut self.templates {
                 match template_res {
                     Ok(template) => {
-                        if template.origin_file == path_str {
+                        if template.origin_file.as_ref() == path_str.as_ref() {
                             is_new = false;
                             if template.last_modified < last_modified {
                                 Template::update_from_path(template_res, path);
@@ -131,11 +131,11 @@ impl Content {
                     Err(template_err) => {
                         if let Some(pos) = &template_err.pos
                             && let Some(info) = &template_err.info
-                            && pos.file == path_str
+                            && pos.file.as_ref() == path_str.as_ref()
                         {
                             is_new = false;
                             if info.last_modified < last_modified {
-                                Template::update_from_path(template_res, path);
+                                *template_res = Template::from_path(path);
                                 changed = true;
 
                                 println!("Updated template {:?}, for page: {key:?}", path_str,);

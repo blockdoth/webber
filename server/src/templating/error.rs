@@ -3,20 +3,21 @@ use std::error::Error;
 use std::fmt::{Debug, Display};
 
 use std::fmt;
+use std::rc::Rc;
 
 use crate::runtime::misc::date::DateFormat;
 use crate::runtime::templating::context::Context;
 use crate::runtime::templating::lexer::{
-    Position, TemplateInfo, TemplatePositionData, TemplateTokenTyp,
+    Position, TemplateInfo, TemplatePosData, TemplateTokenTyp,
 };
-use crate::runtime::templating::parser::{TemplateNodeKind, Var};
+use crate::runtime::templating::parser::TemplateStatementKind;
 use crate::runtime::templating::template::Template;
 use crate::runtime::templating::values::TemplateValueKind;
 
 #[derive(Debug, Clone)]
 pub struct TemplateError {
     pub typ: TemplateErrorMsg,
-    pub pos: Option<TemplatePositionData>,
+    pub pos: Option<TemplatePosData>,
     pub info: Option<Box<TemplateInfo>>, // Box because otherwise clippy complains about Result size
 }
 
@@ -40,7 +41,7 @@ impl From<std::fmt::Error> for TemplateError {
 }
 
 impl TemplateError {
-    pub fn new(typ: TemplateErrorMsg, pos: TemplatePositionData) -> TemplateError {
+    pub fn new(typ: TemplateErrorMsg, pos: TemplatePosData) -> TemplateError {
         TemplateError {
             typ,
             pos: Some(pos),
@@ -55,13 +56,10 @@ impl TemplateError {
             info: None,
         }
     }
-    pub fn only_file(typ: TemplateErrorMsg, file: &str) -> Self {
+    pub fn only_file(typ: TemplateErrorMsg, file: Rc<str>) -> Self {
         Self {
             typ,
-            pos: Some(TemplatePositionData {
-                file: file.to_owned(),
-                span: None,
-            }),
+            pos: Some(TemplatePosData { file, span: None }),
             info: None,
         }
     }
@@ -210,14 +208,13 @@ impl Display for TemplateErrorKind {
 pub enum TemplateErrorMsg {
     VariableNotFound(String),
     TemplateValueNotOfExptectedType(TemplateValueKind, TemplateValueKind),
-    FieldNotFoundOnVariable(Box<Var>, String),
+    FieldNotFoundOnVariable(String, String),
     UnexpectedToken(TemplateTokenTyp, TemplateTokenTyp),
     DidNotExpectToken(TemplateTokenTyp),
     UnexpectedTokenOptions(TemplateTokenTyp, Vec<TemplateTokenTyp>),
     GenericError(String),
     UnknownDateFormat(String),
-    MultiLevelForLoopBind(Box<Var>),
-    UnexpectedTemplateValueType(TemplateNodeKind, TemplateNodeKind),
+    UnexpectedTemplateValueType(TemplateStatementKind, TemplateStatementKind),
     CantCompareTemplateValues(TemplateValueKind, TemplateValueKind),
     CantCompareWithLiteral(TemplateValueKind),
     IndexNotInRange(i64, usize),
@@ -246,7 +243,6 @@ impl TemplateErrorMsg {
             UnexpectedToken(_, _)
             | DidNotExpectToken(_)
             | UnexpectedTokenOptions(_, _)
-            | MultiLevelForLoopBind(_)
             | UnexpectedTemplateValueType(_, _)
             | UnableToParseNumber(_)
             | WrongIterBindForList
@@ -331,12 +327,6 @@ impl Display for TemplateErrorMsg {
             }
             GenericError(msg) => {
                 write!(f, "{error_kind}: {msg}")
-            }
-            MultiLevelForLoopBind(bind) => {
-                write!(
-                    f,
-                    "{error_kind}: For-loop binding must be a single identifier, found '{bind}'",
-                )
             }
             UnexpectedTemplateValueType(expected, found) => {
                 write!(

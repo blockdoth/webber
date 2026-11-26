@@ -20,7 +20,7 @@ fn main() -> Result<(), ServerError> {
     if std::env::args().any(|arg| arg.contains("build_script_build")) {
         comptime::comptime()
     } else {
-        // #[cfg(generated)] // Marks everything deadcode during build time
+        #[cfg(generated)] // Marks everything deadcode during build time
         runtime::runtime()?;
         Ok(())
     }
